@@ -1,0 +1,26 @@
+[package]
+name = "btcore"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "High-performance portfolio backtesting engine in pure Rust"
+keywords = ["backtest", "trading", "finance", "portfolio", "quantitative"]
+categories = ["finance", "simulation"]
+
+[lib]
+crate-type = ["lib"]
+
+[dependencies]
+chrono.workspace = true
+speedate.workspace = true
+thiserror.workspace = true
+rayon.workspace = true
+serde.workspace = true
+
+[dev-dependencies]
+criterion = "0.5"
+
+# [[bench]]
+# name = "benchmark"
+# harness = false

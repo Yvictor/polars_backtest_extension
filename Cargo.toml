@@ -1,0 +1,24 @@
+[workspace]
+resolver = "2"
+members = [
+    "btcore",
+    "polars_backtest",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+repository = "https://github.com/Yvictor/polars_backtest_extension"
+
+[workspace.dependencies]
+chrono = { version = "0.4", default-features = false, features = ["std"] }
+speedate = "0.15"
+thiserror = "2"
+rayon = "1.10"
+serde = { version = "1", features = ["derive"] }
+
+# Polars (only for extension)
+polars = { version = "0.52", default-features = false }
+pyo3 = { version = "0.26" }
+pyo3-polars = { version = "0.25", features = ["derive"] }

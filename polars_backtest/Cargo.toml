@@ -1,0 +1,24 @@
+[package]
+name = "polars_backtest"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Polars extension for portfolio backtesting"
+keywords = ["polars", "backtest", "trading", "finance", "python"]
+categories = ["finance", "science"]
+
+[lib]
+name = "_polars_backtest"
+crate-type = ["cdylib"]
+
+[dependencies]
+btcore = { path = "../btcore" }
+polars.workspace = true
+pyo3.workspace = true
+pyo3-polars.workspace = true
+chrono.workspace = true
+serde.workspace = true
+
+[features]
+default = []
