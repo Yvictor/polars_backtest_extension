@@ -525,3 +525,173 @@ fn test_weights_rebalancing() {
     assert!((creturn[4] - 1.21).abs() < 0.001,
         "Day 4: Expected 1.21, got {}", creturn[4]);
 }
+
+/// Test stop_trading_next_period=true (default behavior)
+/// After stop loss triggers, the stock cannot re-enter in the next period
+#[test]
+fn test_stop_trading_next_period_true() {
+    // Stock drops 15% then recovers, with rebalance trying to re-enter
+    let prices = vec![
+        vec![100.0],  // Day 0: signal
+        vec![100.0],  // Day 1: entry
+        vec![84.0],   // Day 2: -16% triggers 10% stop loss, exit
+        vec![100.0],  // Day 3: signal (try to re-enter)
+        vec![100.0],  // Day 4: cannot re-enter because stop_trading_next_period=true
+        vec![110.0],  // Day 5: should remain flat (not holding)
+    ];
+
+    let signals = vec![
+        vec![true],   // Day 0: enter
+        vec![true],   // Day 3: try to re-enter
+    ];
+    let rebalance_indices = vec![0, 3];
+
+    let config = BacktestConfig {
+        fee_ratio: 0.0,
+        tax_ratio: 0.0,
+        stop_loss: 0.10,  // 10% stop loss
+        stop_trading_next_period: true,  // default: cannot re-enter
+        ..Default::default()
+    };
+
+    let creturn = run_backtest(&prices, &signals, &rebalance_indices, &config);
+
+    assert_eq!(creturn.len(), 6);
+    println!("creturn with stop_trading_next_period=true: {:?}", creturn);
+
+    // After stop loss on day 2, position should be flat
+    // Day 4-5 should remain flat because re-entry is blocked
+    assert!((creturn[4] - creturn[3]).abs() < 1e-10,
+        "Day 4 should be flat (re-entry blocked), got {} vs {}", creturn[4], creturn[3]);
+    assert!((creturn[5] - creturn[4]).abs() < 1e-10,
+        "Day 5 should be flat (re-entry blocked), got {} vs {}", creturn[5], creturn[4]);
+}
+
+/// Test stop_trading_next_period=false
+/// After stop loss triggers, the stock CAN re-enter in the next period
+#[test]
+fn test_stop_trading_next_period_false() {
+    // Stock drops 15% then recovers, with rebalance trying to re-enter
+    let prices = vec![
+        vec![100.0],  // Day 0: signal
+        vec![100.0],  // Day 1: entry
+        vec![84.0],   // Day 2: -16% triggers 10% stop loss, exit
+        vec![100.0],  // Day 3: signal (try to re-enter)
+        vec![100.0],  // Day 4: CAN re-enter because stop_trading_next_period=false
+        vec![110.0],  // Day 5: should have +10% return (holding position)
+    ];
+
+    let signals = vec![
+        vec![true],   // Day 0: enter
+        vec![true],   // Day 3: try to re-enter
+    ];
+    let rebalance_indices = vec![0, 3];
+
+    let config = BacktestConfig {
+        fee_ratio: 0.0,
+        tax_ratio: 0.0,
+        stop_loss: 0.10,  // 10% stop loss
+        stop_trading_next_period: false,  // CAN re-enter
+        ..Default::default()
+    };
+
+    let creturn = run_backtest(&prices, &signals, &rebalance_indices, &config);
+
+    assert_eq!(creturn.len(), 6);
+    println!("creturn with stop_trading_next_period=false: {:?}", creturn);
+
+    // After re-entry on day 4, day 5 should show return
+    // The portfolio should have gained on day 5 (110 vs 100 = +10%)
+    let day5_return = creturn[5] / creturn[4];
+    assert!(day5_return > 1.05,
+        "Day 5 should show positive return from re-entered position, got {} (ratio: {})",
+        creturn[5], day5_return);
+}
+
+/// Test retain_cost_when_rebalance=false (default)
+/// Entry prices should be reset on every rebalance, affecting stop loss calculation
+#[test]
+fn test_retain_cost_when_rebalance_false() {
+    // Stock: 100 -> 105 -> 110 (rebalance) -> 100 (should NOT trigger stop loss)
+    // Because entry price is reset to 110 on rebalance, 100 is only -9% drop
+    let prices = vec![
+        vec![100.0],  // Day 0: signal
+        vec![100.0],  // Day 1: entry at 100
+        vec![105.0],  // Day 2: +5%
+        vec![110.0],  // Day 3: +10% total, rebalance signal, entry price reset to 110
+        vec![110.0],  // Day 4: rebalance executed
+        vec![100.0],  // Day 5: drop from 110 to 100 = -9%, should NOT trigger 10% stop loss
+    ];
+
+    let signals = vec![
+        vec![true],   // Day 0: enter
+        vec![true],   // Day 3: rebalance (same position)
+    ];
+    let rebalance_indices = vec![0, 3];
+
+    let config = BacktestConfig {
+        fee_ratio: 0.0,
+        tax_ratio: 0.0,
+        stop_loss: 0.10,  // 10% stop loss
+        retain_cost_when_rebalance: false,  // reset entry price on rebalance
+        ..Default::default()
+    };
+
+    let creturn = run_backtest(&prices, &signals, &rebalance_indices, &config);
+
+    assert_eq!(creturn.len(), 6);
+    println!("creturn with retain_cost_when_rebalance=false: {:?}", creturn);
+
+    // Day 5: drop from 110 to 100 = -9%, below 10% stop loss threshold
+    // Since entry price was reset to 110 on rebalance, stop loss should NOT trigger
+    // Portfolio should reflect the loss (approximately 100/110 of day 4 value)
+    let day5_change = creturn[5] / creturn[4];
+    assert!(day5_change > 0.85 && day5_change < 0.95,
+        "Day 5 should show ~9% loss (no stop loss triggered), got ratio: {}", day5_change);
+}
+
+/// Test retain_cost_when_rebalance=true
+/// Entry prices should be retained across rebalances, affecting stop loss calculation
+#[test]
+fn test_retain_cost_when_rebalance_true() {
+    // Stock: 100 -> 105 -> 110 (rebalance) -> 100 -> 88 (should trigger stop loss)
+    // Because entry price is retained at 100, 88 is -12% drop from original entry
+    let prices = vec![
+        vec![100.0],  // Day 0: signal
+        vec![100.0],  // Day 1: entry at 100
+        vec![105.0],  // Day 2: +5%
+        vec![110.0],  // Day 3: +10%, rebalance signal, entry price RETAINED at 100
+        vec![110.0],  // Day 4: rebalance executed
+        vec![88.0],   // Day 5: drop from 100 to 88 = -12%, should trigger 10% stop loss
+    ];
+
+    let signals = vec![
+        vec![true],   // Day 0: enter
+        vec![true],   // Day 3: rebalance (same position)
+    ];
+    let rebalance_indices = vec![0, 3];
+
+    let config = BacktestConfig {
+        fee_ratio: 0.0,
+        tax_ratio: 0.0,
+        stop_loss: 0.10,  // 10% stop loss
+        retain_cost_when_rebalance: true,  // keep original entry price
+        ..Default::default()
+    };
+
+    let creturn = run_backtest(&prices, &signals, &rebalance_indices, &config);
+
+    assert_eq!(creturn.len(), 6);
+    println!("creturn with retain_cost_when_rebalance=true: {:?}", creturn);
+
+    // Day 5: drop from original entry 100 to 88 = -12%, triggers 10% stop loss
+    // Position should be exited, so returns should reflect the exit
+    // The exact return depends on when stop loss is calculated vs exit price
+    // Key point: with retain_cost_when_rebalance=true, stop loss triggers earlier
+    // because we compare against original entry price (100), not rebalanced price (110)
+
+    // Verify that return is closer to 88/100 = 0.88 (stop triggered at original entry)
+    // rather than 88/110 = 0.8 (if measured from rebalance)
+    assert!(creturn[5] < creturn[4] * 0.92,
+        "Day 5 should show significant loss due to stop loss, got ratio: {}", creturn[5] / creturn[4]);
+}

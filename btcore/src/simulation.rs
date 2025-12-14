@@ -648,7 +648,7 @@ fn check_stops(
             let sell_value = pos.value * (1.0 - config.fee_ratio - config.tax_ratio);
             portfolio.cash += sell_value;
 
-            if stock_id < stopped_stocks.len() {
+            if config.stop_trading_next_period && stock_id < stopped_stocks.len() {
                 stopped_stocks[stock_id] = true;
             }
         }
@@ -710,7 +710,7 @@ fn check_stops_finlab(
             let sell_value = pos.value - pos.value.abs() * (config.fee_ratio + config.tax_ratio);
             portfolio.cash += sell_value;
 
-            if stock_id < stopped_stocks.len() {
+            if config.stop_trading_next_period && stock_id < stopped_stocks.len() {
                 stopped_stocks[stock_id] = true;
             }
         }
@@ -740,6 +740,17 @@ fn execute_finlab_rebalance(
     prices: &[f64],
     config: &BacktestConfig,
 ) {
+    // If retain_cost_when_rebalance is false (default), reset all entry prices
+    // This matches Finlab's behavior where cr.fill(1) resets all cumulative returns
+    if !config.retain_cost_when_rebalance {
+        for (stock_id, pos) in portfolio.positions.iter_mut() {
+            if *stock_id < prices.len() {
+                pos.entry_price = prices[*stock_id];
+                pos.max_price = prices[*stock_id];
+            }
+        }
+    }
+
     // Step 1: Exit positions with target_weight = 0
     let positions_to_close: Vec<usize> = portfolio
         .positions
@@ -1101,6 +1112,17 @@ fn rebalance_to_target_weights(
     prices: &[f64],
     config: &BacktestConfig,
 ) {
+    // If retain_cost_when_rebalance is false (default), reset all entry prices
+    // This matches Finlab's behavior where cr.fill(1) resets all cumulative returns
+    if !config.retain_cost_when_rebalance {
+        for (stock_id, pos) in portfolio.positions.iter_mut() {
+            if *stock_id < prices.len() {
+                pos.entry_price = prices[*stock_id];
+                pos.max_price = prices[*stock_id];
+            }
+        }
+    }
+
     // First, fully exit positions that should be closed
     let positions_to_close: Vec<usize> = portfolio
         .positions
@@ -1376,6 +1398,16 @@ fn execute_finlab_rebalance_dual(
     entry_trade_prices: &[f64],  // trade_prices at signal day
     config: &BacktestConfig,
 ) {
+    // If retain_cost_when_rebalance is false (default), reset all entry prices
+    // This matches Finlab's behavior where cr.fill(1) resets all cumulative returns
+    if !config.retain_cost_when_rebalance {
+        for (stock_id, (_cost_basis, entry_price)) in positions.iter_mut() {
+            if *stock_id < entry_trade_prices.len() {
+                *entry_price = entry_trade_prices[*stock_id];
+            }
+        }
+    }
+
     // Step 1: Exit positions with target_weight = 0
     let positions_to_close: Vec<usize> = positions
         .keys()
@@ -1536,7 +1568,7 @@ fn check_stops_finlab_dual(
             let sell_value = cost_basis - cost_basis.abs() * (config.fee_ratio + config.tax_ratio);
             *cash += sell_value;
 
-            if stock_id < stopped_stocks.len() {
+            if config.stop_trading_next_period && stock_id < stopped_stocks.len() {
                 stopped_stocks[stock_id] = true;
             }
         }
@@ -1790,10 +1822,12 @@ fn run_backtest_with_trades_internal(
                 config,
             );
 
-            // Mark any stopped stocks
-            for stock_id in stopped_this_period {
-                if stock_id < stopped_stocks.len() {
-                    stopped_stocks[stock_id] = true;
+            // Mark any stopped stocks (only if stop_trading_next_period is enabled)
+            if config.stop_trading_next_period {
+                for stock_id in stopped_this_period {
+                    if stock_id < stopped_stocks.len() {
+                        stopped_stocks[stock_id] = true;
+                    }
                 }
             }
         }
@@ -2056,7 +2090,7 @@ fn check_stops_with_trade_tracking(
             let sell_value = pos.value * (1.0 - config.fee_ratio - config.tax_ratio);
             portfolio.cash += sell_value;
 
-            if stock_id < stopped_stocks.len() {
+            if config.stop_trading_next_period && stock_id < stopped_stocks.len() {
                 stopped_stocks[stock_id] = true;
             }
 
