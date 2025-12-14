@@ -243,10 +243,13 @@ pub fn run_backtest(
     // Pending weights to execute on next day (T+1 execution)
     let mut pending_weights: Option<Vec<f64>> = None;
 
+    // Pending stop exits to execute on next day (T+1 execution)
+    let mut pending_stop_exits: Vec<usize> = Vec::new();
+
     for t in 0..n_times {
         // T+1 execution model (Finlab-compatible):
         // - Entries: happen at prev_prices (yesterday's close), then experience today's return
-        // - Exits: experience today's return first, then exit at current prices
+        // - Stops: detected on day N, executed on day N+1 AFTER experiencing day N+1's return
         if t > 0 {
             if let Some(target_weights) = pending_weights.take() {
                 // T+1 execution: rebalance at prev_prices, then experience today's return
@@ -264,13 +267,21 @@ pub fn run_backtest(
                 update_position_values(&mut portfolio, &prices[t], &prev_prices);
             }
 
-            // Check stop loss / take profit / trailing stop
-            check_stops(
-                &mut portfolio,
-                &prices[t],
-                &mut stopped_stocks,
-                config,
-            );
+            // Execute pending stop exits AFTER positions have experienced today's return
+            // This matches Finlab's behavior where exit happens at execution day's close
+            if !pending_stop_exits.is_empty() {
+                execute_pending_stops(
+                    &mut portfolio,
+                    &pending_stop_exits,
+                    &mut stopped_stocks,
+                    config,
+                );
+                pending_stop_exits.clear();
+            }
+
+            // Detect stops for T+1 execution (mark for exit tomorrow)
+            let new_stops = detect_stops(&portfolio, &prices[t], config);
+            pending_stop_exits.extend(new_stops);
         }
 
         // Check if this is a rebalance day
@@ -362,6 +373,9 @@ pub fn run_backtest_with_weights(
     // Pending weights to execute on next day (T+1 execution)
     let mut pending_weights: Option<Vec<f64>> = None;
 
+    // Pending stop exits to execute on next day (T+1 execution)
+    let mut pending_stop_exits: Vec<usize> = Vec::new();
+
     for t in 0..n_times {
         if config.finlab_mode {
             // ====== FINLAB MODE ======
@@ -383,13 +397,24 @@ pub fn run_backtest_with_weights(
                 // In Finlab mode, we DON'T update position values
                 // because cost_basis stays constant
 
-                // Check stop loss / take profit (using current prices)
-                check_stops_finlab(
-                    &mut portfolio,
-                    &prices[t],
-                    &mut stopped_stocks,
-                    config,
-                );
+                // Update max_price for trailing stop (must happen before exit/detect)
+                update_max_prices(&mut portfolio, &prices[t]);
+
+                // Execute pending stop exits AFTER max_price update
+                // This matches Finlab's behavior where exit happens at execution day's close
+                if !pending_stop_exits.is_empty() {
+                    execute_pending_stops_finlab(
+                        &mut portfolio,
+                        &pending_stop_exits,
+                        &mut stopped_stocks,
+                        config,
+                    );
+                    pending_stop_exits.clear();
+                }
+
+                // Detect stops for T+1 execution (mark for exit tomorrow)
+                let new_stops = detect_stops_finlab(&portfolio, &prices[t], config);
+                pending_stop_exits.extend(new_stops);
             }
 
             // Check if this is a rebalance (signal) day
@@ -411,7 +436,7 @@ pub fn run_backtest_with_weights(
             // ====== STANDARD MODE ======
             // T+1 execution model:
             // - Entries: happen at prev_prices (yesterday's close), then experience today's return
-            // - Exits: experience today's return first, then exit at current prices
+            // - Stops: detected on day N, executed on day N+1 AFTER experiencing day N+1's return
             if t > 0 {
                 if let Some(target_weights) = pending_weights.take() {
                     // T+1 execution: rebalance at prev_prices, then experience today's return
@@ -429,13 +454,21 @@ pub fn run_backtest_with_weights(
                     update_position_values(&mut portfolio, &prices[t], &prev_prices);
                 }
 
-                // Check stop loss / take profit / trailing stop
-                check_stops(
-                    &mut portfolio,
-                    &prices[t],
-                    &mut stopped_stocks,
-                    config,
-                );
+                // Execute pending stop exits AFTER positions have experienced today's return
+                // This matches Finlab's behavior where exit happens at execution day's close
+                if !pending_stop_exits.is_empty() {
+                    execute_pending_stops(
+                        &mut portfolio,
+                        &pending_stop_exits,
+                        &mut stopped_stocks,
+                        config,
+                    );
+                    pending_stop_exits.clear();
+                }
+
+                // Detect stops for T+1 execution (mark for exit tomorrow)
+                let new_stops = detect_stops(&portfolio, &prices[t], config);
+                pending_stop_exits.extend(new_stops);
             }
 
             // Check if this is a rebalance (signal) day
@@ -597,14 +630,14 @@ fn update_position_values(
     }
 }
 
-/// Check stop loss, take profit, and trailing stop conditions
-fn check_stops(
-    portfolio: &mut PortfolioState,
+/// Detect positions that should be closed due to stop conditions (T+1 preparation)
+/// Returns a list of stock IDs that should be closed on the next trading day
+fn detect_stops(
+    portfolio: &PortfolioState,
     prices: &[f64],
-    stopped_stocks: &mut [bool],
     config: &BacktestConfig,
-) {
-    let positions_to_close: Vec<usize> = portfolio
+) -> Vec<usize> {
+    portfolio
         .positions
         .iter()
         .filter_map(|(&stock_id, pos)| {
@@ -632,16 +665,47 @@ fn check_stops(
             }
 
             // Check trailing stop
+            // Finlab formula: triggers when (max_price - current_price) / entry_price >= trail_stop
             if config.trail_stop < f64::INFINITY {
-                let drawdown = (pos.max_price - current_price) / pos.max_price;
-                if drawdown >= config.trail_stop {
+                let drawdown_from_entry = (pos.max_price - current_price) / entry_price;
+                if drawdown_from_entry >= config.trail_stop {
                     return Some(stock_id);
                 }
             }
 
             None
         })
-        .collect();
+        .collect()
+}
+
+/// Execute pending stop exits (T+1 execution)
+/// Closes positions that were marked for exit on the previous day
+fn execute_pending_stops(
+    portfolio: &mut PortfolioState,
+    pending_stops: &[usize],
+    stopped_stocks: &mut [bool],
+    config: &BacktestConfig,
+) {
+    for &stock_id in pending_stops {
+        if let Some(pos) = portfolio.positions.remove(&stock_id) {
+            let sell_value = pos.value * (1.0 - config.fee_ratio - config.tax_ratio);
+            portfolio.cash += sell_value;
+
+            if config.stop_trading_next_period && stock_id < stopped_stocks.len() {
+                stopped_stocks[stock_id] = true;
+            }
+        }
+    }
+}
+
+/// Check stop loss, take profit, and trailing stop conditions (DEPRECATED - use detect_stops + execute_pending_stops for T+1)
+fn check_stops(
+    portfolio: &mut PortfolioState,
+    prices: &[f64],
+    stopped_stocks: &mut [bool],
+    config: &BacktestConfig,
+) {
+    let positions_to_close = detect_stops(portfolio, prices, config);
 
     for stock_id in positions_to_close {
         if let Some(pos) = portfolio.positions.remove(&stock_id) {
@@ -655,16 +719,13 @@ fn check_stops(
     }
 }
 
-/// Check stop loss / take profit for Finlab mode
-///
-/// In Finlab mode, we calculate return using cost_basis * close / entry_price
-fn check_stops_finlab(
-    portfolio: &mut PortfolioState,
+/// Detect positions that should be closed due to stop conditions in Finlab mode (T+1 preparation)
+fn detect_stops_finlab(
+    portfolio: &PortfolioState,
     prices: &[f64],
-    stopped_stocks: &mut [bool],
     config: &BacktestConfig,
-) {
-    let positions_to_close: Vec<usize> = portfolio
+) -> Vec<usize> {
+    portfolio
         .positions
         .iter()
         .filter_map(|(&stock_id, pos)| {
@@ -691,19 +752,28 @@ fn check_stops_finlab(
                 return Some(stock_id);
             }
 
-            // Check trailing stop (update max_price first)
+            // Check trailing stop
+            // Finlab formula: triggers when (max_price - current_price) / entry_price >= trail_stop
             if config.trail_stop < f64::INFINITY {
-                let drawdown = (pos.max_price - current_price) / pos.max_price;
-                if drawdown >= config.trail_stop {
+                let drawdown_from_entry = (pos.max_price - current_price) / entry_price;
+                if drawdown_from_entry >= config.trail_stop {
                     return Some(stock_id);
                 }
             }
 
             None
         })
-        .collect();
+        .collect()
+}
 
-    for stock_id in positions_to_close {
+/// Execute pending stop exits in Finlab mode (T+1 execution)
+fn execute_pending_stops_finlab(
+    portfolio: &mut PortfolioState,
+    pending_stops: &[usize],
+    stopped_stocks: &mut [bool],
+    config: &BacktestConfig,
+) {
+    for &stock_id in pending_stops {
         if let Some(pos) = portfolio.positions.remove(&stock_id) {
             // Finlab exit formula: cash += cost_basis - |cost_basis| * (fee + tax)
             // Note: pos.value IS cost_basis in Finlab mode
@@ -715,8 +785,10 @@ fn check_stops_finlab(
             }
         }
     }
+}
 
-    // Update max_price for trailing stop
+/// Update max_price for trailing stop tracking
+fn update_max_prices(portfolio: &mut PortfolioState, prices: &[f64]) {
     for (&stock_id, pos) in portfolio.positions.iter_mut() {
         if stock_id < prices.len() {
             let current_price = prices[stock_id];
@@ -725,6 +797,30 @@ fn check_stops_finlab(
             }
         }
     }
+}
+
+/// Check stop loss / take profit for Finlab mode (DEPRECATED - use detect/execute for T+1)
+#[allow(dead_code)]
+fn check_stops_finlab(
+    portfolio: &mut PortfolioState,
+    prices: &[f64],
+    stopped_stocks: &mut [bool],
+    config: &BacktestConfig,
+) {
+    let positions_to_close = detect_stops_finlab(portfolio, prices, config);
+
+    for stock_id in positions_to_close {
+        if let Some(pos) = portfolio.positions.remove(&stock_id) {
+            let sell_value = pos.value - pos.value.abs() * (config.fee_ratio + config.tax_ratio);
+            portfolio.cash += sell_value;
+
+            if config.stop_trading_next_period && stock_id < stopped_stocks.len() {
+                stopped_stocks[stock_id] = true;
+            }
+        }
+    }
+
+    update_max_prices(portfolio, prices);
 }
 
 /// Execute rebalance in Finlab mode
@@ -2072,9 +2168,10 @@ fn check_stops_with_trade_tracking(
             }
 
             // Check trailing stop
+            // Finlab formula: triggers when (max_price - current_price) / entry_price >= trail_stop
             if config.trail_stop < f64::INFINITY {
-                let drawdown = (pos.max_price - current_price) / pos.max_price;
-                if drawdown >= config.trail_stop {
+                let drawdown_from_entry = (pos.max_price - current_price) / entry_price;
+                if drawdown_from_entry >= config.trail_stop {
                     return Some(stock_id);
                 }
             }

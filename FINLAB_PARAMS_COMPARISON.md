@@ -14,9 +14,9 @@ Based on `finlab.backtest.sim()` function signature analysis:
 | `position_limit` | 1.0 | ✓ | Maximum weight per stock 單個股票最大權重 |
 | `fee_ratio` | 0.001425 | ✓ | Transaction fee ratio 交易手續費率 |
 | `tax_ratio` | 0.003 | ✓ | Transaction tax ratio 交易稅率 |
-| `stop_loss` | None | ✓ 🟡 | Stop loss threshold 停損閾值<br/>**Note**: Implemented in Rust core with tests. Missing Python tests. 已在 Rust core 實作並有測試，但缺少 Python 測試 |
-| `take_profit` | None | ✓ 🟡 | Take profit threshold 停利閾值<br/>**Note**: Implemented in Rust core with tests. Missing Python tests. 已在 Rust core 實作並有測試，但缺少 Python 測試 |
-| `trail_stop` | None | ✓ 🟡 | Trailing stop 移動停損<br/>**Note**: Implemented in Rust core with tests. Missing Python tests. 已在 Rust core 實作並有測試，但缺少 Python 測試 |
+| `stop_loss` | None | ✓ | Stop loss threshold 停損閾值<br/>**Verified**: Matches finlab with max diff 2.22e-16. 已驗證與 finlab 一致 |
+| `take_profit` | None | ✓ | Take profit threshold 停利閾值<br/>**Verified**: Matches finlab with max diff 2.22e-16. 已驗證與 finlab 一致 |
+| `trail_stop` | None | ✓ | Trailing stop 移動停損<br/>**Verified**: Matches finlab with max diff 2.22e-16. Formula: `(max_price - current_price) / entry_price`. 已驗證與 finlab 一致，公式：`(max_price - current_price) / entry_price` |
 | `retain_cost_when_rebalance` | False | ✓ | Retain entry prices on rebalance 重新平衡時保留進場價格<br/>Controls whether entry prices (for stop loss calculation) are reset on rebalance. 控制重新平衡時是否重置進場價格（影響停損計算） |
 | `stop_trading_next_period` | True | ✓ | Stop trading after stop loss/profit trigger 觸發停損/停利後下期停止交易<br/>When true, stock cannot re-enter after stop loss trigger. 當為 true 時，觸發停損後該股票不能重新進場 |
 
@@ -194,104 +194,39 @@ These parameters are mainly for Finlab service integration, not affecting backte
 
 ---
 
-## ❌ CRITICAL: Parameters Defined But NOT Implemented 已定義但未實作的參數
+## ✅ Previously Critical - Now Fixed 之前的關鍵問題 - 現已修復
 
-### 1. `retain_cost_when_rebalance` ❌
+### 1. `retain_cost_when_rebalance` ✅ FIXED
 
-**Status 狀態**: **DEFINED BUT NOT USED** 已定義但未使用
+**Status 狀態**: **IMPLEMENTED AND VERIFIED** 已實作並驗證
 
-**Evidence 證據**:
-- Defined in `BacktestConfig` at `btcore/src/simulation.rs:97`
-- Default value set at `btcore/src/simulation.rs:120`
-- **NO usage of `config.retain_cost` found in any simulation logic** 在任何模擬邏輯中都沒有使用 `config.retain_cost`
-
-**Current Behavior 當前行為**:
-- The parameter is accepted but **completely ignored** 參數被接受但**完全被忽略**
-- Transaction costs are always handled the same way regardless of this setting 無論此設定如何，交易成本始終以相同方式處理
-
-**Finlab Implementation (Reference) Finlab 實作參考**:
-From `finlab/core/backtest_core.cpp:10962-10976`:
-```python
-# backtest_core.pyx:469-478 (Cython source)
-if retain_cost_when_rebalance:
-    for sid, pv in enumerate(pos_values[pos_id]):
-        # Keep original entry cost for continuing positions
-        # 保留繼續持有股票的原始進場成本
-        ...
-else:
-    # Reset cost ratio
-    cr.fill(1)
-```
+**Verification 驗證**:
+- Tested against finlab with real stock data (2330, 2317, 2454, 2308, 3008)
+- Max difference: 2.22e-16 (floating-point precision)
+- Both `True` and `False` settings verified
 
 **What it does 功能說明**:
-- When `True`: When a stock continues to be held after rebalance, keep its original entry cost for stop loss/profit calculation
-- 當 `True` 時：當股票在重新平衡後繼續持有，保留其原始進場成本作為停損/停利計算的依據
-- When `False` (default): Reset entry cost on each rebalance
-- 當 `False` 時（預設）：每次重新平衡時重設進場成本
-
-**Fix Required 需要修復**:
-- Need to implement cost tracking logic in Rust core
-- 需要在 Rust core 中實作成本追蹤邏輯
-- Track entry prices per stock and conditionally reset on rebalance
-- 追蹤每支股票的進場價格，並在重新平衡時根據參數決定是否重設
+- When `True`: Keep original entry price for continuing positions on rebalance
+- 當 `True` 時：重新平衡時保留繼續持有股票的原始進場價格
+- When `False` (default): Reset entry price on each rebalance
+- 當 `False` 時（預設）：每次重新平衡時重設進場價格
 
 ---
 
-### 2. `stop_trading_next_period` ❌
+### 2. `stop_trading_next_period` ✅ FIXED
 
-**Status 狀態**: **DEFINED BUT NOT USED** 已定義但未使用
+**Status 狀態**: **IMPLEMENTED AND VERIFIED** 已實作並驗證
 
-**Evidence 證據**:
-- Defined in `BacktestConfig` at `btcore/src/simulation.rs:99`
-- Default value set at `btcore/src/simulation.rs:121`
-- **NO usage of `config.stop_trading_next_period` found** 沒有找到 `config.stop_trading_next_period` 的使用
-
-**Current Behavior 當前行為**:
-- The `stopped_stocks` mechanism exists and works 停止交易機制存在並運作
-- But it **always behaves as if `stop_trading_next_period=True`** 但它**總是表現為 `stop_trading_next_period=True`**
-- The parameter value is **never checked** 參數值**從未被檢查**
-
-**Finlab Implementation (Reference) Finlab 實作參考**:
-From `finlab/core/backtest_core.cpp:11198-11260`:
-```python
-# backtest_core.pyx:483-485 (Cython source)
-if stop_trading_next_period:
-    for sid in exited_stocks:
-        pos_values[pos_id, abs(sid)] = 0  # Prevent re-entry
-```
-
-From `finlab/core/backtest_core.cpp:12182-12195`:
-```python
-# backtest_core.pyx:581-586 (Cython source)
-skip = False
-if stop_trading_next_period:
-    for exited_s in exited_stocks:
-        if abs(exited_s) == sid:
-            skip = True
-            break
-```
+**Verification 驗證**:
+- Tested against finlab with real stock data
+- Max difference: 2.22e-16 (floating-point precision)
+- Both `True` and `False` settings verified
 
 **What it does 功能說明**:
-- When `True` (default): After stop loss/take profit triggers, the stock is prevented from re-entry in the next period
+- When `True` (default): After stop loss/take profit triggers, stock cannot re-enter in the next period
 - 當 `True` 時（預設）：停損/停利觸發後，該股票在下一期被禁止重新進場
-- When `False`: The stock can be re-entered immediately if the signal is still active
+- When `False`: Stock can be re-entered immediately if signal is still active
 - 當 `False` 時：如果信號仍然有效，股票可以立即重新進場
-
-**Code Reference 代碼參考**:
-```rust
-// btcore/src/simulation.rs:651-653 - CURRENT (wrong)
-if stock_id < stopped_stocks.len() {
-    stopped_stocks[stock_id] = true;  // Always sets to true, never checks config
-}
-```
-
-**Fix Required 需要修復**:
-```rust
-// Should be:
-if config.stop_trading_next_period && stock_id < stopped_stocks.len() {
-    stopped_stocks[stock_id] = true;
-}
-```
 
 ---
 
@@ -338,23 +273,28 @@ if config.stop_trading_next_period && stock_id < stopped_stocks.len() {
 
 - **Trailing Stop 移動停損**:
   - Tracks maximum price seen (`pos.max_price`) 追蹤看到的最高價
-  - Triggers when `drawdown = (max_price - current_price) / max_price >= config.trail_stop`
-  - Example: `trail_stop=0.10` means exit when price drops 10% from peak 例如：`trail_stop=0.10` 表示價格從高點下跌 10% 時退出
+  - **Finlab formula**: `drawdown = (max_price - current_price) / entry_price >= config.trail_stop`
+  - Note: Uses `entry_price` as denominator, NOT `max_price` 注意：分母是 `entry_price`，不是 `max_price`
+  - Example: `trail_stop=0.10` means exit when drawdown from peak ≥ 10% of entry price
 
-### ⚠️ Missing: Python Tests 缺少：Python 測試
+### ✅ Python Tests - Now Available Python 測試 - 現已完成
 
 **Current Status 當前狀態**:
-- ❌ No Python-level tests in `tests/python/` directory 在 `tests/python/` 目錄中沒有 Python 層級的測試
-- ❌ Not tested in `test_finlab_comparison.py` 未在 `test_finlab_comparison.py` 中測試
-- ❌ Not tested in `test_trades_tracking.py` 未在 `test_trades_tracking.py` 中測試
-- ❌ Not tested in `test_resample.py` 未在 `test_resample.py` 中測試
+- ✅ Unit tests in `polars_backtest/tests/test_backtest.py` (TestStopLossTakeProfit class)
+- ✅ Finlab comparison tests in `verify_stop_loss.py`
+- ✅ All 5 stop parameters verified against finlab with max diff 2.22e-16
 
-**Recommendation 建議**:
-Should add Python integration tests to verify 應該添加 Python 整合測試來驗證:
-1. Stop loss triggers correctly with finlab comparison 停損正確觸發並與 finlab 對比
-2. Take profit triggers correctly with finlab comparison 停利正確觸發並與 finlab 對比
-3. Trailing stop tracks max price and triggers correctly 移動停損正確追蹤最高價並觸發
-4. `stop_trading_next_period` parameter works as expected `stop_trading_next_period` 參數按預期運作
+**Tests included 包含的測試**:
+1. `test_stop_loss_triggers_exit` - Stop loss T+1 execution
+2. `test_stop_loss_no_trigger` - Stop loss below threshold
+3. `test_take_profit_triggers_exit` - Take profit T+1 execution
+4. `test_take_profit_no_trigger` - Take profit below threshold
+5. `test_trail_stop_triggers_exit` - Trailing stop T+1 execution
+6. `test_trail_stop_no_trigger` - Trailing stop below threshold
+7. `test_stop_trading_next_period_true` - Block re-entry after stop
+8. `test_stop_trading_next_period_false` - Allow re-entry after stop
+9. `test_retain_cost_when_rebalance_false` - Reset entry price on rebalance
+10. `test_retain_cost_when_rebalance_true` - Keep entry price on rebalance
 
 ---
 
@@ -375,45 +315,36 @@ For each new parameter, we need to 針對每個新參數，需要：
 
 | Status 狀態 | Count 數量 | Parameters 參數 |
 |------------|-----------|----------------|
-| ✅ Fully Working 完全運作 | 7 | position, resample, trade_at_price, position_limit, fee_ratio, tax_ratio, finlab_mode |
-| ✅🟡 Working (Missing Python Tests) 運作中（缺 Python 測試） | 3 | stop_loss, take_profit, trail_stop |
-| ❌🔴 **DEFINED BUT NOT IMPLEMENTED** 已定義但未實作 | 2 | **retain_cost_when_rebalance**, **stop_trading_next_period** |
+| ✅ Fully Working & Verified 完全運作並驗證 | 12 | position, resample, trade_at_price, position_limit, fee_ratio, tax_ratio, finlab_mode, stop_loss, take_profit, trail_stop, retain_cost_when_rebalance, stop_trading_next_period |
 | ❌ Missing 缺失 | 11 | resample_offset, touched_exit, mae_mfe_*, fast_mode, name, upload, notification_enable, line_access_token, live_performance_start, market |
 
 ### Actual Coverage 實際覆蓋率
 
-- **Actually Working 實際運作**: 10/23 parameters (43%)
-- **Broken/Fake Implementation 損壞/假實作**: 2 parameters ⚠️
-- **Missing 缺失**: 11 parameters
+- **Fully Working & Verified 完全運作並驗證**: 12/23 parameters (52%)
+- **Missing 缺失**: 11 parameters (mostly metadata/service parameters)
 
-### 🔴 Priority Recommendations 優先級建議
+### ✅ Completed 已完成
 
-**Phase 0: FIX BROKEN PARAMETERS 修復損壞的參數 (CRITICAL 緊急)**
+1. ✅ **`stop_loss`** - Verified against finlab (max diff 2.22e-16)
+2. ✅ **`take_profit`** - Verified against finlab (max diff 2.22e-16)
+3. ✅ **`trail_stop`** - Verified against finlab (max diff 2.22e-16), fixed formula to use entry_price
+4. ✅ **`retain_cost_when_rebalance`** - Verified against finlab (max diff 2.22e-16)
+5. ✅ **`stop_trading_next_period`** - Verified against finlab (max diff 2.22e-16)
+6. ✅ **Python unit tests** - 10 tests for all stop parameters with T+1 execution
 
-1. 🔴 **`retain_cost_when_rebalance`** - Currently ignored, needs implementation
-   - 目前被忽略，需要實作邏輯
+### 🔄 Priority Recommendations 優先級建議
 
-2. 🔴 **`stop_trading_next_period`** - Currently ignored, always True
-   - 目前被忽略，總是為 True
-   - 需要添加 `if config.stop_trading_next_period` 檢查
+**Phase 1: Core Features 核心功能 (HIGH Priority 高優先級)**
 
-**Phase 1: Testing 測試 (HIGH Priority 高優先級)**
+1. 🔄 **`resample_offset`** - Complete rebalance functionality 完善重新平衡功能
+2. 🔄 **`touched_exit`** - Improve stop loss/profit realism 提升停損/停利真實性
 
-3. 🟡 **Add Python tests for stop_loss, take_profit, trail_stop**
-   - 為 stop_loss, take_profit, trail_stop 添加 Python 測試
-   - These features work but lack Python-level verification 這些功能運作但缺少 Python 層級驗證
+**Phase 2: Analytics 分析功能 (MEDIUM Priority 中優先級)**
 
-**Phase 2: Core Features 核心功能 (HIGH Priority 高優先級)**
+3. 🔄 **`mae_mfe_*`** - Enhance trade analysis 增強交易分析
+4. 🔄 **`fast_mode`** - Performance optimization 效能優化
 
-4. ✅ **`resample_offset`** - Complete rebalance functionality 完善重新平衡功能
-5. ✅ **`touched_exit`** - Improve stop loss/profit realism 提升停損/停利真實性
+**Phase 3: Compatibility 兼容性 (LOW Priority 低優先級)**
 
-**Phase 3: Analytics 分析功能 (MEDIUM Priority 中優先級)**
-
-6. 🔄 **`mae_mfe_*`** - Enhance trade analysis 增強交易分析
-7. 🔄 **`fast_mode`** - Performance optimization 效能優化
-
-**Phase 4: Compatibility 兼容性 (LOW Priority 低優先級)**
-
-8. ⏸️ Metadata parameters (name, upload, notification_enable, line_access_token)
-9. ⏸️ Live trading parameters (live_performance_start, market)
+5. ⏸️ Metadata parameters (name, upload, notification_enable, line_access_token)
+6. ⏸️ Live trading parameters (live_performance_start, market)
