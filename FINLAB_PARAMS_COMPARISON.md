@@ -4,12 +4,13 @@
 
 Based on `finlab.backtest.sim()` function signature analysis:
 
-### ✅ Supported Parameters 已支援的參數 (17/23)
+### ✅ Supported Parameters 已支援的參數 (13/23)
 
 | Parameter | Finlab Default | Our Implementation | Notes 備註 |
 |------|--------------|-----------|------|
 | `position` | (required) | ✓ | Required, position signals/weights 必需參數，持倉信號/權重 |
-| `resample` | None | ✓ | Rebalance frequency (D/W/M/Q/Y) 重新平衡頻率 |
+| `resample` | None | ✓ | Rebalance frequency. Supports: D/W/M/Q/Y and pandas formats like W-FRI, W-MON, MS, QS 重新平衡頻率 |
+| `resample_offset` | None | ✓ | Time offset for rebalance dates (e.g., '1D', '-1D') 重新平衡日期偏移 |
 | `trade_at_price` | 'close' | ✓ | Trading execution price type 交易執行價格類型 |
 | `position_limit` | 1.0 | ✓ | Maximum weight per stock 單個股票最大權重 |
 | `fee_ratio` | 0.001425 | ✓ | Transaction fee ratio 交易手續費率 |
@@ -31,13 +32,12 @@ Based on `finlab.backtest.sim()` function signature analysis:
 
 ---
 
-### ❌ Missing Parameters 缺失的參數 (6/23)
+### ❌ Missing Parameters 缺失的參數 (10/23)
 
 #### 🔴 Core Functionality 核心功能參數（需要支援）
 
 | Parameter | Finlab Default | Priority 優先級 | Description 說明 |
 |------|--------------|-------|------|
-| `resample_offset` | None | **HIGH 高** | Rebalance offset, e.g. 'W-FRI' for Friday rebalance<br/>重新平衡偏移量，例如 'W-FRI' 表示每週五重新平衡 |
 | `touched_exit` | False | **HIGH 高** | Use high/low prices for stop loss/profit detection<br/>使用 high/low 價格判斷是否觸發停損/停利 |
 | `mae_mfe_window` | 0 | **MEDIUM 中** | MAE/MFE (Maximum Adverse/Favorable Excursion) window<br/>MAE/MFE 窗口大小 |
 | `mae_mfe_window_step` | 1 | **MEDIUM 中** | MAE/MFE window step size<br/>MAE/MFE 窗口步長 |
@@ -315,13 +315,13 @@ For each new parameter, we need to 針對每個新參數，需要：
 
 | Status 狀態 | Count 數量 | Parameters 參數 |
 |------------|-----------|----------------|
-| ✅ Fully Working & Verified 完全運作並驗證 | 12 | position, resample, trade_at_price, position_limit, fee_ratio, tax_ratio, finlab_mode, stop_loss, take_profit, trail_stop, retain_cost_when_rebalance, stop_trading_next_period |
-| ❌ Missing 缺失 | 11 | resample_offset, touched_exit, mae_mfe_*, fast_mode, name, upload, notification_enable, line_access_token, live_performance_start, market |
+| ✅ Fully Working & Verified 完全運作並驗證 | 13 | position, resample, resample_offset, trade_at_price, position_limit, fee_ratio, tax_ratio, finlab_mode, stop_loss, take_profit, trail_stop, retain_cost_when_rebalance, stop_trading_next_period |
+| ❌ Missing 缺失 | 10 | touched_exit, mae_mfe_*, fast_mode, name, upload, notification_enable, line_access_token, live_performance_start, market |
 
 ### Actual Coverage 實際覆蓋率
 
-- **Fully Working & Verified 完全運作並驗證**: 12/23 parameters (52%)
-- **Missing 缺失**: 11 parameters (mostly metadata/service parameters)
+- **Fully Working & Verified 完全運作並驗證**: 13/23 parameters (57%)
+- **Missing 缺失**: 10 parameters (mostly metadata/service parameters)
 
 ### ✅ Completed 已完成
 
@@ -331,13 +331,14 @@ For each new parameter, we need to 針對每個新參數，需要：
 4. ✅ **`retain_cost_when_rebalance`** - Verified against finlab (max diff 2.22e-16)
 5. ✅ **`stop_trading_next_period`** - Verified against finlab (max diff 2.22e-16)
 6. ✅ **Python unit tests** - 10 tests for all stop parameters with T+1 execution
+7. ✅ **`resample_offset`** - Supports pandas offset formats ('1D', '-1D', etc.)
+8. ✅ **Extended `resample`** - Supports 'W-FRI', 'W-MON', 'MS', 'QS' formats
 
 ### 🔄 Priority Recommendations 優先級建議
 
 **Phase 1: Core Features 核心功能 (HIGH Priority 高優先級)**
 
-1. 🔄 **`resample_offset`** - Complete rebalance functionality 完善重新平衡功能
-2. 🔄 **`touched_exit`** - Improve stop loss/profit realism 提升停損/停利真實性
+1. 🔄 **`touched_exit`** - Improve stop loss/profit realism 提升停損/停利真實性
 
 **Phase 2: Analytics 分析功能 (MEDIUM Priority 中優先級)**
 
