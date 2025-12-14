@@ -219,6 +219,7 @@ def _resample_position(
     position: pl.DataFrame,
     price_dates: list,
     resample: str,
+    resample_offset: str | None = None,
 ) -> pl.DataFrame:
     """Resample position DataFrame to target frequency.
 
@@ -227,12 +228,20 @@ def _resample_position(
     Args:
         position: Position DataFrame with date column and stock columns.
         price_dates: List of all trading dates from price DataFrame.
-        resample: Resample frequency ('D', 'W', 'M', 'Q', 'Y').
+        resample: Resample frequency. Supports:
+            - Simple: 'D', 'W', 'M', 'Q', 'Y'
+            - With anchor: 'W-FRI' (weekly on Friday), 'W-MON' (weekly on Monday)
+            - Month variants: 'MS' (month start), 'ME' (month end)
+            - Quarter variants: 'QS' (quarter start), 'QE' (quarter end)
+        resample_offset: Optional time offset to shift rebalance dates.
+            Examples: '1D' (shift 1 day forward), '-1D' (shift 1 day back)
 
     Returns:
         Resampled position DataFrame with dates at period boundaries (trading days).
     """
     import pandas as pd
+    from pandas.tseries.offsets import DateOffset
+    from pandas.tseries.frequencies import to_offset
 
     if resample == 'D':
         return position
@@ -251,33 +260,59 @@ def _resample_position(
     all_dates_pd = pd.DatetimeIndex([pd.Timestamp(d) for d in price_dates])
     pos_filled = pos_pd.reindex(all_dates_pd).ffill()
 
-    # Create a period column for grouping
-    if resample == 'W':
-        # Group by ISO week (year + week number)
-        period = pos_filled.index.to_period('W')
-    elif resample == 'M':
-        period = pos_filled.index.to_period('M')
-    elif resample == 'Q':
-        period = pos_filled.index.to_period('Q')
-    elif resample == 'Y':
-        period = pos_filled.index.to_period('Y')
-    else:
-        raise ValueError(f"Invalid resample frequency: {resample}. "
-                        "Must be 'D', 'W', 'M', 'Q', or 'Y'")
+    # Normalize resample string for pandas 2.2+ compatibility
+    freq = resample
+    if pd.__version__ >= '2.2.0':
+        # Old strings need 'E' suffix for end-of-period
+        old_resample_strings = ['M', 'BM', 'SM', 'CBM', 'Q', 'BQ', 'A', 'Y', 'BY']
+        if freq in old_resample_strings:
+            freq += 'E'
 
-    # Add period column and group by it, taking the LAST trading day in each period
-    pos_filled['_period'] = period
-    pos_resampled = pos_filled.groupby('_period').last()
+    # Generate rebalance dates using pandas date_range
+    start_date = all_dates_pd[0]
+    end_date = all_dates_pd[-1]
 
-    # The index is now periods; we need to get the actual trading dates
-    # Find the last trading date for each period from the original grouped data
-    last_dates = pos_filled.reset_index().groupby('_period')['index'].last()
+    try:
+        rebalance_dates = pd.date_range(start=start_date, end=end_date, freq=freq)
+    except ValueError as e:
+        raise ValueError(f"Invalid resample frequency: {resample}. Error: {e}")
 
-    # Convert back to Polars using the actual trading dates
-    resampled_dates = [str(d.date()) for d in last_dates.tolist()]
+    # Apply resample_offset if provided
+    if resample_offset is not None:
+        try:
+            offset = to_offset(resample_offset)
+            rebalance_dates = rebalance_dates + offset
+        except ValueError as e:
+            raise ValueError(f"Invalid resample_offset: {resample_offset}. Error: {e}")
+
+    # Filter to valid trading dates and find the last trading day <= each rebalance date
+    trading_dates_set = set(all_dates_pd)
+    selected_dates = []
+
+    for rebal_date in rebalance_dates:
+        # Find the last trading day that is <= rebalance date
+        valid_dates = [d for d in all_dates_pd if d <= rebal_date]
+        if valid_dates:
+            last_trading_day = max(valid_dates)
+            if last_trading_day not in selected_dates:
+                selected_dates.append(last_trading_day)
+
+    if not selected_dates:
+        # If no valid dates found, return original position
+        return position
+
+    # Get position values at selected dates
+    pos_at_dates = pos_filled.loc[pos_filled.index.isin(selected_dates)]
+
+    # Remove duplicates and sort
+    pos_at_dates = pos_at_dates[~pos_at_dates.index.duplicated(keep='last')]
+    pos_at_dates = pos_at_dates.sort_index()
+
+    # Convert back to Polars
+    resampled_dates = [str(d.date()) for d in pos_at_dates.index.tolist()]
     result_data = {date_col: resampled_dates}
     for col in stock_cols:
-        result_data[col] = pos_resampled[col].tolist()
+        result_data[col] = pos_at_dates[col].tolist()
 
     return pl.DataFrame(result_data)
 
@@ -286,6 +321,7 @@ def backtest(
     prices: pl.DataFrame,
     position: pl.DataFrame,
     resample: str = 'D',
+    resample_offset: str | None = None,
     rebalance_indices: list[int] | None = None,
     fee_ratio: float = 0.001425,
     tax_ratio: float = 0.003,
@@ -316,12 +352,18 @@ def backtest(
                   as columns. Column names must match price columns.
                   - Boolean values: treated as equal-weight signals (True = hold)
                   - Float values: treated as custom weights (will be normalized)
-        resample: Rebalance frequency. Options:
+        resample: Rebalance frequency. Supports:
                   - 'D': Daily (default, no resampling)
                   - 'W': Weekly (rebalance on last trading day of each week)
+                  - 'W-FRI': Weekly on Friday
+                  - 'W-MON': Weekly on Monday
                   - 'M': Monthly (rebalance on last trading day of each month)
+                  - 'MS': Month start
                   - 'Q': Quarterly
+                  - 'QS': Quarter start
                   - 'Y': Yearly
+        resample_offset: Optional time offset to shift rebalance dates.
+                        Examples: '1D' (shift 1 day forward), '-1D' (shift 1 day back)
         rebalance_indices: List of row indices in prices where rebalancing occurs.
                           If None, will be computed from position dates.
         fee_ratio: Transaction fee ratio (default: 0.001425 for Taiwan stocks)
@@ -376,7 +418,7 @@ def backtest(
 
     # Apply resample if needed
     if resample != 'D':
-        position = _resample_position(position, price_dates, resample)
+        position = _resample_position(position, price_dates, resample, resample_offset)
 
     # Select only common stocks and reorder
     prices_data = prices.select(position_stock_cols)
@@ -699,6 +741,7 @@ def backtest_with_report(
     close: pl.DataFrame,
     position: pl.DataFrame,
     resample: str = 'D',
+    resample_offset: str | None = None,
     trade_at_price: str | pl.DataFrame = "close",
     open: pl.DataFrame | None = None,
     high: pl.DataFrame | None = None,
@@ -741,12 +784,18 @@ def backtest_with_report(
         close: DataFrame with dates as index and adjusted close prices as columns.
                Used for cumulative return calculation.
         position: DataFrame with rebalance dates as index and position weights as columns.
-        resample: Rebalance frequency. Options:
+        resample: Rebalance frequency. Supports:
                   - 'D': Daily (default, no resampling)
                   - 'W': Weekly (rebalance on last trading day of each week)
+                  - 'W-FRI': Weekly on Friday
+                  - 'W-MON': Weekly on Monday
                   - 'M': Monthly (rebalance on last trading day of each month)
+                  - 'MS': Month start
                   - 'Q': Quarterly
+                  - 'QS': Quarter start
                   - 'Y': Yearly
+        resample_offset: Optional time offset to shift rebalance dates.
+                        Examples: '1D' (shift 1 day forward), '-1D' (shift 1 day back)
         trade_at_price: Price type for trading ('close', 'open', 'high', 'low')
                        or a custom DataFrame with trading prices.
         open: DataFrame with open prices (optional, required if trade_at_price='open').
@@ -843,7 +892,7 @@ def backtest_with_report(
 
     # Apply resample if needed
     if resample != 'D':
-        position = _resample_position(position, dates, resample)
+        position = _resample_position(position, dates, resample, resample_offset)
 
     # Ensure position has same stock columns
     position_stock_cols = [c for c in position.columns if c in stock_cols]
