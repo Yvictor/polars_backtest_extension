@@ -55,6 +55,7 @@ select = ["E", "F", "I", "W"]
 
 [dependency-groups]
 dev = [
+    "dotenv>=0.9.9",
     "finlab>=1.5.5",
     "pytest>=8.4.2",
 ]
