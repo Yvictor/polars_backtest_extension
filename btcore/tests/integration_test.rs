@@ -181,6 +181,49 @@ fn test_take_profit_exit() {
     println!("creturn with take profit: {:?}", creturn);
 }
 
+/// Test finlab mode stop exit with fee - exposes bug where cost_basis not updated to market value
+#[test]
+fn test_finlab_mode_stop_exit_with_fee() {
+    // Bug: In finlab mode, stop exit uses cost_basis instead of market value
+    // This causes incorrect exit value when there are fees
+    let prices = vec![
+        vec![100.0],  // Day 0: signal
+        vec![100.0],  // Day 1: entry at 100
+        vec![125.0],  // Day 2: +25%, triggers 20% take profit
+        vec![130.0],  // Day 3: execute exit (T+1)
+        vec![140.0],  // Day 4: should be flat (already exited)
+    ];
+
+    let signals = vec![vec![true]];
+    let rebalance_indices = vec![0];
+
+    let config = BacktestConfig {
+        fee_ratio: 0.01,  // 1% fee - this exposes the bug
+        tax_ratio: 0.0,
+        take_profit: 0.20,  // 20% take profit
+        finlab_mode: true,
+        ..Default::default()
+    };
+
+    let creturn = run_backtest(&prices, &signals, &rebalance_indices, &config);
+
+    assert_eq!(creturn.len(), 5);
+    println!("creturn finlab mode stop with fee: {:?}", creturn);
+
+    // After exit (Day 3), portfolio should be flat
+    assert!((creturn[4] - creturn[3]).abs() < 1e-10,
+        "Portfolio should be flat after stop exit: day3={} day4={}", creturn[3], creturn[4]);
+
+    // Key assertion: Final value should reflect the profit from 100 -> 130 (exit price)
+    // With correct exit: market_value = 130, exit_value ≈ 130 * 0.99 = 128.7
+    // With buggy exit: uses cost_basis = 100, exit_value ≈ 100 * 0.99 = 99
+    //
+    // The final creturn should be > 1.2 (we made 25%+ profit)
+    // If bug exists, it would be close to 0.99 (loss!)
+    assert!(creturn[4] > 1.2,
+        "Final value {} should reflect profit (>1.2), bug would give ~0.99", creturn[4]);
+}
+
 /// Test multiple rebalance periods
 #[test]
 fn test_multiple_rebalance_periods() {

@@ -297,6 +297,7 @@ pub fn run_backtest<S: IntoWeights>(
                     execute_pending_stops_finlab(
                         &mut portfolio,
                         &pending_stop_exits,
+                        &prices[t],
                         &mut stopped_stocks,
                         config,
                     );
@@ -556,14 +557,27 @@ fn detect_stops_finlab(
 fn execute_pending_stops_finlab(
     portfolio: &mut PortfolioState,
     pending_stops: &[usize],
+    prices: &[f64],
     stopped_stocks: &mut [bool],
     config: &BacktestConfig,
 ) {
     for &stock_id in pending_stops {
         if let Some(pos) = portfolio.positions.remove(&stock_id) {
-            // Finlab exit formula: cash += cost_basis - |cost_basis| * (fee + tax)
-            // Note: pos.value IS cost_basis in Finlab mode
-            let sell_value = pos.value - pos.value.abs() * (config.fee_ratio + config.tax_ratio);
+            // First, update cost_basis to market value (like execute_finlab_rebalance does)
+            // This ensures exit fee is calculated on market value, not original cost
+            let market_value = if stock_id < prices.len() && pos.entry_price > 0.0 {
+                let close_price = prices[stock_id];
+                if close_price > 0.0 {
+                    pos.value * close_price / pos.entry_price
+                } else {
+                    pos.value
+                }
+            } else {
+                pos.value
+            };
+
+            // Finlab exit formula: cash += market_value - |market_value| * (fee + tax)
+            let sell_value = market_value - market_value.abs() * (config.fee_ratio + config.tax_ratio);
             portfolio.cash += sell_value;
 
             if config.stop_trading_next_period && stock_id < stopped_stocks.len() {
@@ -2196,6 +2210,48 @@ mod tests {
         assert_eq!(creturn.len(), 4);
         // After stop loss triggers, portfolio should stay flat
         // (position was exited on day 2 when loss exceeded 10%)
+    }
+
+    #[test]
+    fn test_finlab_mode_stop_exit_uses_market_value() {
+        // Verify that stop exit in finlab mode uses market value for fee calculation
+        // Bug fixed: was using cost_basis instead of market value
+        let prices = vec![
+            vec![100.0],  // Day 0: signal
+            vec![100.0],  // Day 1: entry at 100
+            vec![125.0],  // Day 2: +25%, triggers 20% take profit
+            vec![130.0],  // Day 3: execute exit (T+1)
+            vec![140.0],  // Day 4: should be flat (already exited)
+        ];
+
+        let signals = vec![vec![true]];
+        let rebalance_indices = vec![0];
+
+        let config = BacktestConfig {
+            fee_ratio: 0.01,  // 1% fee
+            tax_ratio: 0.0,
+            take_profit: 0.20,
+            finlab_mode: true,
+            ..Default::default()
+        };
+
+        let creturn = run_backtest(&prices, &signals, &rebalance_indices, &config);
+
+        assert_eq!(creturn.len(), 5);
+
+        // After exit, portfolio should be flat
+        assert!(
+            (creturn[4] - creturn[3]).abs() < 1e-10,
+            "Portfolio should be flat after stop exit"
+        );
+
+        // Final value should reflect profit from 100 -> 130 (exit price) minus fees
+        // If bug existed, would be ~0.99 (only cost_basis returned)
+        assert!(
+            creturn[4] > 1.2,
+            "Final value {} should reflect profit (>1.2)",
+            creturn[4]
+        );
     }
 
     // Tests for run_backtest with weights
