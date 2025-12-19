@@ -20,7 +20,6 @@ from polars_backtest._polars_backtest import (
     BacktestConfig,
     TradeRecord,
     BacktestResult,
-    backtest_finlab as _backtest_finlab,
     backtest_signals,
     backtest_weights,
     backtest_with_trades as _backtest_with_trades,
@@ -35,7 +34,6 @@ __all__ = [
     "backtest_signals",
     "backtest_weights",
     "backtest",
-    "backtest_finlab",
     "backtest_with_report",
     "daily_returns",
     "cumulative_returns",
@@ -477,150 +475,6 @@ def backtest(
     return result
 
 
-def backtest_finlab(
-    trade_prices: pl.DataFrame,
-    close_prices: pl.DataFrame,
-    position: pl.DataFrame,
-    rebalance_indices: list[int] | None = None,
-    fee_ratio: float = 0.001425,
-    tax_ratio: float = 0.003,
-    stop_loss: float = 1.0,
-    take_profit: float = float("inf"),
-    trail_stop: float = float("inf"),
-    position_limit: float = 1.0,
-    retain_cost_when_rebalance: bool = False,
-    stop_trading_next_period: bool = True,
-) -> pl.DataFrame:
-    """Run Finlab-compatible backtest with dual price matrices.
-
-    This function exactly replicates Finlab's backtest_core calculation by using
-    two separate price matrices:
-    - trade_prices: Original prices for entry_price (used in balance calculation ratio)
-    - close_prices: Adjusted prices for current market value
-
-    Finlab's Core Formula (from backtest_core.cpp line 11495-11516):
-        balance = cash
-        for each position:
-            trade_price = price_values[entry_day, stock]  # original price at entry
-            close_price = close_values[current_day, stock]  # adjusted close
-            balance += cost_basis * close_price / trade_price
-
-    Key Differences from standard backtest():
-        - Uses trade_prices (original) for entry_price in balance calculation
-        - Uses close_prices (adjusted) for current market value
-        - Balance = cash + Σ(cost_basis * close_price / trade_price)
-        - Rebalance uses Σ(cost_basis) as base, NOT market value
-
-    Args:
-        trade_prices: DataFrame with dates as index and original stock prices as columns.
-                     Must be sorted by date. Used for entry_price calculation.
-        close_prices: DataFrame with dates as index and adjusted stock prices as columns.
-                     Must be sorted by date. Used for current market value.
-        position: DataFrame with rebalance dates as index and position weights as columns.
-                 Column names must match price columns. Must be float weights.
-        rebalance_indices: List of row indices in prices where rebalancing occurs.
-                          If None, will be computed from position dates.
-        fee_ratio: Transaction fee ratio (default: 0.001425 for Taiwan stocks)
-        tax_ratio: Transaction tax ratio (default: 0.003 for Taiwan stocks)
-        stop_loss: Stop loss threshold as decimal (e.g., 0.1 = 10% loss triggers exit).
-                  Default 1.0 disables stop loss.
-        take_profit: Take profit threshold as decimal. Default inf disables.
-        trail_stop: Trailing stop threshold as decimal. Default inf disables.
-        position_limit: Maximum weight per stock. Default 1.0.
-        retain_cost_when_rebalance: If True, retain transaction costs when rebalancing.
-        stop_trading_next_period: If True, stop trading the stock next period after
-                                 stop loss/take profit triggers.
-
-    Returns:
-        DataFrame with columns: date, creturn (cumulative return)
-
-    Example:
-        >>> # Finlab-compatible backtest with original and adjusted prices
-        >>> trade_prices = pl.DataFrame({
-        ...     "date": ["2024-01-01", "2024-01-02", "2024-01-03"],
-        ...     "2330": [100.0, 102.0, 105.0],  # original prices
-        ...     "2317": [200.0, 198.0, 202.0],
-        ... })
-        >>> close_prices = pl.DataFrame({
-        ...     "date": ["2024-01-01", "2024-01-02", "2024-01-03"],
-        ...     "2330": [100.0, 102.0, 105.0],  # adjusted prices
-        ...     "2317": [200.0, 198.0, 202.0],
-        ... })
-        >>> position = pl.DataFrame({
-        ...     "date": ["2024-01-01"],
-        ...     "2330": [0.5],
-        ...     "2317": [0.5],
-        ... })
-        >>> result = backtest_finlab(trade_prices, close_prices, position)
-    """
-    # Get the date column (first column)
-    date_col = trade_prices.columns[0]
-    stock_cols = trade_prices.columns[1:]
-
-    # Ensure position has same stock columns
-    position_stock_cols = [c for c in position.columns if c in stock_cols]
-    if not position_stock_cols:
-        raise ValueError("Position and prices must have common stock columns")
-
-    # Select only common stocks and reorder
-    trade_prices_data = trade_prices.select(position_stock_cols)
-    close_prices_data = close_prices.select(position_stock_cols)
-    position_data = position.select(position_stock_cols)
-
-    # Cast to float if needed
-    position_data = position_data.cast(pl.Float64)
-
-    # Calculate rebalance indices if not provided
-    if rebalance_indices is None:
-        # Get position dates
-        pos_date_col = position.columns[0]
-        position_dates = position.select(pos_date_col).to_series().to_list()
-        price_dates = trade_prices.select(date_col).to_series().to_list()
-
-        rebalance_indices = []
-        for pd in position_dates:
-            try:
-                idx = price_dates.index(pd)
-                rebalance_indices.append(idx)
-            except ValueError:
-                # Date not found, skip
-                pass
-
-        if not rebalance_indices:
-            raise ValueError("No matching dates between prices and position")
-
-    # Create config
-    config = BacktestConfig(
-        fee_ratio=fee_ratio,
-        tax_ratio=tax_ratio,
-        stop_loss=stop_loss,
-        take_profit=take_profit,
-        trail_stop=trail_stop,
-        position_limit=position_limit,
-        retain_cost_when_rebalance=retain_cost_when_rebalance,
-        stop_trading_next_period=stop_trading_next_period,
-        finlab_mode=True,  # This function always uses Finlab mode
-    )
-
-    # Run Finlab-compatible backtest
-    creturn = _backtest_finlab(
-        trade_prices_data,
-        close_prices_data,
-        position_data,
-        rebalance_indices,
-        config,
-    )
-
-    # Build result DataFrame
-    dates = trade_prices.select(date_col).to_series()
-    result = pl.DataFrame({
-        date_col: dates,
-        "creturn": creturn,
-    })
-
-    return result
-
-
 class Report:
     """Backtest report with trades and statistics.
 
@@ -902,10 +756,6 @@ def backtest_with_report(
     # Select only common stocks and reorder
     close_data = close.select(position_stock_cols)
     original_prices_data = original_prices.select(position_stock_cols)
-    position_data = position.select(position_stock_cols)
-
-    # Cast to float if needed
-    position_data = position_data.cast(pl.Float64)
 
     # Calculate rebalance indices if not provided
     if rebalance_indices is None:
@@ -925,6 +775,17 @@ def backtest_with_report(
         if not rebalance_indices:
             raise ValueError("No matching dates between prices and position")
 
+        # When rebalance_indices auto-calculated, position already has correct rows
+        position_data = position.select(position_stock_cols)
+    else:
+        # When rebalance_indices provided, filter position to only those rows
+        # This handles the case where position has all dates (forward-filled)
+        # Rust expects weights indexed by rebalance event number, not time index
+        position_data = position.select(position_stock_cols)[rebalance_indices]
+
+    # Cast to float if needed
+    position_data = position_data.cast(pl.Float64)
+
     # Create config
     config = BacktestConfig(
         fee_ratio=fee_ratio,
@@ -935,7 +796,7 @@ def backtest_with_report(
         position_limit=position_limit,
         retain_cost_when_rebalance=retain_cost_when_rebalance,
         stop_trading_next_period=stop_trading_next_period,
-        finlab_mode=False,  # Use standard mode for creturn (matches Finlab perfectly)
+        finlab_mode=True,  # Use finlab mode for creturn calculation (matches Finlab perfectly)
     )
 
     # Run backtest with trades tracking
