@@ -22,13 +22,15 @@ pub mod returns;
 pub mod simulation;
 pub mod stats;
 pub mod trades;
+pub mod weights;
 
 // Re-export commonly used items
 pub use returns::{cumulative_returns, daily_returns, portfolio_return};
 pub use simulation::{
     run_backtest, run_backtest_finlab, run_backtest_finlab_full, run_backtest_with_trades,
-    run_backtest_with_weights, run_simple_backtest, BacktestConfig, BacktestResult,
-    FinlabPriceData, OhlcPrices, TradeRecord as SimTradeRecord,
+    BacktestConfig, BacktestResult, FinlabPriceData, OhlcPrices,
+    TradeRecord as SimTradeRecord,
 };
 pub use stats::{calc_cagr, max_drawdown, sharpe_ratio, sortino_ratio, BacktestStats};
 pub use trades::TradeRecord;
+pub use weights::IntoWeights;

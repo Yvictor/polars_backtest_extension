@@ -124,6 +124,11 @@ impl Default for BacktestConfig {
     }
 }
 
+// Re-export IntoWeights from weights module
+pub use crate::weights::IntoWeights;
+
+use crate::weights::normalize_weights_finlab;
+
 /// Position in a single stock
 #[derive(Debug, Clone)]
 struct Position {
@@ -195,9 +200,13 @@ impl PortfolioState {
 
 /// Run backtest simulation (T+1 execution mode, like Finlab)
 ///
+/// This is a unified backtest function that accepts both boolean signals and float weights.
+///
 /// # Arguments
 /// * `prices` - 2D array of prices [n_times x n_assets]
-/// * `signals` - 2D array of boolean signals [n_rebalance_times x n_assets]
+/// * `signals` - 2D array of signals [n_rebalance_times x n_assets]
+///   - `Vec<Vec<bool>>`: Boolean signals, converted to equal weights (fully invested)
+///   - `Vec<Vec<f64>>`: Float weights, normalized using Finlab rules (allows partial investment)
 /// * `rebalance_indices` - Indices in price array where rebalancing occurs
 /// * `config` - Backtest configuration
 ///
@@ -212,9 +221,21 @@ impl PortfolioState {
 /// - Entry fee applied on Day T+1
 /// - First price return for new entries starts Day T+2
 /// - Existing positions experience Day T→T+1 return on Day T+1
-pub fn run_backtest(
+///
+/// # Examples
+///
+/// ```ignore
+/// // Using boolean signals (equal weight, fully invested)
+/// let signals: Vec<Vec<bool>> = vec![vec![true, false, true]];
+/// let result = run_backtest(&prices, &signals, &indices, &config);
+///
+/// // Using float weights (custom allocation)
+/// let weights: Vec<Vec<f64>> = vec![vec![0.5, 0.0, 0.3]];
+/// let result = run_backtest(&prices, &weights, &indices, &config);
+/// ```
+pub fn run_backtest<S: IntoWeights>(
     prices: &[Vec<f64>],
-    signals: &[Vec<bool>],
+    signals: &[S],
     rebalance_indices: &[usize],
     config: &BacktestConfig,
 ) -> Vec<f64> {
@@ -230,136 +251,6 @@ pub fn run_backtest(
 
     // Map rebalance index -> signal index
     let mut signal_idx = 0;
-
-    // Previous prices for return calculation
-    let mut prev_prices = prices[0].clone();
-
-    // Cumulative return array
-    let mut creturn = Vec::with_capacity(n_times);
-
-    // Track which stocks to skip due to stop loss/take profit
-    let mut stopped_stocks: Vec<bool> = vec![false; n_assets];
-
-    // Pending weights to execute on next day (T+1 execution)
-    let mut pending_weights: Option<Vec<f64>> = None;
-
-    // Pending stop exits to execute on next day (T+1 execution)
-    let mut pending_stop_exits: Vec<usize> = Vec::new();
-
-    for t in 0..n_times {
-        // T+1 execution model (Finlab-compatible):
-        // - Entries: happen at prev_prices (yesterday's close), then experience today's return
-        // - Stops: detected on day N, executed on day N+1 AFTER experiencing day N+1's return
-        if t > 0 {
-            if let Some(target_weights) = pending_weights.take() {
-                // T+1 execution: rebalance at prev_prices, then experience today's return
-                execute_t1_rebalance(
-                    &mut portfolio,
-                    &target_weights,
-                    &prev_prices,
-                    &prices[t],
-                    config,
-                );
-
-                stopped_stocks = vec![false; n_assets];
-            } else {
-                // No pending weights, just update position values
-                update_position_values(&mut portfolio, &prices[t], &prev_prices);
-            }
-
-            // Execute pending stop exits AFTER positions have experienced today's return
-            // This matches Finlab's behavior where exit happens at execution day's close
-            if !pending_stop_exits.is_empty() {
-                execute_pending_stops(
-                    &mut portfolio,
-                    &pending_stop_exits,
-                    &mut stopped_stocks,
-                    config,
-                );
-                pending_stop_exits.clear();
-            }
-
-            // Detect stops for T+1 execution (mark for exit tomorrow)
-            let new_stops = detect_stops(&portfolio, &prices[t], config);
-            pending_stop_exits.extend(new_stops);
-        }
-
-        // Check if this is a rebalance day
-        let should_rebalance = rebalance_indices.contains(&t) && signal_idx < signals.len();
-
-        if should_rebalance {
-            // Get target weights from signals
-            let target_weights = calculate_target_weights(
-                &signals[signal_idx],
-                &stopped_stocks,
-                config.position_limit,
-            );
-
-            // T+1 mode: store for execution on next day
-            pending_weights = Some(target_weights);
-
-            signal_idx += 1;
-        }
-
-        // Record cumulative return
-        creturn.push(portfolio.balance());
-
-        // Update previous prices
-        prev_prices = prices[t].clone();
-    }
-
-    creturn
-}
-
-/// Run backtest simulation with custom float weights (T+1 execution mode, like Finlab)
-///
-/// This function accepts float weights directly, matching Finlab's behavior
-/// when position DataFrame contains float values.
-///
-/// # Arguments
-/// * `prices` - 2D array of prices [n_times x n_assets]
-/// * `weights` - 2D array of float weights [n_rebalance_times x n_assets]
-/// * `rebalance_indices` - Indices in price array where rebalancing occurs
-/// * `config` - Backtest configuration
-///
-/// # Returns
-/// Vector of cumulative returns at each time step
-///
-/// # Weight Normalization (matches Finlab)
-///
-/// Weights are normalized like Finlab:
-/// ```text
-/// total_weight = abs(weights).sum().clip(1, None)
-/// normalized = weights / total_weight
-/// normalized = normalized.clip(-position_limit, position_limit)
-/// ```
-///
-/// # Execution Model (T+1, Finlab-compatible)
-///
-/// This function uses T+1 execution to match Finlab's behavior:
-/// - Signal on Day T
-/// - Trade executes at Day T+1's close price
-/// - Entry fee applied on Day T+1
-/// - First price return for new entries starts Day T+2
-/// - Existing positions experience Day T→T+1 return on Day T+1
-pub fn run_backtest_with_weights(
-    prices: &[Vec<f64>],
-    weights: &[Vec<f64>],
-    rebalance_indices: &[usize],
-    config: &BacktestConfig,
-) -> Vec<f64> {
-    if prices.is_empty() {
-        return vec![];
-    }
-
-    let n_times = prices.len();
-    let n_assets = prices[0].len();
-
-    // Initialize portfolio
-    let mut portfolio = PortfolioState::new();
-
-    // Map rebalance index -> weight index
-    let mut weight_idx = 0;
 
     // Previous prices for return calculation
     let mut prev_prices = prices[0].clone();
@@ -418,16 +309,16 @@ pub fn run_backtest_with_weights(
             }
 
             // Check if this is a rebalance (signal) day
-            let should_rebalance = rebalance_indices.contains(&t) && weight_idx < weights.len();
+            let should_rebalance = rebalance_indices.contains(&t) && signal_idx < signals.len();
 
             if should_rebalance {
-                let target_weights = normalize_weights_finlab(
-                    &weights[weight_idx],
+                // Use IntoWeights trait to convert signal to weights
+                let target_weights = signals[signal_idx].into_weights(
                     &stopped_stocks,
                     config.position_limit,
                 );
                 pending_weights = Some(target_weights);
-                weight_idx += 1;
+                signal_idx += 1;
             }
 
             // Record cumulative return using Finlab formula
@@ -472,12 +363,11 @@ pub fn run_backtest_with_weights(
             }
 
             // Check if this is a rebalance (signal) day
-            let should_rebalance = rebalance_indices.contains(&t) && weight_idx < weights.len();
+            let should_rebalance = rebalance_indices.contains(&t) && signal_idx < signals.len();
 
             if should_rebalance {
-                // Normalize weights like Finlab
-                let target_weights = normalize_weights_finlab(
-                    &weights[weight_idx],
+                // Use IntoWeights trait to convert signal to weights
+                let target_weights = signals[signal_idx].into_weights(
                     &stopped_stocks,
                     config.position_limit,
                 );
@@ -485,7 +375,7 @@ pub fn run_backtest_with_weights(
                 // T+1 mode: store for execution on next day
                 pending_weights = Some(target_weights);
 
-                weight_idx += 1;
+                signal_idx += 1;
             }
 
             // Record cumulative return
@@ -497,110 +387,6 @@ pub fn run_backtest_with_weights(
     }
 
     creturn
-}
-
-/// Normalize weights like Finlab does
-///
-/// Finlab's normalization:
-/// ```python
-/// total_weight = position.abs().sum(axis=1).clip(1, None)
-/// position = position.astype(float).div(total_weight, axis=0).fillna(0)
-///            .clip(-abs(position_limit), abs(position_limit))
-/// ```
-fn normalize_weights_finlab(
-    weights: &[f64],
-    stopped_stocks: &[bool],
-    position_limit: f64,
-) -> Vec<f64> {
-    let mut result = Vec::with_capacity(weights.len());
-
-    // Calculate total absolute weight (clip to min 1.0 like Finlab)
-    let total_abs_weight: f64 = weights.iter().map(|w| w.abs()).sum();
-    let divisor = total_abs_weight.max(1.0);
-
-    // Normalize and apply stops
-    for (i, &w) in weights.iter().enumerate() {
-        let stopped = stopped_stocks.get(i).copied().unwrap_or(false);
-        if stopped {
-            result.push(0.0);
-        } else {
-            // Normalize by total weight
-            let normalized = w / divisor;
-            // Clip to position limit
-            let clipped = normalized.clamp(-position_limit, position_limit);
-            result.push(clipped);
-        }
-    }
-
-    result
-}
-
-/// Calculate target weights from boolean signals
-fn calculate_target_weights(
-    signals: &[bool],
-    stopped_stocks: &[bool],
-    position_limit: f64,
-) -> Vec<f64> {
-    let mut weights = Vec::with_capacity(signals.len());
-
-    // Count active signals (excluding stopped stocks)
-    let active_count: usize = signals
-        .iter()
-        .zip(stopped_stocks.iter())
-        .filter(|(&sig, &stopped)| sig && !stopped)
-        .count();
-
-    if active_count == 0 {
-        return vec![0.0; signals.len()];
-    }
-
-    // Equal weight
-    let weight = (1.0 / active_count as f64).min(position_limit);
-
-    for (sig, stopped) in signals.iter().zip(stopped_stocks.iter()) {
-        if *sig && !*stopped {
-            weights.push(weight);
-        } else {
-            weights.push(0.0);
-        }
-    }
-
-    // Normalize if position limit reduced total below 1.0
-    let total: f64 = weights.iter().sum();
-    if total > 0.0 && total < 1.0 {
-        for w in weights.iter_mut() {
-            *w /= total;
-        }
-    }
-
-    // Re-apply position limit
-    apply_position_limit(&mut weights, position_limit);
-
-    weights
-}
-
-/// Apply position limit iteratively
-fn apply_position_limit(weights: &mut [f64], limit: f64) {
-    for _ in 0..100 {
-        let mut needs_cap = false;
-        for w in weights.iter_mut() {
-            if *w > limit {
-                *w = limit;
-                needs_cap = true;
-            }
-        }
-
-        if !needs_cap {
-            break;
-        }
-
-        let total: f64 = weights.iter().sum();
-        if total > 0.0 {
-            for w in weights.iter_mut() {
-                *w /= total;
-            }
-        }
-    }
 }
 
 /// Update position values based on price changes
@@ -838,11 +624,20 @@ fn execute_finlab_rebalance(
 ) {
     // If retain_cost_when_rebalance is false (default), reset all entry prices
     // This matches Finlab's behavior where cr.fill(1) resets all cumulative returns
+    // CRITICAL: We must also update cost_basis to preserve portfolio balance
+    // Formula: cost_basis_new = cost_basis * close / entry_price (current market value)
+    // Then:    entry_price_new = close
+    // Result:  cost_basis_new * close / entry_price_new = cost_basis_new * 1 = original value
     if !config.retain_cost_when_rebalance {
         for (stock_id, pos) in portfolio.positions.iter_mut() {
             if *stock_id < prices.len() {
-                pos.entry_price = prices[*stock_id];
-                pos.max_price = prices[*stock_id];
+                let close_price = prices[*stock_id];
+                if close_price > 0.0 && pos.entry_price > 0.0 {
+                    // Update cost_basis to current market value before resetting entry_price
+                    pos.value = pos.value * close_price / pos.entry_price;
+                }
+                pos.entry_price = close_price;
+                pos.max_price = close_price;
             }
         }
     }
@@ -887,7 +682,7 @@ fn execute_finlab_rebalance(
         return;
     }
 
-    // Step 3: Sell overweight positions
+    // Step 3: Sell overweight positions (or cover shorts)
     for (stock_id, &target_weight) in target_weights.iter().enumerate() {
         let target_cost_basis = total_balance * target_weight;
         let current_cost_basis = portfolio
@@ -896,23 +691,40 @@ fn execute_finlab_rebalance(
             .map(|p| p.value)
             .unwrap_or(0.0);
 
-        if current_cost_basis > target_cost_basis + 1e-10 {
-            // Need to sell
-            let sell_amount = current_cost_basis - target_cost_basis;
-            if let Some(pos) = portfolio.positions.get_mut(&stock_id) {
-                // Finlab exit formula for partial sell
-                let sell_value = sell_amount - sell_amount.abs() * (config.fee_ratio + config.tax_ratio);
-                pos.value -= sell_amount;
-                portfolio.cash += sell_value;
+        // For longs: need to sell if current > target (reduce position)
+        // For shorts: need to cover if current < target (current is more negative than target)
+        let need_to_decrease = if target_weight >= 0.0 {
+            current_cost_basis > target_cost_basis + 1e-10
+        } else {
+            // Short position: need to reduce negative position (cover)
+            current_cost_basis < target_cost_basis - 1e-10
+        };
 
-                if pos.value < 1e-10 {
+        if need_to_decrease {
+            // Need to sell (or cover short)
+            let sell_amount = (current_cost_basis - target_cost_basis).abs();
+            if let Some(pos) = portfolio.positions.get_mut(&stock_id) {
+                if pos.value > 0.0 {
+                    // LONG position: sell shares, receive cash
+                    let sell_value = sell_amount - sell_amount * (config.fee_ratio + config.tax_ratio);
+                    pos.value -= sell_amount;
+                    portfolio.cash += sell_value;
+                } else {
+                    // SHORT position: cover by buying back shares, spend cash
+                    let cover_cost = sell_amount + sell_amount * (config.fee_ratio + config.tax_ratio);
+                    pos.value += sell_amount;  // Make liability less negative
+                    portfolio.cash -= cover_cost;  // Spend cash to buy back
+                }
+
+                // Remove position if close to zero
+                if pos.value.abs() < 1e-10 {
                     portfolio.positions.remove(&stock_id);
                 }
             }
         }
     }
 
-    // Step 4: Buy underweight positions
+    // Step 4: Buy underweight positions (including entering shorts)
     for (stock_id, &target_weight) in target_weights.iter().enumerate() {
         if target_weight == 0.0 {
             continue;
@@ -925,82 +737,69 @@ fn execute_finlab_rebalance(
             .map(|p| p.value)
             .unwrap_or(0.0);
 
-        if current_cost_basis < target_cost_basis - 1e-10 {
-            // Need to buy
-            let buy_cost_basis = target_cost_basis - current_cost_basis;
+        // For longs (target > 0): enter if current < target
+        // For shorts (target < 0): enter if current > target (0 > -0.5 means enter short)
+        let need_to_increase = if target_weight > 0.0 {
+            current_cost_basis < target_cost_basis - 1e-10
+        } else {
+            // Short position: need to make cost_basis more negative
+            current_cost_basis > target_cost_basis + 1e-10
+        };
 
-            // In Finlab: spend = buy_cost_basis, actual_cost_basis = spend * (1 - fee)
-            // So to get buy_cost_basis of position, we need to spend buy_cost_basis / (1 - fee)
-            // But actually in Finlab, cost_basis = amount spent, NOT amount spent * (1-fee)
-            // Let me re-read the Finlab code...
-            //
-            // Actually from the analysis, Finlab stores:
-            // - pos[sid] = cost_basis (the amount allocated, which includes fee impact)
-            // - On entry: position_value = allocation * (1 - fee)
-            //
-            // So let's follow that exactly:
-            // spend_amount = buy_cost_basis
-            // cost_basis_added = spend_amount * (1 - fee)
-            // But wait, target_cost_basis already accounts for this...
-            //
-            // Let me think again:
-            // Finlab: amount = position - p[sid]
-            //         cost = abs(amount) * fee_ratio if is_entry
-            //         cash -= amount + cost
-            //
-            // So if we want to add cost_basis of X:
-            // cash -= X + X * fee_ratio = X * (1 + fee_ratio)
-            // But wait, that's the old formula...
-            //
-            // Actually based on my analysis, in Finlab:
-            // - cost_basis IS the position value stored (before any market change)
-            // - Entry fee is handled differently
-            //
-            // Let me just use a simpler approach that matches:
-            // We need to add `diff` to cost_basis
-            // This costs: diff * (1 + fee) if buying, diff * (1 - fee - tax) back if selling
-            //
-            // For entry, based on Finlab:
-            // cash = cash - amount - abs(amount) * fee_ratio (for buy)
-            // So spending `spend` gives us position value of `spend / (1 + fee)`
-            //
-            // Hmm, this is getting confusing. Let me use the simpler approach:
-            // To get target_cost_basis of position, we spend target_cost_basis * (1 + fee) / (1 - fee)
-            //
-            // Actually, let's use the Finlab-style entry:
-            // In Finlab, for a new entry:
-            //   position_value = allocation * (1 - fee)
-            // So the cost_basis = allocation * (1 - fee)
-            // And cash_spent = allocation
-            //
-            // For adjustment:
-            // amount = target_position - current_position
-            // cost = |amount| * fee (if buying)
-            // cash -= amount + cost = amount * (1 + fee)
-            //
-            // So to add `diff` to cost_basis:
-            // cash -= diff * (1 + fee) / (1 - fee) * allocation_style...
-            //
-            // Let me simplify: just spend the diff directly and apply fee
-            let spend_needed = buy_cost_basis / (1.0 - config.fee_ratio);
-            let actual_spend = spend_needed.min(portfolio.cash);
+        if need_to_increase {
+            // Need to increase position magnitude (buy long or enter short)
+            // For longs: spend cash to buy stock
+            // For shorts: in Finlab's model, we track negative cost_basis but also adjust cash
+            //            The total balance stays the same (cash + position value = constant)
 
-            if actual_spend > 1e-10 {
-                let cost_basis_added = actual_spend * (1.0 - config.fee_ratio);
-                portfolio.cash -= actual_spend;
+            if target_weight > 0.0 {
+                // LONG position: spend cash to buy
+                let buy_cost_basis = target_cost_basis - current_cost_basis;
+                let spend_needed = buy_cost_basis / (1.0 - config.fee_ratio);
+                let actual_spend = spend_needed.min(portfolio.cash);
 
-                let entry = portfolio.positions.entry(stock_id).or_insert(Position {
-                    value: 0.0,
-                    entry_price: prices[stock_id],
-                    max_price: prices[stock_id],
-                });
+                if actual_spend > 1e-10 {
+                    let cost_basis_added = actual_spend * (1.0 - config.fee_ratio);
+                    portfolio.cash -= actual_spend;
 
-                if entry.value < 1e-10 {
-                    // New position: set entry price
-                    entry.entry_price = prices[stock_id];
-                    entry.max_price = prices[stock_id];
+                    let entry = portfolio.positions.entry(stock_id).or_insert(Position {
+                        value: 0.0,
+                        entry_price: prices[stock_id],
+                        max_price: prices[stock_id],
+                    });
+
+                    if entry.value.abs() < 1e-10 {
+                        entry.entry_price = prices[stock_id];
+                        entry.max_price = prices[stock_id];
+                    }
+                    entry.value += cost_basis_added;
                 }
-                entry.value += cost_basis_added;
+            } else {
+                // SHORT position: we receive cash from selling borrowed shares
+                // and create a liability (negative cost_basis)
+                let short_cost_basis = target_cost_basis - current_cost_basis;  // Negative
+                let abs_amount = short_cost_basis.abs();
+
+                // Short sale: receive proceeds minus fee
+                let proceeds = abs_amount * (1.0 - config.fee_ratio);
+
+                if proceeds > 1e-10 {
+                    portfolio.cash += proceeds;  // RECEIVE cash from short sale
+
+                    let entry = portfolio.positions.entry(stock_id).or_insert(Position {
+                        value: 0.0,
+                        entry_price: prices[stock_id],
+                        max_price: prices[stock_id],
+                    });
+
+                    if entry.value.abs() < 1e-10 {
+                        entry.entry_price = prices[stock_id];
+                        entry.max_price = prices[stock_id];
+                    }
+                    // For shorts, cost_basis is negative (liability)
+                    // We set it to the target, adjusted for actual proceeds
+                    entry.value -= proceeds / (1.0 - config.fee_ratio);  // Make negative
+                }
             }
         }
     }
@@ -1671,25 +1470,6 @@ fn check_stops_finlab_dual(
     }
 }
 
-/// Run backtest with simple interface (equal weight, no stops)
-///
-/// This is a convenience function for basic backtesting without
-/// stop loss/take profit features.
-pub fn run_simple_backtest(
-    prices: &[Vec<f64>],
-    signals: &[Vec<bool>],
-    rebalance_indices: &[usize],
-    fee_ratio: f64,
-    tax_ratio: f64,
-) -> Vec<f64> {
-    let config = BacktestConfig {
-        fee_ratio,
-        tax_ratio,
-        ..Default::default()
-    };
-    run_backtest(prices, signals, rebalance_indices, &config)
-}
-
 /// OHLC price data for a single time step
 #[derive(Debug, Clone)]
 pub struct OhlcPrices {
@@ -1864,92 +1644,158 @@ fn run_backtest_with_trades_internal(
     let mut completed_trades: Vec<TradeRecord> = Vec::new();
 
     for t in 0..n_times {
-        // T+1 execution model (standard mode, matches Finlab perfectly)
-        if t > 0 {
-            if let Some(target_weights) = pending_weights.take() {
-                let signal_index = pending_signal_index.take().unwrap_or(t - 1);
+        if config.finlab_mode {
+            // ====== FINLAB MODE WITH TRADES ======
+            // Key differences from standard mode:
+            // 1. cost_basis doesn't change with price (no update_position_values)
+            // 2. balance = cash + Σ(cost_basis * close / entry_price)
+            // 3. rebalance uses execute_finlab_rebalance
+            if t > 0 {
+                if let Some(target_weights) = pending_weights.take() {
+                    let signal_index = pending_signal_index.take().unwrap_or(t - 1);
 
-                // Close trades for positions being exited (use trade_prices for record)
-                close_trades_for_rebalance(
-                    &portfolio,
-                    &target_weights,
+                    // Close trades for positions being exited (use trade_prices for record)
+                    close_trades_for_rebalance(
+                        &portfolio,
+                        &target_weights,
+                        &mut open_trades,
+                        &mut completed_trades,
+                        t,
+                        signal_index,
+                        &trade_prices[t],
+                        config,
+                    );
+
+                    // Execute rebalance at current prices (Finlab style)
+                    execute_finlab_rebalance(
+                        &mut portfolio,
+                        &target_weights,
+                        &close_prices[t],
+                        config,
+                    );
+
+                    // Open new trades (use trade_prices for record)
+                    open_trades_for_rebalance(
+                        &portfolio,
+                        &target_weights,
+                        &mut open_trades,
+                        t,
+                        signal_index,
+                        &trade_prices[t],
+                    );
+
+                    stopped_stocks = vec![false; n_assets];
+                }
+                // In Finlab mode, we DON'T update position values
+                // because cost_basis stays constant
+            }
+
+            // Check if this is a rebalance (signal) day
+            let should_rebalance = rebalance_indices.contains(&t) && weight_idx < weights.len();
+
+            if should_rebalance {
+                let target_weights = normalize_weights_finlab(
+                    &weights[weight_idx],
+                    &stopped_stocks,
+                    config.position_limit,
+                );
+
+                pending_weights = Some(target_weights);
+                pending_signal_index = Some(t);
+                weight_idx += 1;
+            }
+
+            // Record cumulative return using Finlab formula
+            creturn.push(portfolio.balance_finlab(&close_prices[t]));
+        } else {
+            // ====== STANDARD MODE WITH TRADES ======
+            // T+1 execution model
+            if t > 0 {
+                if let Some(target_weights) = pending_weights.take() {
+                    let signal_index = pending_signal_index.take().unwrap_or(t - 1);
+
+                    // Close trades for positions being exited (use trade_prices for record)
+                    close_trades_for_rebalance(
+                        &portfolio,
+                        &target_weights,
+                        &mut open_trades,
+                        &mut completed_trades,
+                        t,
+                        signal_index,
+                        &trade_prices[t],
+                        config,
+                    );
+
+                    // T+1 execution: rebalance at prev_prices, then experience today's return
+                    execute_t1_rebalance(
+                        &mut portfolio,
+                        &target_weights,
+                        &prev_prices,
+                        &close_prices[t],
+                        config,
+                    );
+
+                    // Open new trades (use trade_prices for record)
+                    open_trades_for_rebalance(
+                        &portfolio,
+                        &target_weights,
+                        &mut open_trades,
+                        t,
+                        signal_index,
+                        &trade_prices[t],
+                    );
+
+                    stopped_stocks = vec![false; n_assets];
+                } else {
+                    // No pending weights, just update position values
+                    update_position_values(&mut portfolio, &close_prices[t], &prev_prices);
+                }
+
+                // Check stop loss / take profit / trailing stop
+                let stopped_this_period = check_stops_with_trade_tracking(
+                    &mut portfolio,
+                    &close_prices[t],
+                    &trade_prices[t],
+                    &mut stopped_stocks,
                     &mut open_trades,
                     &mut completed_trades,
                     t,
-                    signal_index,
-                    &trade_prices[t],
                     config,
                 );
 
-                // T+1 execution: rebalance at prev_prices, then experience today's return
-                execute_t1_rebalance(
-                    &mut portfolio,
-                    &target_weights,
-                    &prev_prices,
-                    &close_prices[t],
-                    config,
-                );
-
-                // Open new trades (use trade_prices for record)
-                open_trades_for_rebalance(
-                    &portfolio,
-                    &target_weights,
-                    &mut open_trades,
-                    t,
-                    signal_index,
-                    &trade_prices[t],
-                );
-
-                stopped_stocks = vec![false; n_assets];
-            } else {
-                // No pending weights, just update position values
-                update_position_values(&mut portfolio, &close_prices[t], &prev_prices);
-            }
-
-            // Check stop loss / take profit / trailing stop
-            let stopped_this_period = check_stops_with_trade_tracking(
-                &mut portfolio,
-                &close_prices[t],
-                &trade_prices[t],
-                &mut stopped_stocks,
-                &mut open_trades,
-                &mut completed_trades,
-                t,
-                config,
-            );
-
-            // Mark any stopped stocks (only if stop_trading_next_period is enabled)
-            if config.stop_trading_next_period {
-                for stock_id in stopped_this_period {
-                    if stock_id < stopped_stocks.len() {
-                        stopped_stocks[stock_id] = true;
+                // Mark any stopped stocks (only if stop_trading_next_period is enabled)
+                if config.stop_trading_next_period {
+                    for stock_id in stopped_this_period {
+                        if stock_id < stopped_stocks.len() {
+                            stopped_stocks[stock_id] = true;
+                        }
                     }
                 }
             }
+
+            // Check if this is a rebalance (signal) day
+            let should_rebalance = rebalance_indices.contains(&t) && weight_idx < weights.len();
+
+            if should_rebalance {
+                // Normalize weights like Finlab
+                let target_weights = normalize_weights_finlab(
+                    &weights[weight_idx],
+                    &stopped_stocks,
+                    config.position_limit,
+                );
+
+                // T+1 mode: store for execution on next day
+                pending_weights = Some(target_weights);
+                pending_signal_index = Some(t);
+
+                weight_idx += 1;
+            }
+
+            // Record cumulative return
+            creturn.push(portfolio.balance());
         }
 
-        // Check if this is a rebalance (signal) day
-        let should_rebalance = rebalance_indices.contains(&t) && weight_idx < weights.len();
-
-        if should_rebalance {
-            // Normalize weights like Finlab
-            let target_weights = normalize_weights_finlab(
-                &weights[weight_idx],
-                &stopped_stocks,
-                config.position_limit,
-            );
-
-            // T+1 mode: store for execution on next day
-            pending_weights = Some(target_weights);
-            pending_signal_index = Some(t);
-
-            weight_idx += 1;
-        }
-
-        // Record cumulative return
-        creturn.push(portfolio.balance());
-
-        // Update previous prices
+        // Update previous prices (needed for standard mode)
         prev_prices = close_prices[t].clone();
     }
 
@@ -2105,7 +1951,8 @@ fn open_trades_for_rebalance(
 ) {
     for (stock_id, &target_weight) in target_weights.iter().enumerate() {
         // If we have a new position (not already tracked in open_trades)
-        if target_weight > 0.0
+        // Use != 0.0 to also track short positions (negative weights)
+        if target_weight != 0.0
             && portfolio.positions.contains_key(&stock_id)
             && !open_trades.contains_key(&stock_id)
         {
@@ -2252,13 +2099,12 @@ mod tests {
 
         let rebalance_indices = vec![0];
 
-        let creturn = run_simple_backtest(
-            &prices,
-            &signals,
-            &rebalance_indices,
-            0.001425,
-            0.003,
-        );
+        let config = BacktestConfig {
+            fee_ratio: 0.001425,
+            tax_ratio: 0.003,
+            ..Default::default()
+        };
+        let creturn = run_backtest(&prices, &signals, &rebalance_indices, &config);
 
         assert_eq!(creturn.len(), 3);
         // T+1 mode: Day 0 signal not yet executed = 1.0
@@ -2282,33 +2128,17 @@ mod tests {
 
         let rebalance_indices = vec![0];
 
-        let creturn = run_simple_backtest(
-            &prices,
-            &signals,
-            &rebalance_indices,
-            0.001425,
-            0.003,
-        );
+        let config = BacktestConfig {
+            fee_ratio: 0.001425,
+            tax_ratio: 0.003,
+            ..Default::default()
+        };
+        let creturn = run_backtest(&prices, &signals, &rebalance_indices, &config);
 
         // Should stay at 1.0 with no positions
         assert_eq!(creturn.len(), 2);
         assert!((creturn[0] - 1.0).abs() < 1e-10);
         assert!((creturn[1] - 1.0).abs() < 1e-10);
-    }
-
-    #[test]
-    fn test_position_limit() {
-        let mut weights = vec![0.6, 0.3, 0.2, 0.1];
-        apply_position_limit(&mut weights, 0.3);
-
-        // All weights should be <= 0.3
-        for w in &weights {
-            assert!(*w <= 0.3 + 1e-10);
-        }
-
-        // Sum should be ~1.0
-        let sum: f64 = weights.iter().sum();
-        assert!((sum - 1.0).abs() < 1e-10);
     }
 
     #[test]
@@ -2330,13 +2160,12 @@ mod tests {
 
         let rebalance_indices = vec![0, 3];
 
-        let creturn = run_simple_backtest(
-            &prices,
-            &signals,
-            &rebalance_indices,
-            0.001425,
-            0.003,
-        );
+        let config = BacktestConfig {
+            fee_ratio: 0.001425,
+            tax_ratio: 0.003,
+            ..Default::default()
+        };
+        let creturn = run_backtest(&prices, &signals, &rebalance_indices, &config);
 
         assert_eq!(creturn.len(), 5);
         // Check that rebalancing occurred
@@ -2369,84 +2198,7 @@ mod tests {
         // (position was exited on day 2 when loss exceeded 10%)
     }
 
-    // Tests for run_backtest_with_weights and normalize_weights_finlab
-
-    #[test]
-    fn test_normalize_weights_finlab_basic() {
-        // Weights that sum to 1.0 should stay the same
-        let weights = vec![0.4, 0.3, 0.3];
-        let stopped = vec![false, false, false];
-        let result = normalize_weights_finlab(&weights, &stopped, 1.0);
-
-        assert_eq!(result.len(), 3);
-        assert!((result[0] - 0.4).abs() < 1e-10);
-        assert!((result[1] - 0.3).abs() < 1e-10);
-        assert!((result[2] - 0.3).abs() < 1e-10);
-    }
-
-    #[test]
-    fn test_normalize_weights_finlab_sum_greater_than_one() {
-        // Weights that sum to > 1.0 should be divided by sum
-        let weights = vec![0.6, 0.6, 0.4]; // sum = 1.6
-        let stopped = vec![false, false, false];
-        let result = normalize_weights_finlab(&weights, &stopped, 1.0);
-
-        // Divided by 1.6
-        assert!((result[0] - 0.6 / 1.6).abs() < 1e-10);
-        assert!((result[1] - 0.6 / 1.6).abs() < 1e-10);
-        assert!((result[2] - 0.4 / 1.6).abs() < 1e-10);
-    }
-
-    #[test]
-    fn test_normalize_weights_finlab_sum_less_than_one() {
-        // Weights that sum to < 1.0 should NOT be normalized (divisor clipped to 1.0)
-        // This matches Finlab's behavior: total_weight.clip(1, None)
-        let weights = vec![0.2, 0.3]; // sum = 0.5, but divisor clipped to 1.0
-        let stopped = vec![false, false];
-        let result = normalize_weights_finlab(&weights, &stopped, 1.0);
-
-        // Should stay the same (divided by max(0.5, 1.0) = 1.0)
-        assert!((result[0] - 0.2).abs() < 1e-10);
-        assert!((result[1] - 0.3).abs() < 1e-10);
-    }
-
-    #[test]
-    fn test_normalize_weights_finlab_with_position_limit() {
-        // Weights should be clipped to position_limit
-        let weights = vec![0.8, 0.4]; // sum = 1.2
-        let stopped = vec![false, false];
-        let result = normalize_weights_finlab(&weights, &stopped, 0.5);
-
-        // First: 0.8 / 1.2 = 0.667, clipped to 0.5
-        // Second: 0.4 / 1.2 = 0.333, stays
-        assert!((result[0] - 0.5).abs() < 1e-10);
-        assert!((result[1] - 0.4 / 1.2).abs() < 1e-10);
-    }
-
-    #[test]
-    fn test_normalize_weights_finlab_with_stopped_stocks() {
-        // Stopped stocks should get weight 0
-        let weights = vec![0.5, 0.5, 0.5];
-        let stopped = vec![false, true, false]; // stock 1 stopped
-        let result = normalize_weights_finlab(&weights, &stopped, 1.0);
-
-        // Sum = 1.5, normalize by 1.5
-        assert!((result[0] - 0.5 / 1.5).abs() < 1e-10);
-        assert!((result[1] - 0.0).abs() < 1e-10); // stopped
-        assert!((result[2] - 0.5 / 1.5).abs() < 1e-10);
-    }
-
-    #[test]
-    fn test_normalize_weights_finlab_negative_weights() {
-        // Negative weights (short positions) should be handled
-        let weights = vec![0.5, -0.3]; // abs sum = 0.8, clipped to 1.0
-        let stopped = vec![false, false];
-        let result = normalize_weights_finlab(&weights, &stopped, 1.0);
-
-        // Divided by max(0.8, 1.0) = 1.0, so stays same
-        assert!((result[0] - 0.5).abs() < 1e-10);
-        assert!((result[1] - (-0.3)).abs() < 1e-10);
-    }
+    // Tests for run_backtest with weights
 
     #[test]
     fn test_backtest_with_weights_basic() {
@@ -2467,7 +2219,7 @@ mod tests {
             ..Default::default()
         };
 
-        let creturn = run_backtest_with_weights(&prices, &weights, &rebalance_indices, &config);
+        let creturn = run_backtest(&prices, &weights, &rebalance_indices, &config);
 
         assert_eq!(creturn.len(), 3);
         // T+1 mode: Day 0 signal not yet executed = 1.0
@@ -2496,7 +2248,7 @@ mod tests {
             ..Default::default()
         };
 
-        let creturn = run_backtest_with_weights(&prices, &weights, &rebalance_indices, &config);
+        let creturn = run_backtest(&prices, &weights, &rebalance_indices, &config);
 
         assert_eq!(creturn.len(), 3);
         // Day 0: Signal not yet executed = 1.0
@@ -2528,7 +2280,7 @@ mod tests {
             ..Default::default()
         };
 
-        let creturn = run_backtest_with_weights(&prices, &weights, &rebalance_indices, &config);
+        let creturn = run_backtest(&prices, &weights, &rebalance_indices, &config);
 
         assert_eq!(creturn.len(), 3);
         // Day 0 and Day 1: No return yet
@@ -2560,7 +2312,7 @@ mod tests {
             ..Default::default()
         };
 
-        let creturn = run_backtest_with_weights(&prices, &weights, &rebalance_indices, &config);
+        let creturn = run_backtest(&prices, &weights, &rebalance_indices, &config);
 
         assert_eq!(creturn.len(), 3);
         // Day 0 and Day 1: No return yet
@@ -2592,7 +2344,7 @@ mod tests {
             ..Default::default()
         };
 
-        let creturn = run_backtest_with_weights(&prices, &weights, &rebalance_indices, &config);
+        let creturn = run_backtest(&prices, &weights, &rebalance_indices, &config);
 
         assert_eq!(creturn.len(), 3);
         // Day 0 and Day 1: No return yet
@@ -2608,7 +2360,7 @@ mod tests {
 
     #[test]
     fn test_backtest_with_weights_matches_signals() {
-        // run_backtest_with_weights([0.5, 0.5]) should match run_backtest([true, true])
+        // run_backtest([0.5, 0.5]) should match run_backtest([true, true])
         let prices = vec![
             vec![100.0, 100.0],
             vec![110.0, 90.0],   // +10%, -10%
@@ -2626,7 +2378,7 @@ mod tests {
         };
 
         let creturn_signals = run_backtest(&prices, &signals, &rebalance_indices, &config);
-        let creturn_weights = run_backtest_with_weights(&prices, &weights, &rebalance_indices, &config);
+        let creturn_weights = run_backtest(&prices, &weights, &rebalance_indices, &config);
 
         assert_eq!(creturn_signals.len(), creturn_weights.len());
         for (cs, cw) in creturn_signals.iter().zip(creturn_weights.iter()) {
@@ -2642,7 +2394,7 @@ mod tests {
         let rebalance_indices: Vec<usize> = vec![];
 
         let config = BacktestConfig::default();
-        let creturn = run_backtest_with_weights(&prices, &weights, &rebalance_indices, &config);
+        let creturn = run_backtest(&prices, &weights, &rebalance_indices, &config);
 
         assert!(creturn.is_empty());
     }
@@ -2663,7 +2415,7 @@ mod tests {
             ..Default::default()
         };
 
-        let creturn = run_backtest_with_weights(&prices, &weights, &rebalance_indices, &config);
+        let creturn = run_backtest(&prices, &weights, &rebalance_indices, &config);
 
         // With zero weights, should stay at 1.0
         assert!((creturn[0] - 1.0).abs() < 1e-10);
@@ -2765,7 +2517,7 @@ mod tests {
             ..Default::default()
         };
 
-        let creturn = run_backtest_with_weights(&prices, &weights, &rebalance_indices, &config);
+        let creturn = run_backtest(&prices, &weights, &rebalance_indices, &config);
 
         assert_eq!(creturn.len(), 4);
         // Day 0 and Day 1: Signal and entry, no return yet = 1.0
