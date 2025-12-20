@@ -57,5 +57,6 @@ select = ["E", "F", "I", "W"]
 dev = [
     "dotenv>=0.9.9",
     "finlab>=1.5.5",
+    "ipykernel>=6.31.0",
     "pytest>=8.4.2",
 ]
