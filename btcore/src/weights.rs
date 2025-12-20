@@ -83,10 +83,11 @@ pub fn calculate_target_weights(
     let mut weights = Vec::with_capacity(signals.len());
 
     // Count active signals (excluding stopped stocks)
+    // Use .get(i).unwrap_or(&false) to handle empty stopped_stocks
     let active_count: usize = signals
         .iter()
-        .zip(stopped_stocks.iter())
-        .filter(|(&sig, &stopped)| sig && !stopped)
+        .enumerate()
+        .filter(|(i, &sig)| sig && !stopped_stocks.get(*i).copied().unwrap_or(false))
         .count();
 
     if active_count == 0 {
@@ -96,8 +97,9 @@ pub fn calculate_target_weights(
     // Equal weight
     let weight = (1.0 / active_count as f64).min(position_limit);
 
-    for (sig, stopped) in signals.iter().zip(stopped_stocks.iter()) {
-        if *sig && !*stopped {
+    for (i, &sig) in signals.iter().enumerate() {
+        let stopped = stopped_stocks.get(i).copied().unwrap_or(false);
+        if sig && !stopped {
             weights.push(weight);
         } else {
             weights.push(0.0);
