@@ -12,8 +12,8 @@ use pyo3::types::{PyModule, PyModuleMethods};
 use pyo3_polars::PyDataFrame;
 
 use btcore::{
-    run_backtest, run_backtest_with_trades,
-    BacktestConfig, BacktestResult, SimTradeRecord,
+    run_backtest, run_backtest_with_trades, BacktestConfig, BacktestResult, PriceData,
+    SimTradeRecord,
 };
 
 /// Python wrapper for BacktestConfig
@@ -376,6 +376,7 @@ impl From<BacktestResult> for PyBacktestResult {
 /// It uses:
 /// - adj_prices: Adjusted prices for return calculation (creturn)
 /// - original_prices: Original prices for trade records (entry/exit prices)
+/// - high_prices/low_prices: Optional, for touched_exit support
 ///
 /// The trade records match Finlab's trades DataFrame format, using
 /// original prices for entry/exit to match real trading execution.
@@ -386,17 +387,21 @@ impl From<BacktestResult> for PyBacktestResult {
 ///     weights: DataFrame with rebalance dates as rows, stocks as columns (Float64)
 ///     rebalance_indices: List of row indices in prices where rebalancing occurs
 ///     config: BacktestConfig (optional)
+///     high_prices: DataFrame with high prices (optional, for touched_exit)
+///     low_prices: DataFrame with low prices (optional, for touched_exit)
 ///
 /// Returns:
 ///     BacktestResult containing creturn and trades list
 #[pyfunction]
-#[pyo3(signature = (adj_prices, original_prices, weights, rebalance_indices, config=None))]
+#[pyo3(signature = (adj_prices, original_prices, weights, rebalance_indices, config=None, high_prices=None, low_prices=None))]
 fn backtest_with_trades(
     adj_prices: PyDataFrame,
     original_prices: PyDataFrame,
     weights: PyDataFrame,
     rebalance_indices: Vec<usize>,
     config: Option<PyBacktestConfig>,
+    high_prices: Option<PyDataFrame>,
+    low_prices: Option<PyDataFrame>,
 ) -> PyResult<PyBacktestResult> {
     let adj_prices_df = adj_prices.0;
     let original_prices_df = original_prices.0;
@@ -412,16 +417,27 @@ fn backtest_with_trades(
     let weights_2d = df_to_f64_2d(&weights_df)
         .map_err(|e| PyValueError::new_err(format!("Failed to convert weights: {}", e)))?;
 
+    // Convert optional high/low prices
+    let high_prices_2d = high_prices
+        .map(|df| df_to_f64_2d(&df.0))
+        .transpose()
+        .map_err(|e| PyValueError::new_err(format!("Failed to convert high_prices: {}", e)))?;
+
+    let low_prices_2d = low_prices
+        .map(|df| df_to_f64_2d(&df.0))
+        .transpose()
+        .map_err(|e| PyValueError::new_err(format!("Failed to convert low_prices: {}", e)))?;
+
     let cfg = config.map(|c| c.inner).unwrap_or_default();
 
+    // Build PriceData with optional high/low
+    let prices = match (&high_prices_2d, &low_prices_2d) {
+        (Some(high), Some(low)) => PriceData::with_ohlc(&adj_prices_2d, &original_prices_2d, high, low),
+        _ => PriceData::new(&adj_prices_2d, &original_prices_2d),
+    };
+
     // Run backtest with trades tracking
-    let result = run_backtest_with_trades(
-        &adj_prices_2d,
-        &original_prices_2d,
-        &weights_2d,
-        &rebalance_indices,
-        &cfg,
-    );
+    let result = run_backtest_with_trades(&prices, &weights_2d, &rebalance_indices, &cfg);
 
     Ok(result.into())
 }

@@ -1149,131 +1149,89 @@ fn rebalance_to_target_weights(
     }
 }
 
-/// OHLC price data for a single time step
-#[derive(Debug, Clone)]
-pub struct OhlcPrices {
-    pub open: Vec<f64>,
-    pub high: Vec<f64>,
-    pub low: Vec<f64>,
-    pub close: Vec<f64>,
-}
-
-/// Full price data matching Finlab's backtest_core interface
+/// Price data for backtest simulation
 ///
-/// Finlab uses 5 price matrices:
-/// - trade_prices: The price used for trade execution (determined by trade_at_price)
-/// - close_prices: Close prices for return calculation
-/// - high_prices: High prices for stop loss/take profit with touched_exit
-/// - low_prices: Low prices for stop loss/take profit with touched_exit
-/// - open_prices: Open prices for stop loss/take profit with touched_exit
+/// Contains close and trade prices (required), with optional high/low for touched_exit.
 #[derive(Debug, Clone)]
-pub struct FinlabPriceData {
-    /// Trading prices (determined by trade_at_price parameter)
-    /// For trades record: uses original (non-adjusted) prices
-    pub trade_prices: Vec<Vec<f64>>,
-    /// Close prices (adjusted) for return calculation
-    pub close_prices: Vec<Vec<f64>>,
-    /// High prices (adjusted) for stop loss/take profit
-    pub high_prices: Vec<Vec<f64>>,
-    /// Low prices (adjusted) for stop loss/take profit
-    pub low_prices: Vec<Vec<f64>>,
-    /// Open prices (adjusted) for stop loss/take profit
-    pub open_prices: Vec<Vec<f64>>,
+pub struct PriceData<'a> {
+    /// Close prices (adjusted) for return calculation [n_times x n_assets]
+    pub close: &'a [Vec<f64>],
+    /// Trade prices (original) for trade records [n_times x n_assets]
+    pub trade: &'a [Vec<f64>],
+    /// High prices for touched_exit (optional)
+    pub high: Option<&'a [Vec<f64>]>,
+    /// Low prices for touched_exit (optional)
+    pub low: Option<&'a [Vec<f64>]>,
 }
 
-impl FinlabPriceData {
-    /// Create from simple dual-price setup (backward compatible)
-    pub fn from_dual_prices(adj_prices: &[Vec<f64>], original_prices: &[Vec<f64>]) -> Self {
+impl<'a> PriceData<'a> {
+    /// Create with close and trade prices only
+    pub fn new(close: &'a [Vec<f64>], trade: &'a [Vec<f64>]) -> Self {
         Self {
-            trade_prices: original_prices.to_vec(),
-            close_prices: adj_prices.to_vec(),
-            high_prices: adj_prices.to_vec(),
-            low_prices: adj_prices.to_vec(),
-            open_prices: adj_prices.to_vec(),
+            close,
+            trade,
+            high: None,
+            low: None,
         }
     }
 
     /// Create with full OHLC data
-    pub fn new(
-        trade_prices: Vec<Vec<f64>>,
-        close_prices: Vec<Vec<f64>>,
-        high_prices: Vec<Vec<f64>>,
-        low_prices: Vec<Vec<f64>>,
-        open_prices: Vec<Vec<f64>>,
+    pub fn with_ohlc(
+        close: &'a [Vec<f64>],
+        trade: &'a [Vec<f64>],
+        high: &'a [Vec<f64>],
+        low: &'a [Vec<f64>],
     ) -> Self {
         Self {
-            trade_prices,
-            close_prices,
-            high_prices,
-            low_prices,
-            open_prices,
+            close,
+            trade,
+            high: Some(high),
+            low: Some(low),
         }
     }
 }
 
-/// Run backtest with full Finlab-compatible price data
-///
-/// This function matches Finlab's backtest_core interface with full OHLC support.
-///
-/// # Arguments
-/// * `prices` - FinlabPriceData containing all price matrices
-/// * `weights` - 2D array of float weights [n_rebalance_times x n_assets]
-/// * `rebalance_indices` - Indices in price array where rebalancing occurs
-/// * `config` - Backtest configuration
-///
-/// # Returns
-/// BacktestResult containing creturn and trades list
-pub fn run_backtest_finlab_full(
-    prices: &FinlabPriceData,
-    weights: &[Vec<f64>],
-    rebalance_indices: &[usize],
-    config: &BacktestConfig,
-) -> BacktestResult {
-    // Delegate to run_backtest_with_trades using the price data
-    run_backtest_with_trades_internal(
-        &prices.close_prices,
-        &prices.trade_prices,
-        &prices.high_prices,
-        &prices.low_prices,
-        weights,
-        rebalance_indices,
-        config,
-    )
-}
-
-/// Run backtest with trades tracking and dual price support
+/// Run backtest with trades tracking
 ///
 /// This function returns both cumulative returns and trade records.
 /// It uses:
-/// - `adj_prices`: Adjusted prices for return calculation (creturn)
-/// - `original_prices`: Original prices for trade records (entry/exit prices)
+/// - `prices.close`: Adjusted prices for return calculation (creturn)
+/// - `prices.trade`: Original prices for trade records (entry/exit prices)
+/// - `prices.high/low`: Optional, for touched_exit support
 ///
 /// The trade records match Finlab's trades DataFrame format, using
 /// original prices for entry/exit to match real trading execution.
 ///
 /// # Arguments
-/// * `adj_prices` - 2D array of adjusted prices [n_times x n_assets] (for creturn)
-/// * `original_prices` - 2D array of original prices [n_times x n_assets] (for trades)
-/// * `weights` - 2D array of float weights [n_rebalance_times x n_assets]
+/// * `prices` - PriceData containing close/trade prices (and optional high/low)
+/// * `signals` - 2D array of bool signals or float weights [n_rebalance_times x n_assets]
 /// * `rebalance_indices` - Indices in price array where rebalancing occurs
 /// * `config` - Backtest configuration
 ///
 /// # Returns
 /// BacktestResult containing creturn and trades list
-pub fn run_backtest_with_trades(
-    adj_prices: &[Vec<f64>],
-    original_prices: &[Vec<f64>],
-    weights: &[Vec<f64>],
+pub fn run_backtest_with_trades<S: IntoWeights>(
+    prices: &PriceData,
+    signals: &[S],
     rebalance_indices: &[usize],
     config: &BacktestConfig,
 ) -> BacktestResult {
-    // Use adj_prices for high/low as well (no touched_exit support in simple mode)
+    // Convert signals to weights
+    let weights: Vec<Vec<f64>> = signals
+        .iter()
+        .map(|s| s.into_weights(&[], config.position_limit))
+        .collect();
+
+    // Use close prices for high/low if not provided
+    let high = prices.high.unwrap_or(prices.close);
+    let low = prices.low.unwrap_or(prices.close);
+
     run_backtest_with_trades_internal(
-        adj_prices,
-        original_prices,
-        adj_prices,
-        adj_prices,
-        weights,
+        prices.close,
+        prices.trade,
+        high,
+        low,
+        &weights,
         rebalance_indices,
         config,
     )
