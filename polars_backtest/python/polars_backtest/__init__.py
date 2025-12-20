@@ -523,9 +523,12 @@ class Report:
         self.tax_ratio = tax_ratio
 
     @property
-    def creturn(self) -> pl.Series:
-        """Cumulative return series."""
-        return pl.Series("creturn", self._creturn_list)
+    def creturn(self) -> pl.DataFrame:
+        """Cumulative return DataFrame with date column."""
+        return pl.DataFrame({
+            "date": self._dates,
+            "creturn": self._creturn_list,
+        })
 
     @property
     def position(self) -> pl.DataFrame:

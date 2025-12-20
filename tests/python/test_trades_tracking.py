@@ -243,7 +243,7 @@ def test_creturn_matches_standard(price_data, factor_data):
 
     # Compare
     standard_creturn = standard_result["creturn"].to_list()
-    report_creturn = report.creturn.to_list()
+    report_creturn = report.creturn["creturn"].to_list()
 
     max_diff = max(abs(s - r) for s, r in zip(standard_creturn, report_creturn))
 
@@ -301,8 +301,9 @@ def test_report_properties():
 
     report = backtest_with_report(close=close, position=position)
 
-    # Check creturn is a Series
-    assert isinstance(report.creturn, pl.Series)
+    # Check creturn is a DataFrame with date and creturn columns
+    assert isinstance(report.creturn, pl.DataFrame)
+    assert report.creturn.columns == ["date", "creturn"]
     assert len(report.creturn) == 3
 
     # Check position is a DataFrame
