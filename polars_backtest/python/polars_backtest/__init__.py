@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 import polars as pl
+import pandas as pd
 
 if TYPE_CHECKING:
     from polars.type_aliases import IntoExpr
@@ -433,9 +434,9 @@ def backtest(
         position_dates = position.select(pos_date_col).to_series().to_list()
 
         rebalance_indices = []
-        for pd in position_dates:
+        for pos_d in position_dates:
             try:
-                idx = price_dates.index(pd)
+                idx = price_dates.index(pos_d)
                 rebalance_indices.append(idx)
             except ValueError:
                 # Date not found, skip
@@ -502,6 +503,7 @@ class Report:
         position: pl.DataFrame,
         fee_ratio: float,
         tax_ratio: float,
+        first_signal_index: int = 0,
     ):
         """Initialize Report.
 
@@ -513,6 +515,7 @@ class Report:
             position: Position weights DataFrame
             fee_ratio: Transaction fee ratio
             tax_ratio: Transaction tax ratio
+            first_signal_index: Index of first date with signals (for Finlab compatibility)
         """
         self._creturn_list = creturn
         self._trades_raw = trades
@@ -521,13 +524,17 @@ class Report:
         self._position = position
         self.fee_ratio = fee_ratio
         self.tax_ratio = tax_ratio
+        self._first_signal_index = first_signal_index
 
     @property
     def creturn(self) -> pl.DataFrame:
-        """Cumulative return DataFrame with date column."""
+        """Cumulative return DataFrame with date column.
+
+        Like Finlab, starts from the first date with signals.
+        """
         return pl.DataFrame({
-            "date": self._dates,
-            "creturn": self._creturn_list,
+            "date": self._dates[self._first_signal_index:],
+            "creturn": self._creturn_list[self._first_signal_index:],
         })
 
     @property
@@ -766,20 +773,54 @@ def backtest_with_report(
         pos_date_col = position.columns[0]
         position_dates = position.select(pos_date_col).to_series().to_list()
 
-        rebalance_indices = []
-        for pd in position_dates:
+        # Find first position date index
+        first_idx = None
+        for pos_d in position_dates:
             try:
-                idx = dates.index(pd)
-                rebalance_indices.append(idx)
+                first_idx = dates.index(pos_d)
+                break
             except ValueError:
-                # Date not found, skip
                 pass
 
-        if not rebalance_indices:
+        if first_idx is None:
             raise ValueError("No matching dates between prices and position")
 
-        # When rebalance_indices auto-calculated, position already has correct rows
-        position_data = position.select(position_stock_cols)
+        if resample == 'D':
+            # resample='D' means daily rebalance (like Finlab)
+            # Every day from first position date is a rebalance point
+            rebalance_indices = list(range(first_idx, len(dates)))
+
+            # Expand position to all dates by forward-filling
+            # Create a DataFrame with all dates and ffill position values
+            position_df = position.to_pandas()
+            position_df.set_index(pos_date_col, inplace=True)
+
+            # Reindex to all dates and ffill
+            all_dates_df = pd.DataFrame({pos_date_col: dates})
+            all_dates_df.set_index(pos_date_col, inplace=True)
+            position_expanded = position_df.reindex(all_dates_df.index).ffill()
+
+            # Take only from first_idx onwards
+            position_expanded = position_expanded.iloc[first_idx:]
+            position_expanded = position_expanded.reset_index()
+
+            # Convert back to polars
+            position_data = pl.from_pandas(position_expanded).select(position_stock_cols)
+        else:
+            # Non-daily resample: only rebalance on position dates
+            rebalance_indices = []
+            for pos_d in position_dates:
+                try:
+                    idx = dates.index(pos_d)
+                    rebalance_indices.append(idx)
+                except ValueError:
+                    pass
+
+            if not rebalance_indices:
+                raise ValueError("No matching dates between prices and position")
+
+            # When rebalance_indices auto-calculated, position already has correct rows
+            position_data = position.select(position_stock_cols)
     else:
         # When rebalance_indices provided, filter position to only those rows
         # This handles the case where position has all dates (forward-filled)
@@ -788,6 +829,40 @@ def backtest_with_report(
 
     # Cast to float if needed
     position_data = position_data.cast(pl.Float64)
+
+    # Find the first rebalance with any non-zero signals (like Finlab)
+    # Finlab behavior:
+    # - If first signal is on first day of data: include that day (creturn = 1.0)
+    # - If first signal is after first day: start from T+1 execution day
+    first_signal_rebalance_idx = 0
+    for i in range(len(position_data)):
+        row = position_data[i]
+        # Check if any value in this row is non-zero (True or > 0)
+        has_signal = any(
+            row[col][0] is not None and row[col][0] > 0
+            for col in position_data.columns
+        )
+        if has_signal:
+            first_signal_rebalance_idx = i
+            break
+
+    # Calculate first_signal_index based on Finlab behavior
+    # Finlab behavior depends on fees:
+    # - With fees: start from signal day (creturn = 1.0 on signal day)
+    # - Without fees: start from T+1 execution day (creturn = 1.0 on execution day)
+    if rebalance_indices:
+        signal_day_index = rebalance_indices[first_signal_rebalance_idx]
+        if signal_day_index == 0:
+            # First signal is on first day of data - include that day
+            first_signal_index = 0
+        elif fee_ratio > 0 or tax_ratio > 0:
+            # With fees: start from signal day (like Finlab)
+            first_signal_index = signal_day_index
+        else:
+            # Without fees: start from T+1 execution day
+            first_signal_index = signal_day_index + 1
+    else:
+        first_signal_index = 0
 
     # Create config
     config = BacktestConfig(
@@ -822,4 +897,5 @@ def backtest_with_report(
         position=position,
         fee_ratio=fee_ratio,
         tax_ratio=tax_ratio,
+        first_signal_index=first_signal_index,
     )

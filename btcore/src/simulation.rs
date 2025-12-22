@@ -58,6 +58,7 @@ impl TradeRecord {
 #[derive(Debug, Clone)]
 struct OpenTrade {
     /// Stock ID
+    #[allow(dead_code)]
     stock_id: usize,
     /// Entry index (actual entry date, T+1)
     entry_index: usize,
@@ -336,6 +337,9 @@ struct Position {
     stop_entry_price: f64,
     /// Maximum price since entry (for trailing stop)
     max_price: f64,
+    /// Last valid market value (Finlab: pos[sid] updated daily)
+    /// Used when current price is NaN
+    last_market_value: f64,
 }
 
 /// Portfolio state during simulation
@@ -364,6 +368,8 @@ impl PortfolioState {
 
     /// Calculate portfolio balance in Finlab mode
     /// Finlab formula: cash + Σ(cost_basis * close_price / entry_price)
+    /// When price is NaN, Finlab uses the last valid market value (from pos[sid] *= r updates)
+    #[allow(dead_code)]
     fn balance_finlab(&self, prices: &[f64]) -> f64 {
         let pos_value: f64 = self.positions.iter()
             .map(|(&stock_id, p)| {
@@ -371,18 +377,81 @@ impl PortfolioState {
                     let close_price = prices[stock_id];
                     let entry_price = p.entry_price;
                     if entry_price > 0.0 && close_price > 0.0 && !close_price.is_nan() {
-                        // Finlab formula: cost_basis * close / entry
+                        // Valid case: cost_basis * close / entry
                         p.value * close_price / entry_price
                     } else {
-                        // If price is invalid, use cost_basis directly (like Finlab)
-                        p.value
+                        // NaN case: use last valid market value (Finlab line 473)
+                        p.last_market_value
                     }
                 } else {
-                    p.value
+                    p.last_market_value
                 }
             })
             .sum();
         self.cash + pos_value
+    }
+
+    /// Update last_market_value for all positions (Finlab: pos[sid] *= r)
+    /// Call this daily to track market values for NaN handling
+    fn update_market_values(&mut self, prices: &[f64]) {
+        for (&stock_id, pos) in self.positions.iter_mut() {
+            if stock_id < prices.len() {
+                let close_price = prices[stock_id];
+                if pos.entry_price > 0.0 && close_price > 0.0 && !close_price.is_nan() {
+                    // Valid price: update market value
+                    pos.last_market_value = pos.value * close_price / pos.entry_price;
+                }
+                // If NaN, keep last_market_value unchanged (like Finlab's pos[sid] *= 1)
+            }
+        }
+    }
+
+    /// Calculate portfolio daily return using fixed target weights (Finlab style)
+    /// Finlab uses: portfolio_return = sum(target_weight_i * stock_return_i)
+    /// This is conceptually like daily rebalancing to maintain target weights
+    #[allow(dead_code)]
+    fn daily_return_finlab(
+        &self,
+        current_prices: &[f64],
+        prev_prices: &[f64],
+        target_weights: &[f64],
+    ) -> f64 {
+        let mut total_return = 0.0;
+        let mut total_weight = 0.0;
+
+        for (stock_id, &target_weight) in target_weights.iter().enumerate() {
+            if target_weight == 0.0 {
+                continue;
+            }
+            if stock_id >= current_prices.len() || stock_id >= prev_prices.len() {
+                continue;
+            }
+
+            let curr_price = current_prices[stock_id];
+            let prev_price = prev_prices[stock_id];
+
+            // Skip if either price is invalid or NaN
+            let curr_valid = curr_price > 0.0 && !curr_price.is_nan();
+            let prev_valid = prev_price > 0.0 && !prev_price.is_nan();
+
+            if curr_valid && prev_valid {
+                let stock_return = (curr_price - prev_price) / prev_price;
+                total_return += target_weight * stock_return;
+                total_weight += target_weight;
+            } else {
+                // If price is NaN, this stock contributes 0% return
+                // but we still count its weight
+                total_weight += target_weight;
+            }
+        }
+
+        // If no valid stocks, return 0
+        if total_weight == 0.0 {
+            0.0
+        } else {
+            // Normalize by actual weight (in case some stocks are missing)
+            total_return / total_weight * total_weight.min(1.0)
+        }
     }
 
     /// Calculate total cost basis (used for Finlab rebalance calculation)
@@ -443,6 +512,9 @@ fn simulate_backtest<T: TradeTracker>(
     // Pending stop exits to execute on next day (T+1 execution)
     let mut pending_stop_exits: Vec<usize> = Vec::new();
 
+    // Finlab mode: track active weights for stop loss handling
+    let mut active_weights: Vec<f64> = vec![0.0; n_assets];
+
     for t in 0..n_times {
         if config.finlab_mode {
             // ====== FINLAB MODE ======
@@ -450,35 +522,34 @@ fn simulate_backtest<T: TradeTracker>(
                 if let Some(target_weights) = pending_weights.take() {
                     let signal_index = pending_signal_index.take().unwrap_or(t - 1);
 
-                    // Close trades for exiting positions
-                    for (stock_id, _) in portfolio.positions.iter() {
-                        let stock_id = *stock_id;
-                        if stock_id < target_weights.len() && target_weights[stock_id] == 0.0 {
-                            let exit_price = if stock_id < trade_prices[t].len() {
-                                trade_prices[t][stock_id]
-                            } else {
-                                1.0
-                            };
-                            tracker.close_trade(
-                                stock_id,
-                                t,
-                                Some(signal_index),
-                                exit_price,
-                                config.fee_ratio,
-                                config.tax_ratio,
-                            );
-                        }
+                    // Close ALL trades during rebalance (Finlab behavior: sell all, rebuy all)
+                    // This matches Finlab's trades where each rebalance creates new trade records
+                    let open_positions: Vec<usize> = portfolio.positions.keys().copied().collect();
+                    for stock_id in open_positions {
+                        let exit_price = if stock_id < trade_prices[t].len() {
+                            trade_prices[t][stock_id]
+                        } else {
+                            1.0
+                        };
+                        tracker.close_trade(
+                            stock_id,
+                            t,
+                            Some(signal_index),
+                            exit_price,
+                            config.fee_ratio,
+                            config.tax_ratio,
+                        );
                     }
 
-                    // Execute rebalance at current prices (Finlab style)
+                    // Execute rebalance at current prices (Finlab style: sell all, rebuy all)
                     execute_finlab_rebalance(&mut portfolio, &target_weights, &close_prices[t], config);
 
-                    // Open trades for new positions
+                    // Update active weights for daily return calculation
+                    active_weights = target_weights.clone();
+
+                    // Open trades for ALL new positions (after sell-all-rebuy-all)
                     for (stock_id, &target_weight) in target_weights.iter().enumerate() {
-                        if target_weight != 0.0
-                            && portfolio.positions.contains_key(&stock_id)
-                            && !tracker.has_open_trade(stock_id)
-                        {
+                        if target_weight != 0.0 && portfolio.positions.contains_key(&stock_id) {
                             let entry_price = if stock_id < trade_prices[t].len() {
                                 trade_prices[t][stock_id]
                             } else {
@@ -517,6 +588,11 @@ fn simulate_backtest<T: TradeTracker>(
                                 stopped_stocks[stock_id] = true;
                             }
 
+                            // Clear weight for stopped stock (for daily return calculation)
+                            if stock_id < active_weights.len() {
+                                active_weights[stock_id] = 0.0;
+                            }
+
                             // Record trade close
                             let exit_price = if stock_id < trade_prices[t].len() {
                                 trade_prices[t][stock_id]
@@ -539,6 +615,10 @@ fn simulate_backtest<T: TradeTracker>(
                 // Detect stops for T+1 execution
                 let new_stops = detect_stops_finlab(&portfolio, &close_prices[t], config);
                 pending_stop_exits.extend(new_stops);
+
+                // Update entry prices for positions recovering from NaN
+                // This ensures 0% return when a stock comes back from NaN (like Finlab)
+                update_entry_prices_after_nan(&mut portfolio, &close_prices[t], &prev_prices);
             }
 
             // Check if this is a rebalance day
@@ -552,7 +632,13 @@ fn simulate_backtest<T: TradeTracker>(
                 weight_idx += 1;
             }
 
-            // Record cumulative return using Finlab formula
+            // Update market values for NaN handling (Finlab: pos[sid] *= r)
+            // This tracks the last valid market value for each position
+            portfolio.update_market_values(&close_prices[t]);
+
+            // Record cumulative return using Finlab balance formula
+            // Finlab uses: balance = cash + Σ(cost_basis * close / entry_price)
+            // When price is NaN, uses last_market_value instead
             creturn.push(portfolio.balance_finlab(&close_prices[t]));
         } else {
             // ====== STANDARD MODE ======
@@ -739,6 +825,53 @@ fn update_position_values(
             // Update max price for trailing stop
             if curr_price > pos.max_price {
                 pos.max_price = curr_price;
+            }
+        }
+    }
+}
+
+/// Update entry prices for positions that are recovering from NaN (Finlab mode)
+///
+/// Two cases are handled:
+/// 1. When a stock's previous price was NaN but current price is valid
+/// 2. When a position was entered with NaN price (entry_price = 0) and current price is valid
+///
+/// In both cases, we update entry_price to current price so the position value stays constant.
+/// This matches Finlab's behavior: NaN price means 0% return for that stock.
+fn update_entry_prices_after_nan(
+    portfolio: &mut PortfolioState,
+    current_prices: &[f64],
+    prev_prices: &[f64],
+) {
+    for (&stock_id, pos) in portfolio.positions.iter_mut() {
+        if stock_id >= current_prices.len() {
+            continue;
+        }
+
+        let curr_price = current_prices[stock_id];
+        let curr_is_valid = !curr_price.is_nan() && curr_price > 0.0;
+
+        if !curr_is_valid {
+            continue;
+        }
+
+        // Case 1: Position was entered with NaN price (entry_price = 0)
+        // Set entry_price to current price so market_value = cost_basis * curr / curr = cost_basis
+        if pos.entry_price <= 0.0 {
+            pos.entry_price = curr_price;
+            pos.stop_entry_price = curr_price;
+            pos.max_price = curr_price;
+            continue;
+        }
+
+        // Case 2: Previous day's price was NaN but current is valid
+        // Update entry_price to current price for 0% return on this transition
+        if stock_id < prev_prices.len() {
+            let prev_price = prev_prices[stock_id];
+            let prev_is_nan = prev_price.is_nan() || prev_price <= 0.0;
+
+            if prev_is_nan {
+                pos.entry_price = curr_price;
             }
         }
     }
@@ -957,202 +1090,198 @@ fn check_stops_finlab(
 
 /// Execute rebalance in Finlab mode
 ///
-/// Finlab rebalance formula:
-/// - total_balance = cash + sum(cost_basis)  (NOT market value!)
-/// - target_cost_basis = total_balance * target_weight
-/// - Exit: cash += cost_basis - |cost_basis| * (fee + tax)
-/// - Entry: cost_basis = amount * (1 - fee)
+/// Finlab uses proportional fee allocation:
+/// 1. Calculate total rebalance fee cost (sell fee + buy fee)
+/// 2. Spread this cost proportionally across all target positions
+/// 3. Each position gets: market_value * target_weight - proportional_fee
+///
+/// This ensures all positions have exactly equal weight after rebalance.
 fn execute_finlab_rebalance(
     portfolio: &mut PortfolioState,
     target_weights: &[f64],
     prices: &[f64],
     config: &BacktestConfig,
 ) {
-    // If retain_cost_when_rebalance is false (default), reset all entry prices
-    // This matches Finlab's behavior where cr.fill(1) resets all cumulative returns
-    // CRITICAL: We must also update cost_basis to preserve portfolio balance
-    // Formula: cost_basis_new = cost_basis * close / entry_price (current market value)
-    // Then:    entry_price_new = close
-    // Result:  cost_basis_new * close / entry_price_new = cost_basis_new * 1 = original value
-    if !config.retain_cost_when_rebalance {
-        for (stock_id, pos) in portfolio.positions.iter_mut() {
-            if *stock_id < prices.len() {
-                let close_price = prices[*stock_id];
-                if close_price > 0.0 && pos.entry_price > 0.0 {
-                    // Update cost_basis to current market value before resetting entry_price
-                    pos.value = pos.value * close_price / pos.entry_price;
-                }
-                pos.entry_price = close_price;
-                pos.max_price = close_price;
+    // Finlab uses the DIFFERENCE method for fee calculation:
+    // - Continuing positions: keep value, pay fee only on SOLD portion
+    // - New positions: pay entry fee on full amount
+    // - This results in unequal cost_basis and potentially negative cash
+
+    // Step 1: Update all positions to market value
+    for (stock_id, pos) in portfolio.positions.iter_mut() {
+        if *stock_id < prices.len() {
+            let close_price = prices[*stock_id];
+            if close_price > 0.0 && pos.entry_price > 0.0 {
+                pos.value = pos.value * close_price / pos.entry_price;
+            }
+            pos.entry_price = close_price;
+            pos.max_price = close_price;
+        }
+    }
+
+    // Step 2: Calculate current market value (balance)
+    let balance = portfolio.total_cost_basis();
+
+    // Step 3: Calculate ratio for weight scaling
+    let total_target_weight: f64 = target_weights.iter().map(|w| w.abs()).sum();
+    if total_target_weight == 0.0 || balance <= 0.0 {
+        // Exit all positions
+        let all_positions: Vec<usize> = portfolio.positions.keys().copied().collect();
+        for stock_id in all_positions {
+            if let Some(pos) = portfolio.positions.remove(&stock_id) {
+                let sell_value = pos.value - pos.value.abs() * (config.fee_ratio + config.tax_ratio);
+                portfolio.cash += sell_value;
             }
         }
-    }
-
-    // Step 1: Exit positions with target_weight = 0
-    let positions_to_close: Vec<usize> = portfolio
-        .positions
-        .keys()
-        .filter(|&&id| id < target_weights.len() && target_weights[id] == 0.0)
-        .copied()
-        .collect();
-
-    for stock_id in positions_to_close {
-        if let Some(pos) = portfolio.positions.remove(&stock_id) {
-            // Finlab exit formula: cash += cost_basis - |cost_basis| * (fee + tax)
-            let sell_value = pos.value - pos.value.abs() * (config.fee_ratio + config.tax_ratio);
-            portfolio.cash += sell_value;
-        }
-    }
-
-    // Also close positions not in target_weights array
-    let extra_positions: Vec<usize> = portfolio
-        .positions
-        .keys()
-        .filter(|&&id| id >= target_weights.len())
-        .copied()
-        .collect();
-
-    for stock_id in extra_positions {
-        if let Some(pos) = portfolio.positions.remove(&stock_id) {
-            let sell_value = pos.value - pos.value.abs() * (config.fee_ratio + config.tax_ratio);
-            portfolio.cash += sell_value;
-        }
-    }
-
-    // Step 2: Calculate total balance using cost_basis (Finlab formula)
-    // CRITICAL: Finlab uses sum(cost_basis), NOT market value!
-    let total_balance = portfolio.total_cost_basis();
-
-    let total_target_weight: f64 = target_weights.iter().sum();
-    if total_target_weight == 0.0 {
         return;
     }
 
-    // Step 3: Sell overweight positions (or cover shorts)
+    let ratio = balance / total_target_weight.max(1.0);
+
+    // Step 4: Process each stock using Finlab's set_position logic
+    // Store old positions for reference (both cost_basis and last_market_value)
+    let old_positions: std::collections::HashMap<usize, f64> = portfolio
+        .positions
+        .iter()
+        .map(|(&k, v)| (k, v.value))
+        .collect();
+    let old_market_values: std::collections::HashMap<usize, f64> = portfolio
+        .positions
+        .iter()
+        .map(|(&k, v)| (k, v.last_market_value))
+        .collect();
+
+    // Clear positions, keep track of initial cash, rebuild using Finlab's method
+    portfolio.positions.clear();
+    // Start with the initial cash from the portfolio (usually 0 for positions,
+    // but could be non-zero at the very start or after exits)
+    let mut cash = portfolio.cash;
+
     for (stock_id, &target_weight) in target_weights.iter().enumerate() {
-        let target_cost_basis = total_balance * target_weight;
-        let current_cost_basis = portfolio
-            .positions
-            .get(&stock_id)
-            .map(|p| p.value)
-            .unwrap_or(0.0);
-
-        // For longs: need to sell if current > target (reduce position)
-        // For shorts: need to cover if current < target (current is more negative than target)
-        let need_to_decrease = if target_weight >= 0.0 {
-            current_cost_basis > target_cost_basis + 1e-10
-        } else {
-            // Short position: need to reduce negative position (cover)
-            current_cost_basis < target_cost_basis - 1e-10
-        };
-
-        if need_to_decrease {
-            // Need to sell (or cover short)
-            let sell_amount = (current_cost_basis - target_cost_basis).abs();
-            if let Some(pos) = portfolio.positions.get_mut(&stock_id) {
-                if pos.value > 0.0 {
-                    // LONG position: sell shares, receive cash
-                    let sell_value = sell_amount - sell_amount * (config.fee_ratio + config.tax_ratio);
-                    pos.value -= sell_amount;
-                    portfolio.cash += sell_value;
-                } else {
-                    // SHORT position: cover by buying back shares, spend cash
-                    let cover_cost = sell_amount + sell_amount * (config.fee_ratio + config.tax_ratio);
-                    pos.value += sell_amount;  // Make liability less negative
-                    portfolio.cash -= cover_cost;  // Spend cash to buy back
-                }
-
-                // Remove position if close to zero
-                if pos.value.abs() < 1e-10 {
-                    portfolio.positions.remove(&stock_id);
-                }
-            }
-        }
-    }
-
-    // Step 4: Buy underweight positions (including entering shorts)
-    for (stock_id, &target_weight) in target_weights.iter().enumerate() {
-        if target_weight == 0.0 {
+        if stock_id >= prices.len() {
             continue;
         }
 
-        let target_cost_basis = total_balance * target_weight;
-        let current_cost_basis = portfolio
-            .positions
-            .get(&stock_id)
-            .map(|p| p.value)
-            .unwrap_or(0.0);
+        let price = prices[stock_id];
+        let price_valid = price > 0.0 && !price.is_nan();
 
-        // For longs (target > 0): enter if current < target
-        // For shorts (target < 0): enter if current > target (0 > -0.5 means enter short)
-        let need_to_increase = if target_weight > 0.0 {
-            current_cost_basis < target_cost_basis - 1e-10
+        // Target position value (scaled by ratio)
+        let target_value = target_weight * ratio;
+        let current_value = old_positions.get(&stock_id).copied().unwrap_or(0.0);
+
+        // Handle NaN price case:
+        // Finlab enters positions even when price is NaN!
+        // The position value is set, and balance uses the value directly when price is NaN.
+        if !price_valid {
+            // If target is 0 and we have an old position, sell it using last market value
+            if target_weight.abs() < 1e-10 {
+                if let Some(&market_value) = old_market_values.get(&stock_id) {
+                    if market_value.abs() > 1e-10 {
+                        let sell_fee = market_value.abs() * (config.fee_ratio + config.tax_ratio);
+                        cash += market_value - sell_fee;
+                    }
+                }
+                continue;
+            }
+
+            // Finlab behavior: Enter/modify position even with NaN price
+            // Fees are calculated based on monetary amount difference, not price
+            // - entry_price = 0 signals NaN entry, balance_finlab will use last_market_value
+            // - When price becomes valid, update_entry_prices_after_nan will set entry_price
+            if target_value.abs() > 1e-10 {
+                // Same fee logic as valid price case
+                let amount = target_value - current_value;
+                let is_buy = amount > 0.0;
+                let is_entry = (target_value >= 0.0 && amount > 0.0) || (target_value <= 0.0 && amount < 0.0);
+                let cost = if is_entry {
+                    amount.abs() * config.fee_ratio
+                } else {
+                    amount.abs() * (config.fee_ratio + config.tax_ratio)
+                };
+
+                let new_value = if is_buy {
+                    cash -= amount;
+                    current_value + amount - cost
+                } else {
+                    let sell_amount = amount.abs();
+                    cash += sell_amount - cost;
+                    current_value - sell_amount
+                };
+
+                portfolio.positions.insert(
+                    stock_id,
+                    Position {
+                        value: new_value,
+                        entry_price: 0.0, // Signal that price was NaN at entry
+                        stop_entry_price: 0.0,
+                        max_price: 0.0,
+                        last_market_value: new_value, // Use position value as market value
+                    },
+                );
+            }
+            continue;
+        }
+
+        // Calculate trade amount (difference method)
+        let amount = target_value - current_value;
+
+        if target_value.abs() < 1e-10 {
+            // Exit position completely
+            if current_value.abs() > 1e-10 {
+                // Sell all: cash gets net of exit fee
+                let sell_fee = current_value.abs() * (config.fee_ratio + config.tax_ratio);
+                cash += current_value - sell_fee;
+            }
+            continue;
+        }
+
+        let is_buy = amount > 0.0;
+        // is_entry: buying into a long position OR selling into a short position
+        let is_entry = (target_value >= 0.0 && amount > 0.0) || (target_value <= 0.0 && amount < 0.0);
+        let cost = if is_entry {
+            amount.abs() * config.fee_ratio
         } else {
-            // Short position: need to make cost_basis more negative
-            current_cost_basis > target_cost_basis + 1e-10
+            amount.abs() * (config.fee_ratio + config.tax_ratio)
         };
 
-        if need_to_increase {
-            // Need to increase position magnitude (buy long or enter short)
-            // For longs: spend cash to buy stock
-            // For shorts: in Finlab's model, we track negative cost_basis but also adjust cash
-            //            The total balance stays the same (cash + position value = constant)
+        let new_position_value;
+        if is_buy {
+            // Buying: cash decreases by gross amount, position increases by net amount
+            cash -= amount;
+            new_position_value = current_value + amount - cost;
+        } else {
+            // Selling: cash increases by net amount, position decreases by gross amount
+            let sell_amount = amount.abs();
+            cash += sell_amount - cost;
+            new_position_value = current_value - sell_amount;
+        }
 
-            if target_weight > 0.0 {
-                // LONG position: spend cash to buy
-                let buy_cost_basis = target_cost_basis - current_cost_basis;
-                let spend_needed = buy_cost_basis / (1.0 - config.fee_ratio);
-                let actual_spend = spend_needed.min(portfolio.cash);
-
-                if actual_spend > 1e-10 {
-                    let cost_basis_added = actual_spend * (1.0 - config.fee_ratio);
-                    portfolio.cash -= actual_spend;
-
-                    let entry = portfolio.positions.entry(stock_id).or_insert(Position {
-                        value: 0.0,
-                        entry_price: prices[stock_id],
-                        stop_entry_price: prices[stock_id],
-                        max_price: prices[stock_id],
-                    });
-
-                    if entry.value.abs() < 1e-10 {
-                        entry.entry_price = prices[stock_id];
-                        entry.stop_entry_price = prices[stock_id];
-                        entry.max_price = prices[stock_id];
-                    }
-                    entry.value += cost_basis_added;
-                }
-            } else {
-                // SHORT position: we receive cash from selling borrowed shares
-                // and create a liability (negative cost_basis)
-                let short_cost_basis = target_cost_basis - current_cost_basis;  // Negative
-                let abs_amount = short_cost_basis.abs();
-
-                // Short sale: receive proceeds minus fee
-                let proceeds = abs_amount * (1.0 - config.fee_ratio);
-
-                if proceeds > 1e-10 {
-                    portfolio.cash += proceeds;  // RECEIVE cash from short sale
-
-                    let entry = portfolio.positions.entry(stock_id).or_insert(Position {
-                        value: 0.0,
-                        entry_price: prices[stock_id],
-                        stop_entry_price: prices[stock_id],
-                        max_price: prices[stock_id],
-                    });
-
-                    if entry.value.abs() < 1e-10 {
-                        entry.entry_price = prices[stock_id];
-                        entry.stop_entry_price = prices[stock_id];
-                        entry.max_price = prices[stock_id];
-                    }
-                    // For shorts, cost_basis is negative (liability)
-                    // We set it to the target, adjusted for actual proceeds
-                    entry.value -= proceeds / (1.0 - config.fee_ratio);  // Make negative
-                }
-            }
+        if new_position_value.abs() > 1e-10 {
+            portfolio.positions.insert(
+                stock_id,
+                Position {
+                    value: new_position_value,
+                    entry_price: price,
+                    stop_entry_price: price,
+                    max_price: price,
+                    last_market_value: new_position_value, // Initialize to cost_basis
+                },
+            );
         }
     }
+
+    // Step 5: Handle old positions that are OUTSIDE target_weights array
+    // (positions within target_weights range are already handled in step 4)
+    for (&stock_id, &old_value) in old_positions.iter() {
+        if stock_id >= target_weights.len() && old_value.abs() > 1e-10 {
+            // This position is outside target_weights and should be sold
+            let sell_fee = old_value.abs() * (config.fee_ratio + config.tax_ratio);
+            cash += old_value - sell_fee;
+        }
+    }
+
+    // Step 6: Store the cash (may be negative in Finlab model)
+    portfolio.cash = cash;
 }
 
 /// Execute T+1 rebalance with Finlab-compatible sequence
@@ -1244,6 +1373,7 @@ fn enter_new_positions(
                         entry_price: prices[stock_id],
                         stop_entry_price: prices[stock_id],
                         max_price: prices[stock_id],
+                        last_market_value: actual_buy,
                     },
                 );
             }
@@ -1342,8 +1472,10 @@ fn exit_and_adjust_positions(
                     entry_price: prices[stock_id],
                     stop_entry_price: prices[stock_id],
                     max_price: prices[stock_id],
+                    last_market_value: 0.0,
                 });
                 entry.value += actual_buy;
+                entry.last_market_value = entry.value;
             }
         }
     }
@@ -1478,6 +1610,7 @@ fn rebalance_to_target_weights(
                     entry_price: prices[stock_id],
                     stop_entry_price: prices[stock_id],
                     max_price: prices[stock_id],
+                    last_market_value: 0.0,
                 });
                 // Update entry price only for new positions
                 if entry.value < 1e-10 {
@@ -1486,6 +1619,7 @@ fn rebalance_to_target_weights(
                     entry.max_price = prices[stock_id];
                 }
                 entry.value += position_value;
+                entry.last_market_value = entry.value;
             }
         }
     }
