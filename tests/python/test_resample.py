@@ -190,9 +190,11 @@ def test_resample_with_report(price_data):
         resample='M',
     )
 
-    # Should have 3 trades (one per month) - actually likely just 1 since we hold through
-    # The important thing is it doesn't crash
-    assert len(report.creturn) == len(dates)
+    # With resample='M' and default fees (non-zero), creturn starts from signal day
+    # (end of January = first monthly rebalance point)
+    # This matches Finlab behavior: with fees, start from signal day
+    assert len(report.creturn) < len(dates)  # Should be shorter due to resampling
+    assert report.creturn["date"][0].startswith("2024-01-3")  # End of Jan (signal day)
     assert isinstance(report.trades, pl.DataFrame)
 
 
