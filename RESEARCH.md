@@ -242,17 +242,74 @@ if prev_is_nan {
 - 兩股票 (2330+2317): 完全匹配 (差異 < 1e-14)
 - 完整策略 (rolling 300 max): 從 ~3% 降到 ~0.24%
 
-### 8. 剩餘差異分析
+### 8. 剩餘差異分析 (已解決)
 
-剩餘 0.24% 差異可能來自:
-1. 浮點數精度累積誤差
-2. 多股票等權重計算的細微差異
-3. NaN 價格股票的 rebalance 處理
+~~剩餘 0.24% 差異可能來自:~~
+~~1. 浮點數精度累積誤差~~
+~~2. 多股票等權重計算的細微差異~~
+~~3. NaN 價格股票的 rebalance 處理~~
 
-第一個差異出現在 2010-09-01:
-- 差異: -0.000129 (-0.003%)
-- 4609 股票在 8/31-9/3 連續 NaN
-- rebalance 時需要賣出 4609，但價格是 NaN
+### 9. 根本原因發現: NaN 股票的 balance 計算 Bug (2024-12-23)
+
+**問題**: 在 `execute_finlab_rebalance` 中，NaN 價格股票使用 cost_basis 而非 market value
+
+**Finlab 行為** (restored_backtest_core.pyx lines 299-314):
+```python
+# 每日更新 pos[sid] (市值)
+r = price_values[d, sidprice] / previous_price[sidprice]
+if isnan(r):
+    r = 1  # NaN 時不變
+pos[sid] *= r  # pos[sid] 始終追踪市值!
+```
+
+**Finlab rebalance 時的 balance 計算**:
+```python
+balance = cash
+for sid in pos:
+    balance += pos[sid]  # 使用市值 (pos[sid] 已被每日更新)
+```
+
+**我們的問題**:
+- `pos.value` = cost_basis (進場時設定，不每日更新)
+- `last_market_value` = 市值 (每日更新)
+- 但在 `execute_finlab_rebalance` Step 1 中，對 NaN 股票不更新 `pos.value`
+- 導致 balance 計算時使用 cost_basis 而非 market value
+
+**4609 股票案例分析**:
+```
+Entry date: 2010-08-02
+Entry price: 141.89
+Initial pos value (after fee): 0.027738 (= 1/36 * 0.998575)
+
+Daily evolution (pos *= r):
+  2010-08-02: pos=0.027738 (entry)
+  ...
+  2010-08-30: pos=0.050064 (last valid price)
+  2010-08-31: pos=0.050064 (NaN, r=1)
+  2010-09-01: pos=0.050064 (NaN, r=1, rebalance day)
+
+On 2010-09-01 rebalance:
+  Finlab uses pos[4609] = 0.050064 (market value)
+  Our code uses pos.value = 0.027738 (cost_basis) ← BUG!
+
+  Difference per stock: 0.022326 = 0.050064 - 0.027738
+```
+
+**影響**:
+- balance 計算錯誤導致 rebalance ratio 錯誤
+- 所有新持倉的權重都被錯誤縮放
+- 差異隨時間累積，最終達 ~0.24%
+
+**修復方案**:
+在 `execute_finlab_rebalance` Step 1 中，對 NaN 價格股票使用 `last_market_value`:
+```rust
+if close_price > 0.0 && pos.entry_price > 0.0 && !close_price.is_nan() {
+    pos.value = pos.value * close_price / pos.entry_price;
+} else {
+    // For NaN prices, use last valid market value
+    pos.value = pos.last_market_value;
+}
+```
 
 ---
 
@@ -264,12 +321,24 @@ if prev_is_nan {
 4. [x] 檢查 NaN 價格處理 - **已修復 Bug!**
 5. [x] 檢查 previous_price 更新邏輯 - Finlab 在 NaN 日不更新
 6. [x] 找出我們實現與 Finlab 的具體差異點 - 見上方分析
+7. [x] 修復 NaN 股票的 balance 計算 Bug - **完成!** (2024-12-23)
 
-## 當前狀態 (2024-12-23)
+## 當前狀態 (2024-12-23) ✅
+
+**目標達成！完全匹配 Finlab！**
 
 - 單股票: **完全匹配** (差異 < 1e-13)
 - 兩股票 (2330+2317): **完全匹配** (差異 < 1e-14)
-- 完整策略 (rolling 300 max): **差異 ~0.24%** (從 ~3% 改善)
+- 完整策略 (rolling 300 max): **完全匹配** (差異 < 1e-14) ✅
+
+**最終驗證結果**:
+```
+Final date: 2025-12-23
+Finlab creturn: 66.597805
+Polars creturn: 66.597805
+Max relative diff: 0.0000%
+Dates compared: 4114
+```
 
 ---
 

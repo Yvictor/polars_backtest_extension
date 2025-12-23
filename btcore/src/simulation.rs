@@ -1111,11 +1111,19 @@ fn execute_finlab_rebalance(
     // - This results in unequal cost_basis and potentially negative cash
 
     // Step 1: Update all positions to market value
+    // For valid prices: market_value = cost_basis * close / entry_price
+    // For NaN prices: use last_market_value (tracked daily via update_market_values)
+    // This matches Finlab's pos[sid] which is updated daily with pos *= r (r=1 for NaN)
     for (stock_id, pos) in portfolio.positions.iter_mut() {
         if *stock_id < prices.len() {
             let close_price = prices[*stock_id];
-            if close_price > 0.0 && pos.entry_price > 0.0 {
+            let price_valid = close_price > 0.0 && !close_price.is_nan();
+            if price_valid && pos.entry_price > 0.0 {
                 pos.value = pos.value * close_price / pos.entry_price;
+            } else {
+                // For NaN prices, use last valid market value (Finlab: pos[sid] *= 1)
+                // This is critical! Without this, we'd use cost_basis instead of market value
+                pos.value = pos.last_market_value;
             }
             pos.entry_price = close_price;
             pos.max_price = close_price;
