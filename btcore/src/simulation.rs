@@ -865,15 +865,18 @@ fn update_entry_prices_after_nan(
         }
 
         // Case 2: Previous day's price was NaN but current is valid
-        // Update entry_price to current price for 0% return on this transition
-        if stock_id < prev_prices.len() {
-            let prev_price = prev_prices[stock_id];
-            let prev_is_nan = prev_price.is_nan() || prev_price <= 0.0;
-
-            if prev_is_nan {
-                pos.entry_price = curr_price;
-            }
-        }
+        // DO NOT update entry_price here!
+        // Finlab behavior: previous_price is NOT updated during NaN days
+        // So when price recovers, the return includes the "hidden" price change during NaN
+        // Our model: balance = pos.value * close_price / entry_price
+        // If entry_price stays at pre-NaN value, the calculation correctly includes the return
+        //
+        // Example:
+        // Day 1: price=100, entry_price=100, balance = 1.0 * 100/100 = 1.0
+        // Day 2: price=NaN, uses last_market_value = 1.0
+        // Day 3: price=120, balance = 1.0 * 120/100 = 1.2 (correctly captures 20% return)
+        //
+        // If we updated entry_price to 120 on Day 3, balance would be 1.0 * 120/120 = 1.0 (WRONG!)
     }
 }
 
