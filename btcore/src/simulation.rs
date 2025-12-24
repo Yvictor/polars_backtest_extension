@@ -556,15 +556,17 @@ fn simulate_backtest<T: TradeTracker>(
                     for stock_id in exits_to_process {
                         if let Some(pos) = portfolio.positions.remove(&stock_id) {
                             // Calculate market value for fee calculation
+                            // When price is NaN, use last_market_value (Finlab: pos[sid] *= 1)
                             let market_value = if stock_id < close_prices[t].len() && pos.entry_price > 0.0 {
                                 let close_price = close_prices[t][stock_id];
-                                if close_price > 0.0 {
+                                if close_price > 0.0 && !close_price.is_nan() {
                                     pos.value * close_price / pos.entry_price
                                 } else {
-                                    pos.value
+                                    // NaN price: use last valid market value (Finlab behavior)
+                                    pos.last_market_value
                                 }
                             } else {
-                                pos.value
+                                pos.last_market_value
                             };
                             let sell_value =
                                 market_value - market_value.abs() * (config.fee_ratio + config.tax_ratio);
@@ -1035,9 +1037,14 @@ fn detect_stops_finlab(
             }
 
             // Use cumulative cr from Position (Finlab: cr *= r)
-            // This matches Finlab's floating point behavior exactly
             // Note: cr is updated by update_max_prices() before this function is called
             let cr = pos.cr;
+
+            // Finlab uses cr_at_close = cr * close / price for stop detection (line 387)
+            // Even when close == price (both adj_close), the multiply-divide operation
+            // affects floating point precision, which matters at exact threshold boundaries.
+            // Example: cr = 0.9499999999999998 < 0.95, but cr * p / p = 0.95 exactly!
+            let cr_at_close = cr * current_price / current_price;
 
             // maxcr = max_price / stop_entry (Finlab's max cumulative return)
             // Note: We still use direct division for maxcr since Finlab tracks it similarly
@@ -1047,10 +1054,10 @@ fn detect_stops_finlab(
             // For long positions:
             //   max_r = 1 + take_profit
             //   min_r = max(1 - stop_loss, maxcr - trail_stop)
-            // Trigger: cr >= max_r (take profit) or cr < min_r (stop loss/trail)
+            // Trigger: cr_at_close >= max_r (take profit) or cr_at_close < min_r (stop loss/trail)
 
-            // Check take profit: cr >= 1 + take_profit
-            if config.take_profit < f64::INFINITY && cr >= 1.0 + config.take_profit {
+            // Check take profit: cr_at_close >= 1 + take_profit
+            if config.take_profit < f64::INFINITY && cr_at_close >= 1.0 + config.take_profit {
                 return Some(stock_id);
             }
 
@@ -1063,8 +1070,8 @@ fn detect_stops_finlab(
             };
             let min_r = stop_threshold.max(trail_threshold);
 
-            // Check stop loss / trail stop: cr < min_r (Finlab uses < not <=)
-            if cr < min_r {
+            // Check stop loss / trail stop: cr_at_close < min_r (Finlab uses < not <=)
+            if cr_at_close < min_r {
                 return Some(stock_id);
             }
 

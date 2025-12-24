@@ -13,9 +13,27 @@ report = backtest.sim(position, resample='M')
 
 ## 當前狀態 (2024-12-24 更新)
 - ✅ creturn 匹配: `round(6)` 完全一致
-- ✅ 最大差異: 1.07e-13 (機器精度)
-- ✅ `test_stop_loss[0.1]` 通過 (累積乘法修正)
-- ⚠️ `test_stop_loss[0.05]` 仍失敗 (更激進的 stop 有其他邊界問題)
+- ✅ 最大差異: 3.41e-13 (機器精度)
+- ✅ `test_stop_loss[0.05]` 通過
+- ✅ `test_stop_loss[0.1]` 通過
+
+### 通過的測試 (11/18)
+- test_resample[D], [W], [M]
+- test_fees[0-0], [0.001425-0.003], [0.01-0.005]
+- test_position_limit[0.2], [1.0]
+- test_stop_loss[0.05], [0.1]
+- test_stop_trading_next_period_false
+
+### 待修正 (7/18)
+- test_position_limit[0.5]
+- test_take_profit[0.1], [0.2]
+- test_trail_stop[0.1], [0.15]
+- test_retain_cost_when_rebalance
+- test_trades_match
+
+### 已修正的關鍵問題
+1. **cr_at_close 浮點精度**: Finlab 使用 `cr * close / price` 公式，即使 close == price，乘除操作也會影響浮點數精度
+2. **NaN 價格停損退出**: 當退出日價格為 NaN 時，應使用 `last_market_value` 而非 `cost_basis`
 
 ---
 
