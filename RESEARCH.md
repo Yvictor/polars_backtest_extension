@@ -577,6 +577,38 @@ Therefore cr_at_close = cr (no adjustment)
 - 差異源於極少數邊界情況 (17 個日期有 ±1 筆差異)
 - 這是可接受的精度差異，不影響實際交易決策
 
+### 10.4 Trades.return 計算差異 (2024-12-24)
+
+**發現**: 同一天進出的交易，Finlab 和 Polars 報告的 return 不同
+
+**驗證數據** (2009-09-01 出場的交易):
+```
+Stock   Entry Price  Exit Price   Finlab Return  Polars Return  Diff
+2383    25.1307      30.9300      0.229015       0.223579       0.0054
+2428    41.8260      47.1110      0.124751       0.119776       0.0050
+6134    69.8806      97.9600      0.399821       0.393629       0.0062
+3068    48.6154      61.7174      0.267694       0.262087       0.0056
+```
+
+**計算公式差異**:
+| 系統 | 公式 | 說明 |
+|------|------|------|
+| Finlab | `(exit/entry) * (1-fee) - 1` | 只扣 entry fee |
+| Polars | `exit*(1-fee-tax) / entry*(1+fee) - 1` | 完整 net return |
+
+**差異來源**:
+- fee = 0.001425, tax = 0.003
+- Finlab 只扣 entry fee (0.1425%)
+- Polars 扣 entry fee + exit fee+tax (0.1425% + 0.4425%)
+- 差異 ≈ 0.5% (正比於 exit fee)
+
+**影響**:
+- **不影響 creturn**: creturn 是基於 balance 計算，正確包含所有費用
+- **不影響 stop 檢測**: stop 基於 cr (累積報酬率)
+- **只影響 trades 報告**: trades.return 是報表用，不影響回測邏輯
+
+**結論**: 這是 return 定義的差異，不是 bug。Polars 的計算更準確反映實際淨收益。
+
 ### 11. retain_cost_when_rebalance 邏輯
 
 **Finlab 行為** (lines 468-478):
