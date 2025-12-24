@@ -20,7 +20,8 @@ pub struct TradeRecord {
     /// Stock ID (column index in price matrix)
     pub stock_id: usize,
     /// Actual entry date (row index in price matrix, T+1 after signal)
-    pub entry_index: usize,
+    /// None for pending entries that have signal but not yet executed
+    pub entry_index: Option<usize>,
     /// Actual exit date (row index in price matrix)
     pub exit_index: Option<usize>,
     /// Signal date for entry (row index in price matrix)
@@ -40,7 +41,10 @@ pub struct TradeRecord {
 impl TradeRecord {
     /// Calculate holding period in days
     pub fn holding_period(&self) -> Option<usize> {
-        self.exit_index.map(|exit| exit - self.entry_index)
+        match (self.entry_index, self.exit_index) {
+            (Some(entry), Some(exit)) => Some(exit - entry),
+            _ => None,
+        }
     }
 
     /// Calculate trade return with fees
@@ -119,6 +123,10 @@ trait TradeTracker {
     #[allow(dead_code)]
     fn get_entry_price(&self, stock_id: usize) -> Option<f64>;
 
+    /// Add a pending entry (signal given but not yet executed)
+    /// Used for trades at the end of simulation where entry would happen on the next day
+    fn add_pending_entry(&mut self, stock_id: usize, signal_index: usize, weight: f64);
+
     /// Finalize all open trades at the end of simulation
     fn finalize(
         self,
@@ -153,6 +161,9 @@ impl TradeTracker for NoopTracker {
     fn get_entry_price(&self, _: usize) -> Option<f64> {
         None
     }
+
+    #[inline]
+    fn add_pending_entry(&mut self, _: usize, _: usize, _: f64) {}
 
     #[inline]
     fn finalize(self, _: usize, _: &[f64], _: f64, _: f64) -> Vec<TradeRecord> {
@@ -206,7 +217,7 @@ impl TradeTracker for RealTracker {
         if let Some(open_trade) = self.open_trades.remove(&stock_id) {
             let trade = TradeRecord {
                 stock_id,
-                entry_index: open_trade.entry_index,
+                entry_index: Some(open_trade.entry_index),
                 exit_index: Some(exit_index),
                 entry_sig_index: open_trade.entry_sig_index,
                 exit_sig_index,
@@ -232,37 +243,42 @@ impl TradeTracker for RealTracker {
         self.open_trades.get(&stock_id).map(|t| t.entry_price)
     }
 
+    fn add_pending_entry(&mut self, stock_id: usize, signal_index: usize, weight: f64) {
+        // Add a pending entry record (Finlab: entry_date=NaT for signals not yet executed)
+        // This is for stocks that have a buy signal on the last day but would execute on the next day
+        self.completed_trades.push(TradeRecord {
+            stock_id,
+            entry_index: None,  // Not yet executed
+            exit_index: None,
+            entry_sig_index: signal_index,
+            exit_sig_index: None,
+            position_weight: weight,
+            entry_price: f64::NAN,  // No entry price yet
+            exit_price: None,
+            trade_return: None,
+        });
+    }
+
     fn finalize(
         mut self,
-        last_index: usize,
-        trade_prices: &[f64],
-        fee_ratio: f64,
-        tax_ratio: f64,
+        _last_index: usize,
+        _trade_prices: &[f64],
+        _fee_ratio: f64,
+        _tax_ratio: f64,
     ) -> Vec<TradeRecord> {
-        // Close all remaining open trades
+        // Report open positions as still open (like Finlab: exit_date=NaT)
+        // Don't close them at the last index
         for (stock_id, open_trade) in self.open_trades.drain() {
-            let exit_price = if stock_id < trade_prices.len() {
-                trade_prices[stock_id]
-            } else {
-                open_trade.entry_price
-            };
-
-            let trade = TradeRecord {
+            self.completed_trades.push(TradeRecord {
                 stock_id,
-                entry_index: open_trade.entry_index,
-                exit_index: Some(last_index),
+                entry_index: Some(open_trade.entry_index),
+                exit_index: None, // Open position - no exit
                 entry_sig_index: open_trade.entry_sig_index,
                 exit_sig_index: None,
                 position_weight: open_trade.weight,
                 entry_price: open_trade.entry_price,
-                exit_price: Some(exit_price),
-                trade_return: None,
-            };
-            let trade_return = trade.calculate_return(fee_ratio, tax_ratio);
-
-            self.completed_trades.push(TradeRecord {
-                trade_return,
-                ..trade
+                exit_price: None, // Open position - no exit price
+                trade_return: None, // Open position - no return calculated
             });
         }
 
@@ -809,6 +825,18 @@ fn simulate_backtest<T: TradeTracker>(
 
         // Update previous prices
         prev_prices = close_prices[t].clone();
+    }
+
+    // Add pending entries for stocks that have signals but weren't executed
+    // (Finlab: entry_date=NaT for buy signals on the last day)
+    if let Some(weights) = pending_weights {
+        let signal_index = pending_signal_index.unwrap_or(n_times.saturating_sub(1));
+        for (stock_id, &weight) in weights.iter().enumerate() {
+            // Only add pending entries for new positions (not already held)
+            if weight > 1e-10 && !portfolio.positions.contains_key(&stock_id) {
+                tracker.add_pending_entry(stock_id, signal_index, weight);
+            }
+        }
     }
 
     creturn

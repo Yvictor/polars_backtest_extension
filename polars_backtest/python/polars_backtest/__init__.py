@@ -278,11 +278,20 @@ def _resample_position(
             freq += 'E'
 
     # Generate rebalance dates using pandas date_range
+    # Extend end_date to include the next period end (Finlab behavior)
+    # This allows capturing pending entries for the upcoming rebalance
     start_date = all_dates_pd[0]
     end_date = all_dates_pd[-1]
 
+    # Extend end_date by one period to include upcoming rebalance date
     try:
-        rebalance_dates = pd.date_range(start=start_date, end=end_date, freq=freq)
+        one_period = to_offset(freq)
+        extended_end = end_date + one_period
+    except (ValueError, TypeError):
+        extended_end = end_date
+
+    try:
+        rebalance_dates = pd.date_range(start=start_date, end=extended_end, freq=freq)
     except ValueError as e:
         raise ValueError(f"Invalid resample frequency: {resample}. Error: {e}")
 
@@ -586,7 +595,8 @@ class Report:
         records = []
         for t in self._trades_raw:
             stock_id = self._stock_columns[t.stock_id] if t.stock_id < len(self._stock_columns) else str(t.stock_id)
-            entry_date = self._dates[t.entry_index] if t.entry_index < len(self._dates) else None
+            # entry_index can be None for pending entries (signals not yet executed)
+            entry_date = self._dates[t.entry_index] if t.entry_index is not None and t.entry_index < len(self._dates) else None
             exit_date = self._dates[t.exit_index] if t.exit_index is not None and t.exit_index < len(self._dates) else None
             entry_sig_date = self._dates[t.entry_sig_index] if t.entry_sig_index < len(self._dates) else None
             exit_sig_date = self._dates[t.exit_sig_index] if t.exit_sig_index is not None and t.exit_sig_index < len(self._dates) else None
@@ -822,15 +832,35 @@ def backtest_with_report(
         else:
             # Non-daily resample: only rebalance on position dates
             rebalance_indices = []
-            for pos_d in position_dates:
+            unmatched_position_indices = []  # Track position indices without matching price dates
+            for i, pos_d in enumerate(position_dates):
                 try:
                     idx = dates.index(pos_d)
                     rebalance_indices.append(idx)
                 except ValueError:
-                    pass
+                    # Date not found - track it for pending entries handling
+                    unmatched_position_indices.append(i)
 
             if not rebalance_indices:
                 raise ValueError("No matching dates between prices and position")
+
+            # Handle unmatched position dates (Finlab behavior: add as pending entries)
+            # If there are position dates after all matched dates (e.g., next month-end),
+            # add the last price date as a rebalance point so the signal becomes pending
+            if unmatched_position_indices:
+                # Check if unmatched dates are AFTER all matched dates
+                last_matched_pos_idx = max(
+                    i for i, pos_d in enumerate(position_dates)
+                    if pos_d in [dates[idx] for idx in rebalance_indices]
+                ) if rebalance_indices else -1
+
+                for unmatched_idx in unmatched_position_indices:
+                    if unmatched_idx > last_matched_pos_idx:
+                        # This is a future position date - add last price date as rebalance point
+                        # This will make the signal pending at end of simulation
+                        last_price_idx = len(dates) - 1
+                        if last_price_idx not in rebalance_indices:
+                            rebalance_indices.append(last_price_idx)
 
             # When rebalance_indices auto-calculated, position already has correct rows
             position_data = position.select(position_stock_cols)

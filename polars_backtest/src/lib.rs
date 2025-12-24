@@ -276,8 +276,9 @@ pub struct PyTradeRecord {
     #[pyo3(get)]
     pub stock_id: usize,
     /// Actual entry date (row index in price matrix, T+1 after signal)
+    /// None for pending entries that have signal but not yet executed
     #[pyo3(get)]
-    pub entry_index: usize,
+    pub entry_index: Option<usize>,
     /// Actual exit date (row index in price matrix)
     #[pyo3(get)]
     pub exit_index: Option<usize>,
@@ -305,12 +306,15 @@ pub struct PyTradeRecord {
 impl PyTradeRecord {
     /// Calculate holding period in days
     fn holding_period(&self) -> Option<usize> {
-        self.exit_index.map(|exit| exit - self.entry_index)
+        match (self.entry_index, self.exit_index) {
+            (Some(entry), Some(exit)) => Some(exit - entry),
+            _ => None,
+        }
     }
 
     fn __repr__(&self) -> String {
         format!(
-            "TradeRecord(stock_id={}, entry_index={}, exit_index={:?}, position={:.4}, entry_price={:.2}, exit_price={:?}, return={:?})",
+            "TradeRecord(stock_id={}, entry_index={:?}, exit_index={:?}, position={:.4}, entry_price={:.2}, exit_price={:?}, return={:?})",
             self.stock_id,
             self.entry_index,
             self.exit_index,

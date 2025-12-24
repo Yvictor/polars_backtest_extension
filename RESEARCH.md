@@ -12,23 +12,20 @@ report = backtest.sim(position, resample='M')
 ```
 
 ## 當前狀態 (2024-12-24 更新)
+- ✅ **所有 18 個測試全部通過！**
 - ✅ creturn 匹配: `round(6)` 完全一致
-- ✅ 最大差異: 3.41e-13 (機器精度)
-- ✅ `test_stop_loss[0.05]` 通過
-- ✅ `test_stop_loss[0.1]` 通過
+- ✅ 最大差異: ~3-4e-13 (機器精度)
+- ✅ trades 數量完全匹配 (6410 == 6410)
 
-### 通過的測試 (11/18)
+### 通過的測試 (18/18)
 - test_resample[D], [W], [M]
 - test_fees[0-0], [0.001425-0.003], [0.01-0.005]
-- test_position_limit[0.2], [1.0]
+- test_position_limit[0.2], [0.5], [1.0]
 - test_stop_loss[0.05], [0.1]
-- test_stop_trading_next_period_false
-
-### 待修正 (7/18)
-- test_position_limit[0.5]
 - test_take_profit[0.1], [0.2]
 - test_trail_stop[0.1], [0.15]
 - test_retain_cost_when_rebalance
+- test_stop_trading_next_period_false
 - test_trades_match
 
 ### 已修正的關鍵問題
@@ -918,6 +915,94 @@ let (stop_entry, max_price_val, cr_val, maxcr_val, prev_price) =
 ```
 
 **結果**: test_retain_cost_when_rebalance PASSED
+
+### 11.1 trades_match: Pending Entries for Future Rebalance (2024-12-24)
+
+**問題**: Finlab 有 6410 筆交易，我們只有 6376 筆，差 34 筆
+
+**根因分析**:
+通過 debug 發現 34 筆缺少的交易都有 `entry_date=NaT, entry_sig_date=2025-12-31`。
+這些是 Finlab 對「下一個月底 rebalance 信號」的 pending entries。
+
+Finlab 的行為 (backtest.py lines 783-789):
+```python
+r.trades = pd.concat([r.trades, pd.DataFrame({
+    'stock_id': buy_sids,         # 有 'enter' action 的股票
+    'entry_date': pd.NaT,         # 尚未執行
+    'entry_sig_date': r.position.index[-1],  # = 2025-12-31
+    'exit_date': pd.NaT,
+    'exit_sig_date': pd.NaT,
+})], ignore_index=True)
+```
+
+`buy_sids` 來自 `stock_operations['actions']`，在 restored_backtest_core.pyx lines 607-608:
+```python
+if val0 == 0 and val1 != 0:
+    stock_operations['actions'][sid] = 'enter'
+```
+
+即：當前沒持有 (val0=0) 但下一期目標權重非零 (val1≠0) 的股票。
+
+**修復步驟**:
+
+1. **TradeRecord.entry_index 改為 Option<usize>** (simulation.rs):
+   - 允許 `entry_index = None` 表示 pending entry
+   - 更新 `holding_period()` 方法處理 None 情況
+   - 更新 PyO3 bindings (lib.rs)
+
+2. **新增 add_pending_entry 方法** (simulation.rs):
+   ```rust
+   fn add_pending_entry(&mut self, stock_id: usize, signal_index: usize, weight: f64) {
+       self.completed_trades.push(TradeRecord {
+           stock_id,
+           entry_index: None,  // Not yet executed
+           entry_sig_index: signal_index,
+           position_weight: weight,
+           entry_price: f64::NAN,
+           // ... other fields None
+       });
+   }
+   ```
+
+3. **在 simulate_backtest 結束時添加 pending entries** (simulation.rs):
+   ```rust
+   if let Some(weights) = pending_weights {
+       for (stock_id, &weight) in weights.iter().enumerate() {
+           if weight > 1e-10 && !portfolio.positions.contains_key(&stock_id) {
+               tracker.add_pending_entry(stock_id, signal_index, weight);
+           }
+       }
+   }
+   ```
+
+4. **擴展 resample_position 包含未來 rebalance 日期** (__init__.py):
+   ```python
+   # Extend end_date by one period to include upcoming rebalance date
+   one_period = to_offset(freq)
+   extended_end = end_date + one_period
+   rebalance_dates = pd.date_range(start=start_date, end=extended_end, freq=freq)
+   ```
+
+5. **處理未匹配的未來位置日期** (__init__.py):
+   ```python
+   # If there are position dates after all matched dates,
+   # add the last price date as a rebalance point
+   if unmatched_position_indices:
+       for unmatched_idx in unmatched_position_indices:
+           if unmatched_idx > last_matched_pos_idx:
+               last_price_idx = len(dates) - 1
+               if last_price_idx not in rebalance_indices:
+                   rebalance_indices.append(last_price_idx)
+   ```
+
+6. **Python 端處理 entry_index = None** (__init__.py):
+   ```python
+   entry_date = self._dates[t.entry_index] if t.entry_index is not None and t.entry_index < len(self._dates) else None
+   ```
+
+**結果**: test_trades_match PASSED (Finlab=6410, Polars=6410)
+
+---
 
 ### 12. 移除 pandas/numpy 運行時依賴
 
