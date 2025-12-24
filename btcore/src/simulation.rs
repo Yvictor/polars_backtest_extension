@@ -375,20 +375,23 @@ impl PortfolioState {
     }
 
     /// Calculate portfolio balance in Finlab mode
-    /// Finlab formula: cash + Σ(cost_basis * close_price / entry_price)
-    /// When price is NaN, Finlab uses the last valid market value (from pos[sid] *= r updates)
+    /// Finlab formula: cash + Σ(pos[sid] * close / price)
+    /// But when close == price (both adj_close), this simplifies to cash + Σ(pos[sid])
+    /// We use last_market_value which is updated via cumulative multiplication (pos *= r)
+    /// This matches Finlab's floating point behavior exactly
     #[allow(dead_code)]
     fn balance_finlab(&self, prices: &[f64]) -> f64 {
+        // Finlab: balance = cash + Σ(pos[sid])
+        // where pos[sid] is updated daily via pos *= r (cumulative multiplication)
+        // We track this as last_market_value, updated in update_max_prices
         let pos_value: f64 = self.positions.iter()
             .map(|(&stock_id, p)| {
                 if stock_id < prices.len() {
                     let close_price = prices[stock_id];
-                    let entry_price = p.entry_price;
-                    if entry_price > 0.0 && close_price > 0.0 && !close_price.is_nan() {
-                        // Valid case: cost_basis * close / entry
-                        p.value * close_price / entry_price
+                    // If current price is NaN, use last valid market value
+                    if close_price > 0.0 && !close_price.is_nan() {
+                        p.last_market_value
                     } else {
-                        // NaN case: use last valid market value (Finlab line 473)
                         p.last_market_value
                     }
                 } else {
@@ -399,17 +402,19 @@ impl PortfolioState {
         self.cash + pos_value
     }
 
-    /// Update last_market_value for all positions (Finlab: pos[sid] *= r)
-    /// Call this daily to track market values for NaN handling
+    /// Update last_market_value for all positions using cumulative multiplication
+    /// (Finlab: pos[sid] *= r, where r = price / previous_price)
+    /// This matches Finlab's floating point behavior exactly
     fn update_market_values(&mut self, prices: &[f64]) {
         for (&stock_id, pos) in self.positions.iter_mut() {
             if stock_id < prices.len() {
                 let close_price = prices[stock_id];
-                if pos.entry_price > 0.0 && close_price > 0.0 && !close_price.is_nan() {
-                    // Valid price: update market value
-                    pos.last_market_value = pos.value * close_price / pos.entry_price;
+                if close_price > 0.0 && !close_price.is_nan() && pos.previous_price > 0.0 {
+                    // Valid price: use cumulative multiplication (Finlab: pos *= r)
+                    let r = close_price / pos.previous_price;
+                    pos.last_market_value *= r;
                 }
-                // If NaN, keep last_market_value unchanged (like Finlab's pos[sid] *= 1)
+                // If NaN or first day, keep last_market_value unchanged (like Finlab's pos[sid] *= 1)
             }
         }
     }
@@ -565,18 +570,10 @@ fn simulate_backtest<T: TradeTracker>(
 
                     for stock_id in exits_to_process {
                         if let Some(pos) = portfolio.positions.remove(&stock_id) {
-                            // Calculate market value for fee calculation
-                            // When price is NaN, use last_market_value (Finlab: pos[sid] *= 1)
-                            let market_value = if stock_id < close_prices[t].len() && pos.entry_price > 0.0 {
-                                let close_price = close_prices[t][stock_id];
-                                if close_price > 0.0 && !close_price.is_nan() {
-                                    pos.value * close_price / pos.entry_price
-                                } else {
-                                    pos.last_market_value
-                                }
-                            } else {
-                                pos.last_market_value
-                            };
+                            // Use last_market_value which has been updated with today's return
+                            // Finlab line 439: cash += pos[sid] - abs(pos[sid]) * (fee + tax)
+                            // pos[sid] has already been updated by pos *= r (line 313)
+                            let market_value = pos.last_market_value;
                             let sell_value =
                                 market_value - market_value.abs() * (config.fee_ratio + config.tax_ratio);
                             portfolio.cash += sell_value;
@@ -626,9 +623,23 @@ fn simulate_backtest<T: TradeTracker>(
                     //         pos_values[pos_id, abs(sid)] = 0
                     // ```
                     if config.stop_trading_next_period {
+                        // Calculate original sum before zeroing stopped stocks
+                        let original_sum: f64 = target_weights.iter().map(|w| w.abs()).sum();
+
                         for (i, stopped) in stopped_stocks.iter().enumerate() {
                             if *stopped && i < target_weights.len() {
                                 target_weights[i] = 0.0;
+                            }
+                        }
+
+                        // Re-normalize: Scale up remaining weights to maintain 100% investment
+                        // Finlab: ratio = balance / abs(newp).sum() where newp has 0 for stopped stocks
+                        // The sum is smaller, so each position gets proportionally more weight
+                        let remaining_sum: f64 = target_weights.iter().map(|w| w.abs()).sum();
+                        if remaining_sum > 0.0 && remaining_sum < original_sum {
+                            let scale_factor = original_sum / remaining_sum;
+                            for w in target_weights.iter_mut() {
+                                *w *= scale_factor;
                             }
                         }
                     }
@@ -683,9 +694,8 @@ fn simulate_backtest<T: TradeTracker>(
                 weight_idx += 1;
             }
 
-            // Update market values for NaN handling (Finlab: pos[sid] *= r)
-            // This tracks the last valid market value for each position
-            portfolio.update_market_values(&close_prices[t]);
+            // Note: last_market_value is now updated in update_max_prices (via pos *= r)
+            // before previous_price is updated, matching Finlab's floating point behavior
 
             // Record cumulative return using Finlab balance formula
             // Finlab uses: balance = cash + Σ(cost_basis * close / entry_price)
@@ -1158,18 +1168,19 @@ fn update_max_prices(portfolio: &mut PortfolioState, prices: &[f64]) {
                 pos.max_price = current_price;
             }
 
-            // Update cr using Finlab's cumulative multiplication
-            // cr *= r, where r = current_price / previous_price
+            // Update cr, last_market_value using Finlab's cumulative multiplication
+            // Finlab line 304-320: r = price / previous_price; pos *= r; cr *= r; maxcr = max(maxcr, cr)
             if pos.previous_price > 0.0 {
                 let r = current_price / pos.previous_price;
                 pos.cr *= r;
+                pos.last_market_value *= r;  // Finlab: pos[sid] *= r
             }
 
             // Update maxcr using Finlab's cumulative max
             // maxcr = max(maxcr, cr)  (lines 319-320 of restored_backtest_core.pyx)
             pos.maxcr = pos.maxcr.max(pos.cr);
 
-            // Update previous_price for next day
+            // Update previous_price for next day (MUST be after r calculation!)
             pos.previous_price = current_price;
         }
     }
@@ -1218,10 +1229,9 @@ fn execute_finlab_rebalance(
     // - New positions: pay entry fee on full amount
     // - This results in unequal cost_basis and potentially negative cash
 
-    // Step 1: Update all positions to market value
-    // For valid prices: market_value = cost_basis * close / entry_price
-    // For NaN prices: use last_market_value (tracked daily via update_market_values)
-    // This matches Finlab's pos[sid] which is updated daily with pos *= r (r=1 for NaN)
+    // Step 1: Update all positions to market value using last_market_value
+    // Finlab: pos[sid] is updated daily via pos *= r, and we use this cumulative value
+    // last_market_value has already been updated in update_max_prices() before this function
     //
     // Note: stop_entry_price handling is done in Step 4 when rebuilding positions,
     // because Step 4 clears and rebuilds all positions. The logic there handles
@@ -1229,14 +1239,8 @@ fn execute_finlab_rebalance(
     for (stock_id, pos) in portfolio.positions.iter_mut() {
         if *stock_id < prices.len() {
             let close_price = prices[*stock_id];
-            let price_valid = close_price > 0.0 && !close_price.is_nan();
-            if price_valid && pos.entry_price > 0.0 {
-                pos.value = pos.value * close_price / pos.entry_price;
-            } else {
-                // For NaN prices, use last valid market value (Finlab: pos[sid] *= 1)
-                // This is critical! Without this, we'd use cost_basis instead of market value
-                pos.value = pos.last_market_value;
-            }
+            // Use last_market_value for consistency (Finlab: pos[sid] after pos *= r)
+            pos.value = pos.last_market_value;
             pos.entry_price = close_price;
         }
     }

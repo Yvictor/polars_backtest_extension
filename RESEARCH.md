@@ -782,6 +782,106 @@ Matches at round(6): True ✓
 
 ---
 
+### 10.7 Cumulative last_market_value for Balance Calculation (2024-12-24)
+
+**問題**: take_profit 測試仍有差異，maxdiff 約 6.8%
+
+**根因分析**:
+Finlab 使用累積乘法追蹤持倉市值：
+```python
+# 每日更新 (line 313)
+pos[sid] *= r  # r = today_price / yesterday_price
+
+# Balance 計算 (line 505)
+balance += pos[sid] * close / price  # 當 close == price 時 = pos[sid]
+```
+
+我們的舊實作在 `balance_finlab` 使用直接除法：
+```rust
+// 舊：直接計算
+market_value = cost_basis * close_price / entry_price
+```
+
+這導致浮點精度差異：累積乘法 vs 直接除法
+
+**修復**:
+1. 在 `update_max_prices()` 中同時更新 `last_market_value *= r`
+2. 在 `balance_finlab()` 直接使用 `last_market_value`
+3. 在 stop exit 處理時使用 `last_market_value` 而非直接計算
+4. 在 `execute_finlab_rebalance()` 使用 `last_market_value` 更新 `pos.value`
+
+**修改的檔案**:
+- `btcore/src/simulation.rs`:
+  - `update_max_prices()`: 新增 `pos.last_market_value *= r`
+  - `balance_finlab()`: 使用 `p.last_market_value`
+  - stop exit 處理: 使用 `pos.last_market_value`
+  - `execute_finlab_rebalance()`: `pos.value = pos.last_market_value`
+
+---
+
+### 10.8 Weight Re-normalization After Stop Exits (2024-12-24)
+
+**問題**: take_profit 測試權重不匹配
+- Finlab: 每股權重 = 1/23 (0.043478)
+- Polars: 每股權重 = 1/24 (0.041667)
+
+**根因分析**:
+當 take_profit 觸發時，Finlab 會重新正規化權重：
+
+```python
+# Finlab rebalance 時：
+# 1. 將 stopped stocks 設為 0
+pos_values[pos_id, abs(sid)] = 0
+
+# 2. Rebalance 使用修改後的 weights
+ratio = balance / max(abs(newp).sum(), 1)  # sum 不包含 stopped stocks
+```
+
+我們的問題：
+1. Signal day (T-1): `pending_weights` 設定，包含 24 支股票各 1/24
+2. Execution day (T): 處理 stop exits，1 支股票退出
+3. 但 `pending_weights` 仍是舊的 24 支股票版本！
+4. 將 stopped stock 設為 0 後，剩餘 23 支仍是 1/24 權重
+5. 總權重 = 23/24 = 0.9583（不是 100%！）
+
+**修復**:
+在 `pending_weights` 設定 stopped stocks 為 0 後，重新縮放剩餘權重：
+
+```rust
+// btcore/src/simulation.rs lines 625-644
+if config.stop_trading_next_period {
+    // 記錄原始總和
+    let original_sum: f64 = target_weights.iter().map(|w| w.abs()).sum();
+
+    // 將 stopped stocks 設為 0
+    for (i, stopped) in stopped_stocks.iter().enumerate() {
+        if *stopped && i < target_weights.len() {
+            target_weights[i] = 0.0;
+        }
+    }
+
+    // 重新縮放：維持 100% 投資
+    let remaining_sum: f64 = target_weights.iter().map(|w| w.abs()).sum();
+    if remaining_sum > 0.0 && remaining_sum < original_sum {
+        let scale_factor = original_sum / remaining_sum;
+        for w in target_weights.iter_mut() {
+            *w *= scale_factor;
+        }
+    }
+}
+```
+
+**注意**: 這個問題只影響 Finlab mode（T+1 execution），因為：
+- Finlab mode: `pending_weights` 在 signal day 設定，但 stop exits 在 execution day 處理
+- Standard mode: `pending_weights` 在 stop exits 處理後才設定，所以 `stopped_stocks` 已經是最新的
+
+**結果**:
+- take_profit[0.1]: PASSED
+- take_profit[0.2]: PASSED
+- 所有基本測試通過 (16/18)
+
+---
+
 ### 11. retain_cost_when_rebalance 邏輯
 
 **Finlab 行為** (lines 468-478):
