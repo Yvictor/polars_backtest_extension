@@ -1287,6 +1287,22 @@ fn execute_finlab_rebalance(
         .iter()
         .map(|(&k, v)| (k, v.max_price))
         .collect();
+    // Store old cr and maxcr for retain_cost_when_rebalance logic
+    let old_cr: std::collections::HashMap<usize, f64> = portfolio
+        .positions
+        .iter()
+        .map(|(&k, v)| (k, v.cr))
+        .collect();
+    let old_maxcr: std::collections::HashMap<usize, f64> = portfolio
+        .positions
+        .iter()
+        .map(|(&k, v)| (k, v.maxcr))
+        .collect();
+    let old_previous_prices: std::collections::HashMap<usize, f64> = portfolio
+        .positions
+        .iter()
+        .map(|(&k, v)| (k, v.previous_price))
+        .collect();
 
     // Clear positions, keep track of initial cash, rebuild using Finlab's method
     portfolio.positions.clear();
@@ -1397,29 +1413,26 @@ fn execute_finlab_rebalance(
         }
 
         if new_position_value.abs() > 1e-10 {
-            // Determine stop_entry_price based on retain_cost_when_rebalance
+            // Determine stop_entry_price, cr, maxcr based on retain_cost_when_rebalance
             // Finlab logic (lines 468-478 of restored_backtest_core.pyx):
             // - retain_cost=False: cr.fill(1); maxcr.fill(1); for ALL stocks
             // - retain_cost=True: only reset for NEW positions or DIRECTION CHANGE
-            let (stop_entry, max_price_val) = if config.retain_cost_when_rebalance {
-                // Check if this is a continuing position with same direction
-                // Use target_weight (not target_value) for direction comparison
-                let old_value = old_positions.get(&stock_id).copied().unwrap_or(0.0);
-                let is_continuing = old_value.abs() > 1e-10 && old_value * target_weight > 0.0;
+            let old_value = old_positions.get(&stock_id).copied().unwrap_or(0.0);
+            let is_continuing = old_value.abs() > 1e-10 && old_value * target_weight > 0.0;
 
-                if is_continuing {
+            let (stop_entry, max_price_val, cr_val, maxcr_val, prev_price) =
+                if config.retain_cost_when_rebalance && is_continuing {
                     // Preserve old stop tracking for continuing same-direction positions
                     let old_stop = old_stop_entries.get(&stock_id).copied().unwrap_or(price);
                     let old_max = old_max_prices.get(&stock_id).copied().unwrap_or(price);
-                    (old_stop, old_max)
+                    let old_cr_val = old_cr.get(&stock_id).copied().unwrap_or(1.0);
+                    let old_maxcr_val = old_maxcr.get(&stock_id).copied().unwrap_or(1.0);
+                    let old_prev = old_previous_prices.get(&stock_id).copied().unwrap_or(price);
+                    (old_stop, old_max, old_cr_val, old_maxcr_val, old_prev)
                 } else {
-                    // New position or direction change: reset stop tracking
-                    (price, price)
-                }
-            } else {
-                // Default: reset stop tracking for all positions (cr.fill(1); maxcr.fill(1);)
-                (price, price)
-            };
+                    // New position or direction change or retain_cost=False: reset all
+                    (price, price, 1.0, 1.0, price)
+                };
 
             portfolio.positions.insert(
                 stock_id,
@@ -1429,9 +1442,9 @@ fn execute_finlab_rebalance(
                     stop_entry_price: stop_entry,
                     max_price: max_price_val,
                     last_market_value: new_position_value, // Initialize to cost_basis
-                    cr: 1.0, // Reset cr on rebalance (Finlab: cr.fill(1))
-                    maxcr: 1.0, // Reset maxcr on rebalance (Finlab: maxcr.fill(1))
-                    previous_price: price, // Initialize for daily r calculation
+                    cr: cr_val,
+                    maxcr: maxcr_val,
+                    previous_price: prev_price,
                 },
             );
         }

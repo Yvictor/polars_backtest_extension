@@ -882,7 +882,7 @@ if config.stop_trading_next_period {
 
 ---
 
-### 11. retain_cost_when_rebalance 邏輯
+### 11. retain_cost_when_rebalance 邏輯 (2024-12-24 已修復)
 
 **Finlab 行為** (lines 468-478):
 ```python
@@ -898,9 +898,26 @@ else:
     maxcr.fill(1)
 ```
 
-**需要實作**:
-- 當 `retain_cost_when_rebalance = True` 時，繼續持有的股票保留原始 `stop_entry_price`
-- 只有新進場或方向改變的股票重設 `stop_entry_price`
+**問題**: 我們在 `execute_finlab_rebalance` 中總是將 cr/maxcr 重設為 1.0，即使 `retain_cost_when_rebalance=True`
+
+**修復**:
+1. 儲存舊的 cr, maxcr, previous_price 到 HashMap
+2. 對於繼續持有且方向相同的股票，保留這些值
+3. 對於新持倉或方向改變的股票，重設為 1.0/price
+
+```rust
+// btcore/src/simulation.rs
+let (stop_entry, max_price_val, cr_val, maxcr_val, prev_price) =
+    if config.retain_cost_when_rebalance && is_continuing {
+        // Preserve old values for continuing same-direction positions
+        (old_stop, old_max, old_cr_val, old_maxcr_val, old_prev)
+    } else {
+        // New position or direction change: reset all
+        (price, price, 1.0, 1.0, price)
+    };
+```
+
+**結果**: test_retain_cost_when_rebalance PASSED
 
 ### 12. 移除 pandas/numpy 運行時依賴
 
