@@ -10,10 +10,21 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 import polars as pl
-import pandas as pd
 
 if TYPE_CHECKING:
     from polars.type_aliases import IntoExpr
+
+
+def _ensure_pandas():
+    """Lazy import pandas, raising clear error if not installed."""
+    try:
+        import pandas as pd
+        return pd
+    except ImportError:
+        raise ImportError(
+            "pandas is required for date resampling functionality. "
+            "Install it with: pip install pandas"
+        )
 
 # Load the Rust extension
 from polars_backtest._polars_backtest import (
@@ -238,8 +249,7 @@ def _resample_position(
     Returns:
         Resampled position DataFrame with dates at period boundaries (trading days).
     """
-    import pandas as pd
-    from pandas.tseries.offsets import DateOffset
+    pd = _ensure_pandas()
     from pandas.tseries.frequencies import to_offset
 
     if resample == 'D':
@@ -790,22 +800,25 @@ def backtest_with_report(
             # Every day from first position date is a rebalance point
             rebalance_indices = list(range(first_idx, len(dates)))
 
-            # Expand position to all dates by forward-filling
-            # Create a DataFrame with all dates and ffill position values
-            position_df = position.to_pandas()
-            position_df.set_index(pos_date_col, inplace=True)
+            # Expand position to all dates by forward-filling using Polars
+            # Create a DataFrame with all dates
+            all_dates_df = pl.DataFrame({pos_date_col: dates})
 
-            # Reindex to all dates and ffill
-            all_dates_df = pd.DataFrame({pos_date_col: dates})
-            all_dates_df.set_index(pos_date_col, inplace=True)
-            position_expanded = position_df.reindex(all_dates_df.index).ffill()
+            # Join and forward fill
+            position_expanded = (
+                all_dates_df
+                .join(position, on=pos_date_col, how="left")
+                .select([pos_date_col] + position_stock_cols)
+                .with_columns([
+                    pl.col(col).forward_fill() for col in position_stock_cols
+                ])
+            )
 
             # Take only from first_idx onwards
-            position_expanded = position_expanded.iloc[first_idx:]
-            position_expanded = position_expanded.reset_index()
+            position_expanded = position_expanded.slice(first_idx)
 
-            # Convert back to polars
-            position_data = pl.from_pandas(position_expanded).select(position_stock_cols)
+            # Select only stock columns for position_data
+            position_data = position_expanded.select(position_stock_cols)
         else:
             # Non-daily resample: only rebalance on position dates
             rebalance_indices = []
