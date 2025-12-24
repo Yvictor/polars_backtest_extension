@@ -343,6 +343,9 @@ struct Position {
     /// Cumulative return ratio for stop detection (Finlab: cr[sid] *= r)
     /// This uses cumulative multiplication to match Finlab's floating point behavior
     cr: f64,
+    /// Maximum cumulative return for trail stop (Finlab: maxcr[sid] = max(maxcr[sid], cr[sid]))
+    /// This uses cumulative max to match Finlab's floating point behavior
+    maxcr: f64,
     /// Previous price for daily return calculation (r = current / previous)
     previous_price: f64,
 }
@@ -523,24 +526,31 @@ fn simulate_backtest<T: TradeTracker>(
     for t in 0..n_times {
         if config.finlab_mode {
             // ====== FINLAB MODE ======
+            // Finlab processing order (from restored_backtest_core.pyx):
+            // 1. Update cr for all positions (lines 304-320)
+            // 2. Detect take_profit/stop_loss, add to exit_stocks_temp (lines 384-393)
+            // 3. Process exit_stocks (yesterday's) (lines 432-451)
+            // 4. Transfer exit_stocks_temp -> exit_stocks (lines 456-459)
+            // 5. Rebalance (lines 464-491) - resets cr.fill(1)
             if t > 0 {
-                // ===== STEP 1: Execute pending stop exits BEFORE rebalance =====
-                // Finlab processes exit_stocks before rebalance (lines 432-451 of restored_backtest_core.pyx)
+                // ===== STEP 1: Update max_prices and detect stops BEFORE rebalance =====
+                // This must happen before rebalance because rebalance resets cr to 1.0
+                update_max_prices(&mut portfolio, &close_prices[t]);
+
+                // Detect stops for T+1 execution (today's detection -> tomorrow's execution)
+                // Store in a temporary vector because we need to process yesterday's exits first
+                let mut today_stops = detect_stops_finlab(&portfolio, &close_prices[t], config);
+
+                // ===== STEP 2: Execute pending stop exits (yesterday's detection) =====
+                // Finlab processes exit_stocks before rebalance (lines 432-451)
                 if !pending_stop_exits.is_empty() {
                     // Check will_be_set_by_rebalance (Finlab line 434):
                     // will_be_set = should_rebalance and not stop_trading_next_period and pos_values[pos_id, abssid] != 0
-                    // Skip stop exit ONLY if all three conditions are met
                     let exits_to_process: Vec<usize> = pending_stop_exits
                         .iter()
                         .filter(|&&stock_id| {
                             if let Some(ref weights) = pending_weights {
-                                // Finlab: skip exit if will_be_set_by_rebalance
-                                // will_be_set = should_rebalance AND (not stop_trading_next_period) AND (weight != 0)
-                                // We skip exit if all conditions are true
-                                // So we KEEP (process) exit if any condition is false
                                 let has_nonzero_weight = stock_id < weights.len() && weights[stock_id].abs() > 1e-10;
-                                // If stop_trading_next_period is true, always process the exit (don't skip)
-                                // because will_be_set_by_rebalance = False when stop_trading_next_period = True
                                 if config.stop_trading_next_period {
                                     true // Always process exit when stop_trading_next_period is true
                                 } else {
@@ -562,7 +572,6 @@ fn simulate_backtest<T: TradeTracker>(
                                 if close_price > 0.0 && !close_price.is_nan() {
                                     pos.value * close_price / pos.entry_price
                                 } else {
-                                    // NaN price: use last valid market value (Finlab behavior)
                                     pos.last_market_value
                                 }
                             } else {
@@ -576,12 +585,10 @@ fn simulate_backtest<T: TradeTracker>(
                                 stopped_stocks[stock_id] = true;
                             }
 
-                            // Clear weight for stopped stock (for daily return calculation)
                             if stock_id < active_weights.len() {
                                 active_weights[stock_id] = 0.0;
                             }
 
-                            // Record trade close
                             let exit_price = if stock_id < trade_prices[t].len() {
                                 trade_prices[t][stock_id]
                             } else {
@@ -595,17 +602,38 @@ fn simulate_backtest<T: TradeTracker>(
                                 config.fee_ratio,
                                 config.tax_ratio,
                             );
+
+                            // Finlab lines 444-449: Remove from today_stops if already processed
+                            // This prevents duplicate detection
+                            today_stops.retain(|&x| x != stock_id);
                         }
                     }
                     pending_stop_exits.clear();
                 }
 
-                // ===== STEP 2: Execute rebalance =====
-                if let Some(target_weights) = pending_weights.take() {
+                // Transfer today's stops to pending (Finlab: exit_stocks_temp -> exit_stocks)
+                pending_stop_exits.extend(today_stops);
+
+                // ===== STEP 3: Execute rebalance =====
+                if let Some(mut target_weights) = pending_weights.take() {
                     let signal_index = pending_signal_index.take().unwrap_or(t - 1);
 
+                    // Finlab lines 481-483: Set stopped stocks to 0 before rebalance
+                    // This prevents re-entry of stocks that were stopped today
+                    // ```cython
+                    // if stop_trading_next_period:
+                    //     for sid in exited_stocks:
+                    //         pos_values[pos_id, abs(sid)] = 0
+                    // ```
+                    if config.stop_trading_next_period {
+                        for (i, stopped) in stopped_stocks.iter().enumerate() {
+                            if *stopped && i < target_weights.len() {
+                                target_weights[i] = 0.0;
+                            }
+                        }
+                    }
+
                     // Close ALL trades during rebalance (Finlab behavior: sell all, rebuy all)
-                    // This matches Finlab's trades where each rebalance creates new trade records
                     let open_positions: Vec<usize> = portfolio.positions.keys().copied().collect();
                     for stock_id in open_positions {
                         let exit_price = if stock_id < trade_prices[t].len() {
@@ -623,13 +651,9 @@ fn simulate_backtest<T: TradeTracker>(
                         );
                     }
 
-                    // Execute rebalance at current prices (Finlab style: sell all, rebuy all)
                     execute_finlab_rebalance(&mut portfolio, &target_weights, &close_prices[t], config);
-
-                    // Update active weights for daily return calculation
                     active_weights = target_weights.clone();
 
-                    // Open trades for ALL new positions (after sell-all-rebuy-all)
                     for (stock_id, &target_weight) in target_weights.iter().enumerate() {
                         if target_weight != 0.0 && portfolio.positions.contains_key(&stock_id) {
                             let entry_price = if stock_id < trade_prices[t].len() {
@@ -644,15 +668,7 @@ fn simulate_backtest<T: TradeTracker>(
                     stopped_stocks = vec![false; n_assets];
                 }
 
-                // ===== STEP 3: Update max_prices and detect new stops =====
-                update_max_prices(&mut portfolio, &close_prices[t]);
-
-                // Detect stops for T+1 execution
-                let new_stops = detect_stops_finlab(&portfolio, &close_prices[t], config);
-                pending_stop_exits.extend(new_stops);
-
                 // Update entry prices for positions recovering from NaN
-                // This ensures 0% return when a stock comes back from NaN (like Finlab)
                 update_entry_prices_after_nan(&mut portfolio, &close_prices[t], &prev_prices);
             }
 
@@ -1046,9 +1062,9 @@ fn detect_stops_finlab(
             // Example: cr = 0.9499999999999998 < 0.95, but cr * p / p = 0.95 exactly!
             let cr_at_close = cr * current_price / current_price;
 
-            // maxcr = max_price / stop_entry (Finlab's max cumulative return)
-            // Note: We still use direct division for maxcr since Finlab tracks it similarly
-            let maxcr = pos.max_price / stop_entry;
+            // Use cumulative maxcr from Position (Finlab: maxcr[sid] = max(maxcr[sid], cr[sid]))
+            // Note: maxcr is updated by update_max_prices() before this function is called
+            let maxcr = pos.maxcr;
 
             // Finlab stop conditions (lines 326-393 of restored_backtest_core.pyx):
             // For long positions:
@@ -1148,6 +1164,10 @@ fn update_max_prices(portfolio: &mut PortfolioState, prices: &[f64]) {
                 let r = current_price / pos.previous_price;
                 pos.cr *= r;
             }
+
+            // Update maxcr using Finlab's cumulative max
+            // maxcr = max(maxcr, cr)  (lines 319-320 of restored_backtest_core.pyx)
+            pos.maxcr = pos.maxcr.max(pos.cr);
 
             // Update previous_price for next day
             pos.previous_price = current_price;
@@ -1330,6 +1350,7 @@ fn execute_finlab_rebalance(
                         max_price: 0.0,
                         last_market_value: new_value, // Use position value as market value
                         cr: 1.0,
+                        maxcr: 1.0,
                         previous_price: 0.0,
                     },
                 );
@@ -1405,6 +1426,7 @@ fn execute_finlab_rebalance(
                     max_price: max_price_val,
                     last_market_value: new_position_value, // Initialize to cost_basis
                     cr: 1.0, // Reset cr on rebalance (Finlab: cr.fill(1))
+                    maxcr: 1.0, // Reset maxcr on rebalance (Finlab: maxcr.fill(1))
                     previous_price: price, // Initialize for daily r calculation
                 },
             );
@@ -1516,6 +1538,7 @@ fn enter_new_positions(
                         max_price: prices[stock_id],
                         last_market_value: actual_buy,
                         cr: 1.0,
+                        maxcr: 1.0,
                         previous_price: prices[stock_id],
                     },
                 );
@@ -1617,6 +1640,7 @@ fn exit_and_adjust_positions(
                     max_price: prices[stock_id],
                     last_market_value: 0.0,
                     cr: 1.0,
+                    maxcr: 1.0,
                     previous_price: prices[stock_id],
                 });
                 entry.value += actual_buy;
@@ -1646,6 +1670,7 @@ fn rebalance_to_target_weights(
                 pos.entry_price = prices[*stock_id];
                 pos.max_price = prices[*stock_id];
                 pos.cr = 1.0; // Reset cr (Finlab: cr.fill(1))
+                pos.maxcr = 1.0; // Reset maxcr (Finlab: maxcr.fill(1))
                 pos.previous_price = prices[*stock_id]; // Reset for daily r calculation
             }
         }
@@ -1759,6 +1784,7 @@ fn rebalance_to_target_weights(
                     max_price: prices[stock_id],
                     last_market_value: 0.0,
                     cr: 1.0,
+                    maxcr: 1.0,
                     previous_price: prices[stock_id],
                 });
                 // Update entry price only for new positions
@@ -1767,6 +1793,7 @@ fn rebalance_to_target_weights(
                     entry.stop_entry_price = prices[stock_id];
                     entry.max_price = prices[stock_id];
                     entry.cr = 1.0;
+                    entry.maxcr = 1.0;
                     entry.previous_price = prices[stock_id];
                 }
                 entry.value += position_value;
