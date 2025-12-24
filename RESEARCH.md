@@ -11,9 +11,11 @@ position = close >= close.rolling(300).max()
 report = backtest.sim(position, resample='M')
 ```
 
-## 當前狀態
-- 最終 creturn 差異: ~1%
-- 第一個差異出現在: 2010-09-01 (rebalance 日)
+## 當前狀態 (2024-12-24 更新)
+- ✅ creturn 匹配: `round(6)` 完全一致
+- ✅ 最大差異: 1.07e-13 (機器精度)
+- ✅ `test_stop_loss[0.1]` 通過 (累積乘法修正)
+- ⚠️ `test_stop_loss[0.05]` 仍失敗 (更激進的 stop 有其他邊界問題)
 
 ---
 
@@ -699,8 +701,66 @@ pub fn normalize_weights_finlab(weights: &[f64], stopped_stocks: &[bool], limit:
 
 **結論**:
 - 主要問題已解決 (weight normalization)
-- 剩餘差異是數值精度在極端邊界情況的影響
-- 17 年回測中只有 ~20 個日期有 ±1 筆 exit 差異
+- MaxDiff 從 1.58 降至 0.037 (97.7% 改善)
+- 剩餘差異見 10.6 節
+
+---
+
+### 10.6 Cumulative vs Direct cr 計算 (2024-12-24) - 最後 1 bit 精度修正
+
+**問題**: 修復 weight normalization 後，仍有 ~0.037 的最大差異
+
+**根因分析**:
+Stock 2393 在 Oct 28 的 cr 恰好等於 0.9（stop_loss threshold）:
+- Finlab 認為 cr < 0.9，觸發 stop → Oct 29 exit
+- 我們認為 cr >= 0.9，不觸發 → Oct 30 exit
+
+**關鍵差異**:
+```python
+# Finlab: 累積乘法 (restored_backtest_core.pyx line 319)
+r = price_values[d, sidprice] / previous_price[sidprice]
+cr[sid] *= r  # 累積乘法
+
+# 我們的舊實作: 直接除法
+cr = current_price / stop_entry_price  # 直接計算
+```
+
+**浮點數精度分析**:
+```
+Oct 28 price: 128.202217231489442
+Entry price:  142.446908034988269
+
+Cumulative cr:  0.899999999999999911  (< 0.9, triggers stop)
+Direct cr:      0.900000000000000022  (>= 0.9, no stop)
+Difference:     1.11e-16 (1 bit difference!)
+
+Cumulative hex: 0x3feccccccccccccc
+Direct hex:     0x3feccccccccccccd  (只差 1 bit!)
+```
+
+**修復**:
+1. 在 Position struct 新增 `cr` 和 `previous_price` 欄位
+2. 每日更新 cr: `cr *= current_price / previous_price`
+3. 在 `detect_stops_finlab` 使用累積的 `pos.cr`
+
+**修改的檔案**:
+- `btcore/src/simulation.rs`:
+  - Position struct 新增 `cr: f64` 和 `previous_price: f64`
+  - `update_max_prices()` 同時更新 cr (line 1120-1145)
+  - `detect_stops_finlab()` 使用 `pos.cr` (line 1039)
+  - 所有 Position 建立處初始化 `cr=1.0`, `previous_price=entry_price`
+  - `retain_cost_when_rebalance=False` 時重設 cr (line 1610-1611)
+
+**結果**:
+```
+=== Creturn Comparison ===
+Max absolute diff: 1.07e-13  (機器精度)
+Mean absolute diff: 1.60e-14
+
+Matches at round(6): True ✓
+```
+
+**結論**: 使用累積乘法完全匹配 Finlab 的浮點行為，差異降至機器精度 (~1e-13)
 
 ---
 

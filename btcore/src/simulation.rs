@@ -340,6 +340,11 @@ struct Position {
     /// Last valid market value (Finlab: pos[sid] updated daily)
     /// Used when current price is NaN
     last_market_value: f64,
+    /// Cumulative return ratio for stop detection (Finlab: cr[sid] *= r)
+    /// This uses cumulative multiplication to match Finlab's floating point behavior
+    cr: f64,
+    /// Previous price for daily return calculation (r = current / previous)
+    previous_price: f64,
 }
 
 /// Portfolio state during simulation
@@ -1003,7 +1008,8 @@ fn check_stops(
 /// Detect positions that should be closed due to stop conditions in Finlab mode (T+1 preparation)
 ///
 /// Uses Finlab's cr/maxcr formula for stop detection:
-/// - cr = current_price / stop_entry_price (cumulative return ratio from rebalance)
+/// - cr is updated daily via cumulative multiplication: cr *= r (where r = today/yesterday)
+///   This matches Finlab's floating point behavior exactly (line 319 of restored_backtest_core.pyx)
 /// - maxcr = max_price / stop_entry_price (max cumulative return)
 /// - max_r = 1 + take_profit
 /// - min_r = max(1 - stop_loss, maxcr - trail_stop)
@@ -1022,17 +1028,19 @@ fn detect_stops_finlab(
             }
 
             let current_price = prices[stock_id];
-            // stop_entry_price is reset at each rebalance (when retain_cost=False)
-            // This matches Finlab's cr.fill(1) behavior
             let stop_entry = pos.stop_entry_price;
 
             if stop_entry <= 0.0 || current_price.is_nan() || current_price <= 0.0 {
                 return None;
             }
 
-            // cr = current_price / stop_entry (Finlab's cumulative return ratio)
-            let cr = current_price / stop_entry;
+            // Use cumulative cr from Position (Finlab: cr *= r)
+            // This matches Finlab's floating point behavior exactly
+            // Note: cr is updated by update_max_prices() before this function is called
+            let cr = pos.cr;
+
             // maxcr = max_price / stop_entry (Finlab's max cumulative return)
+            // Note: We still use direct division for maxcr since Finlab tracks it similarly
             let maxcr = pos.max_price / stop_entry;
 
             // Finlab stop conditions (lines 326-393 of restored_backtest_core.pyx):
@@ -1100,14 +1108,42 @@ fn execute_pending_stops_finlab(
     }
 }
 
-/// Update max_price for trailing stop tracking
+/// Update max_price and cr for stop tracking
+///
+/// This function updates:
+/// - max_price: for trailing stop detection
+/// - cr: cumulative return ratio using Finlab's multiplication method (cr *= r)
+/// - previous_price: for next day's r calculation
+///
+/// Finlab's cr calculation (line 319 of restored_backtest_core.pyx):
+/// ```python
+/// r = price_values[d, sidprice] / previous_price[sidprice]
+/// cr[sid] *= r
+/// ```
 fn update_max_prices(portfolio: &mut PortfolioState, prices: &[f64]) {
     for (&stock_id, pos) in portfolio.positions.iter_mut() {
         if stock_id < prices.len() {
             let current_price = prices[stock_id];
+
+            // Skip if price is invalid
+            if current_price.is_nan() || current_price <= 0.0 {
+                continue;
+            }
+
+            // Update max_price for trailing stop
             if current_price > pos.max_price {
                 pos.max_price = current_price;
             }
+
+            // Update cr using Finlab's cumulative multiplication
+            // cr *= r, where r = current_price / previous_price
+            if pos.previous_price > 0.0 {
+                let r = current_price / pos.previous_price;
+                pos.cr *= r;
+            }
+
+            // Update previous_price for next day
+            pos.previous_price = current_price;
         }
     }
 }
@@ -1286,6 +1322,8 @@ fn execute_finlab_rebalance(
                         stop_entry_price: 0.0,
                         max_price: 0.0,
                         last_market_value: new_value, // Use position value as market value
+                        cr: 1.0,
+                        previous_price: 0.0,
                     },
                 );
             }
@@ -1359,6 +1397,8 @@ fn execute_finlab_rebalance(
                     stop_entry_price: stop_entry,
                     max_price: max_price_val,
                     last_market_value: new_position_value, // Initialize to cost_basis
+                    cr: 1.0, // Reset cr on rebalance (Finlab: cr.fill(1))
+                    previous_price: price, // Initialize for daily r calculation
                 },
             );
         }
@@ -1468,6 +1508,8 @@ fn enter_new_positions(
                         stop_entry_price: prices[stock_id],
                         max_price: prices[stock_id],
                         last_market_value: actual_buy,
+                        cr: 1.0,
+                        previous_price: prices[stock_id],
                     },
                 );
             }
@@ -1567,6 +1609,8 @@ fn exit_and_adjust_positions(
                     stop_entry_price: prices[stock_id],
                     max_price: prices[stock_id],
                     last_market_value: 0.0,
+                    cr: 1.0,
+                    previous_price: prices[stock_id],
                 });
                 entry.value += actual_buy;
                 entry.last_market_value = entry.value;
@@ -1594,6 +1638,8 @@ fn rebalance_to_target_weights(
             if *stock_id < prices.len() {
                 pos.entry_price = prices[*stock_id];
                 pos.max_price = prices[*stock_id];
+                pos.cr = 1.0; // Reset cr (Finlab: cr.fill(1))
+                pos.previous_price = prices[*stock_id]; // Reset for daily r calculation
             }
         }
     }
@@ -1705,12 +1751,16 @@ fn rebalance_to_target_weights(
                     stop_entry_price: prices[stock_id],
                     max_price: prices[stock_id],
                     last_market_value: 0.0,
+                    cr: 1.0,
+                    previous_price: prices[stock_id],
                 });
                 // Update entry price only for new positions
                 if entry.value < 1e-10 {
                     entry.entry_price = prices[stock_id];
                     entry.stop_entry_price = prices[stock_id];
                     entry.max_price = prices[stock_id];
+                    entry.cr = 1.0;
+                    entry.previous_price = prices[stock_id];
                 }
                 entry.value += position_value;
                 entry.last_market_value = entry.value;
