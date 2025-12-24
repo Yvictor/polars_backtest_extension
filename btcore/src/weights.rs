@@ -50,9 +50,48 @@ pub fn normalize_weights_finlab(
 ) -> Vec<f64> {
     let mut result = Vec::with_capacity(weights.len());
 
-    // Calculate total absolute weight (clip to min 1.0 like Finlab)
-    let total_abs_weight: f64 = weights.iter().map(|w| w.abs()).sum();
-    let divisor = total_abs_weight.max(1.0);
+    // Finlab behavior: First set stopped stocks to 0, THEN calculate ratio
+    // This ensures remaining stocks are re-normalized to maintain full investment
+    //
+    // Finlab code flow:
+    // 1. pos_values[pos_id, abs(sid)] = 0  # Set stopped to 0
+    // 2. rebalance(pos, pos_values[pos_id], ...)
+    // 3. ratio = balance / max(abs(newp).sum(), 1)  # Sum excludes stopped!
+    //
+    // Key insight: Finlab uses RAW weights (1 for each target) not pre-normalized.
+    // When a stock is stopped, the sum decreases (e.g., 30→29), and ratio adjusts.
+    // Our pre-normalized weights (1/30 each) don't work the same way.
+    //
+    // Fix: After excluding stopped stocks, re-normalize remaining to maintain
+    // the same investment level (sum = original sum, clipped to min 1.0).
+
+    // Calculate original total absolute weight (before excluding stopped)
+    let original_abs_weight: f64 = weights.iter().map(|w| w.abs()).sum();
+
+    // Calculate remaining weight after excluding stopped
+    let remaining_abs_weight: f64 = weights
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| !stopped_stocks.get(*i).copied().unwrap_or(false))
+        .map(|(_, w)| w.abs())
+        .sum();
+
+    // If all remaining stocks are stopped, return zeros
+    if remaining_abs_weight < 1e-10 {
+        return vec![0.0; weights.len()];
+    }
+
+    // Calculate scale factor: maintain original investment level
+    // Scale up remaining weights to compensate for stopped stocks
+    let scale_factor = if original_abs_weight > 1e-10 {
+        original_abs_weight / remaining_abs_weight
+    } else {
+        1.0
+    };
+
+    // Apply Finlab's normalization: divide by max(sum, 1.0)
+    // After scaling, the sum equals original_abs_weight
+    let divisor = original_abs_weight.max(1.0);
 
     // Normalize and apply stops
     for (i, &w) in weights.iter().enumerate() {
@@ -60,8 +99,9 @@ pub fn normalize_weights_finlab(
         if stopped {
             result.push(0.0);
         } else {
-            // Normalize by total weight
-            let normalized = w / divisor;
+            // Scale up to compensate for stopped, then normalize
+            let scaled = w * scale_factor;
+            let normalized = scaled / divisor;
             // Clip to position limit
             let clipped = normalized.clamp(-position_limit, position_limit);
             result.push(clipped);
@@ -205,15 +245,39 @@ mod tests {
 
     #[test]
     fn test_normalize_weights_finlab_with_stopped_stocks() {
-        // Stopped stocks should get weight 0
-        let weights = vec![0.5, 0.5, 0.5];
+        // Stopped stocks should get weight 0, and remaining stocks are SCALED UP
+        // to maintain full investment (same as Finlab's raw weight behavior)
+        let weights = vec![0.5, 0.5, 0.5]; // sum = 1.5
         let stopped = vec![false, true, false]; // stock 1 stopped
         let result = normalize_weights_finlab(&weights, &stopped, 1.0);
 
-        // Sum = 1.5, normalize by 1.5
-        assert!((result[0] - 0.5 / 1.5).abs() < 1e-10);
+        // Original sum = 1.5, remaining sum = 1.0
+        // Scale factor = 1.5 / 1.0 = 1.5
+        // divisor = max(1.5, 1.0) = 1.5
+        // Each remaining: 0.5 * 1.5 / 1.5 = 0.5 (maintains original proportion)
+        assert!((result[0] - 0.5).abs() < 1e-10);
         assert!((result[1] - 0.0).abs() < 1e-10); // stopped
-        assert!((result[2] - 0.5 / 1.5).abs() < 1e-10);
+        assert!((result[2] - 0.5).abs() < 1e-10);
+    }
+
+    #[test]
+    fn test_normalize_weights_finlab_with_stopped_rescales() {
+        // When one stock is stopped from a fully-invested portfolio,
+        // remaining stocks should be scaled up to maintain 100% investment
+        let weights = vec![1.0 / 3.0, 1.0 / 3.0, 1.0 / 3.0]; // sum = 1.0
+        let stopped = vec![false, true, false]; // stock 1 stopped
+        let result = normalize_weights_finlab(&weights, &stopped, 1.0);
+
+        // Original sum = 1.0, remaining sum = 2/3
+        // Scale factor = 1.0 / (2/3) = 1.5
+        // divisor = max(1.0, 1.0) = 1.0
+        // Each remaining: (1/3) * 1.5 / 1.0 = 0.5 (full 100% investment)
+        assert!((result[0] - 0.5).abs() < 1e-10);
+        assert!((result[1] - 0.0).abs() < 1e-10); // stopped
+        assert!((result[2] - 0.5).abs() < 1e-10);
+        // Total should be 1.0 (100% invested)
+        let total: f64 = result.iter().sum();
+        assert!((total - 1.0).abs() < 1e-10);
     }
 
     #[test]

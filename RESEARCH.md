@@ -609,6 +609,101 @@ Stock   Entry Price  Exit Price   Finlab Return  Polars Return  Diff
 
 **結論**: 這是 return 定義的差異，不是 bug。Polars 的計算更準確反映實際淨收益。
 
+### 10.5 Weight Normalization Bug (2024-12-24) - 重大發現！
+
+**問題**: stop_loss 測試差異從 4% 降低後，仍有 0.02% 累積差異
+
+**根本原因發現**:
+
+當有股票被 stop 後，weight 計算邏輯錯誤！
+
+**Finlab 的行為**:
+```python
+# 1. 設置 stopped stocks 為 0
+if stop_trading_next_period:
+    for sid in exited_stocks:
+        pos_values[pos_id, abs(sid)] = 0
+
+# 2. Rebalance 使用修改後的 weights
+ratio = balance / max(abs(newp).sum(), 1)  # sum 不包含 stopped stocks
+for sid, v in enumerate(newp):
+    v2 = v * ratio  # 每股 = balance / n_active
+```
+
+**原始 Finlab 案例** (30 支目標股票，1 支被 stop):
+- Raw weights: [1, 1, ..., 0, 1, ...] (29 個 1)
+- sum = 29
+- ratio = balance / 29
+- 每股 target = balance / 29 (100% 投資)
+
+**我們的錯誤實現**:
+```rust
+// 在 run_backtest 中 pre-normalize (空 stopped_stocks)
+weights = [1/30, 1/30, ..., 1/30]  // sum = 1.0
+
+// 在 simulate_backtest 中 normalize_weights_finlab
+// 舊版: 使用所有 weights 的 sum 作為 divisor
+total_abs_weight = sum of all = 1.0  // 包含即將被設為 0 的 stopped stock!
+divisor = max(1.0, 1.0) = 1.0
+
+// 設置 stopped stocks 為 0
+result = [1/30, 0, 1/30, ...]  // 29 個 1/30
+
+// 在 execute_finlab_rebalance 中
+total_target_weight = 29 * (1/30) = 29/30 = 0.967
+ratio = balance / max(0.967, 1) = balance / 1 = balance
+每股 target = (1/30) * balance = balance/30  // 只有 96.67% 投資！
+```
+
+**差異**:
+- Finlab: 每股 = balance / 29 = 3.45% of balance
+- Polars (舊): 每股 = balance / 30 = 3.33% of balance
+- 差異 = 3.45% vs 3.33% = **0.12% per stock underweight!**
+
+**修復** (`btcore/src/weights.rs`):
+
+```rust
+pub fn normalize_weights_finlab(weights: &[f64], stopped_stocks: &[bool], limit: f64) -> Vec<f64> {
+    // 計算原始 sum (用於決定是否 normalize)
+    let original_abs_weight: f64 = weights.iter().map(|w| w.abs()).sum();
+
+    // 計算排除 stopped 後的 sum
+    let remaining_abs_weight: f64 = weights.iter()
+        .enumerate()
+        .filter(|(i, _)| !stopped_stocks.get(*i).unwrap_or(&false))
+        .map(|(_, w)| w.abs())
+        .sum();
+
+    // Scale factor: 放大剩餘 weights 以維持原始投資水平
+    let scale_factor = original_abs_weight / remaining_abs_weight;
+
+    // Finlab 的 normalization
+    let divisor = original_abs_weight.max(1.0);
+
+    // 對每個 weight: (w * scale_factor) / divisor
+    // = w * (original / remaining) / max(original, 1)
+    // = w / remaining  (當 original = 1.0 時)
+    // 這確保剩餘 weights 總和 = 1.0 (100% 投資)
+}
+```
+
+**修復後結果**:
+- MaxDiff: 1.58 → 0.037 (降低 97.7%!)
+- 最終 creturn: Finlab 33.963, Polars 33.970 (差異 0.02%)
+- Sep 1 - Oct 28 完全匹配 (差異 < 1e-15)
+
+**剩餘差異來源** (Oct 29 開始):
+- Stock 2393: Finlab 10/29 exit, Polars 10/30 exit (1 天差異)
+- cr = 0.9000153 on Oct 28 (僅比 0.9 threshold 高 0.0017%)
+- 這是浮點數精度導致的邊界情況
+
+**結論**:
+- 主要問題已解決 (weight normalization)
+- 剩餘差異是數值精度在極端邊界情況的影響
+- 17 年回測中只有 ~20 個日期有 ±1 筆 exit 差異
+
+---
+
 ### 11. retain_cost_when_rebalance 邏輯
 
 **Finlab 行為** (lines 468-478):
