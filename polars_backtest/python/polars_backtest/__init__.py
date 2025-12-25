@@ -15,16 +15,234 @@ if TYPE_CHECKING:
     from polars.type_aliases import IntoExpr
 
 
-def _ensure_pandas():
-    """Lazy import pandas, raising clear error if not installed."""
-    try:
-        import pandas as pd
-        return pd
-    except ImportError:
-        raise ImportError(
-            "pandas is required for date resampling functionality. "
-            "Install it with: pip install pandas"
-        )
+from datetime import date, timedelta
+
+
+def _parse_resample_freq(resample: str) -> tuple[str, int | None]:
+    """Parse pandas-style resample frequency to polars interval format.
+
+    Args:
+        resample: Pandas-style frequency string like 'D', 'W', 'W-FRI', 'M', 'Q', 'Y'
+
+    Returns:
+        Tuple of (polars_interval, weekday) where weekday is 1-7 (Mon-Sun) for weekly anchors.
+
+    Raises:
+        ValueError: If the frequency is not recognized.
+    """
+    resample = resample.upper()
+
+    # Daily
+    if resample == 'D':
+        return ('1d', None)
+
+    # Weekly with anchor (W-MON, W-FRI, etc.)
+    if resample.startswith('W-'):
+        day_map = {'MON': 1, 'TUE': 2, 'WED': 3, 'THU': 4, 'FRI': 5, 'SAT': 6, 'SUN': 7}
+        anchor = resample[2:]
+        if anchor not in day_map:
+            raise ValueError(f"Invalid weekly anchor: {anchor}")
+        return ('1w', day_map[anchor])
+
+    # Weekly (default Sunday end, like pandas)
+    if resample == 'W':
+        return ('1w', 7)  # Sunday
+
+    # Monthly (end of month)
+    if resample in ('M', 'ME', 'BM', 'SM', 'CBM'):
+        return ('1mo', None)
+
+    # Monthly (start of month)
+    if resample == 'MS':
+        return ('1mo_start', None)
+
+    # Quarterly (end of quarter)
+    if resample in ('Q', 'QE', 'BQ'):
+        return ('3mo', None)
+
+    # Quarterly (start of quarter)
+    if resample == 'QS':
+        return ('3mo_start', None)
+
+    # Yearly (end of year)
+    if resample in ('A', 'Y', 'YE', 'BY'):
+        return ('1y', None)
+
+    # Yearly (start of year)
+    if resample in ('AS', 'YS'):
+        return ('1y_start', None)
+
+    raise ValueError(f"Invalid resample frequency: {resample}")
+
+
+def _parse_offset(offset_str: str) -> timedelta:
+    """Parse pandas-style offset string to timedelta.
+
+    Args:
+        offset_str: Offset string like '1D', '-1D', '2W', '1M' (only D/W supported for offset)
+
+    Returns:
+        timedelta object
+
+    Raises:
+        ValueError: If the offset format is not recognized.
+    """
+    import re
+
+    if not offset_str:
+        return timedelta(0)
+
+    # Parse format: optional sign, number, unit
+    match = re.match(r'^(-)?(\d+)([DWHMST])$', offset_str.upper())
+    if not match:
+        raise ValueError(f"Invalid offset format: {offset_str}")
+
+    sign = -1 if match.group(1) else 1
+    value = int(match.group(2))
+    unit = match.group(3)
+
+    if unit == 'D':
+        return timedelta(days=sign * value)
+    elif unit == 'W':
+        return timedelta(weeks=sign * value)
+    elif unit == 'H':
+        return timedelta(hours=sign * value)
+    elif unit == 'M':
+        return timedelta(minutes=sign * value)
+    elif unit == 'S':
+        return timedelta(seconds=sign * value)
+    else:
+        raise ValueError(f"Unsupported offset unit: {unit}")
+
+
+def _get_period_end_dates(
+    start_date: date,
+    end_date: date,
+    freq: str,
+    weekday: int | None = None,
+) -> list[date]:
+    """Generate period-end dates between start and end dates using polars.
+
+    Args:
+        start_date: Start date
+        end_date: End date
+        freq: Polars-style frequency ('1w', '1mo', '3mo', '1y', etc.)
+        weekday: For weekly frequency, which day ends the week (1=Mon, 7=Sun)
+
+    Returns:
+        List of period-end dates
+    """
+    result_dates = []
+
+    if freq == '1w':
+        # Weekly: find all specified weekdays between start and end
+        # weekday is 1-7 (Mon-Sun)
+        current = start_date
+        target_weekday = weekday if weekday else 7  # Default Sunday
+
+        # Find first occurrence of target weekday
+        days_ahead = target_weekday - current.isoweekday()
+        if days_ahead < 0:
+            days_ahead += 7
+        current = current + timedelta(days=days_ahead)
+
+        while current <= end_date:
+            result_dates.append(current)
+            current = current + timedelta(weeks=1)
+
+    elif freq == '1mo':
+        # Monthly end: last day of each month
+        current = start_date
+        while current <= end_date:
+            # Find last day of current month
+            if current.month == 12:
+                next_month_start = date(current.year + 1, 1, 1)
+            else:
+                next_month_start = date(current.year, current.month + 1, 1)
+            month_end = next_month_start - timedelta(days=1)
+
+            if month_end >= start_date:
+                result_dates.append(month_end)
+
+            # Move to next month
+            current = next_month_start
+
+    elif freq == '1mo_start':
+        # Monthly start: first day of each month
+        current = date(start_date.year, start_date.month, 1)
+        while current <= end_date:
+            if current >= start_date:
+                result_dates.append(current)
+            # Move to next month
+            if current.month == 12:
+                current = date(current.year + 1, 1, 1)
+            else:
+                current = date(current.year, current.month + 1, 1)
+
+    elif freq == '3mo':
+        # Quarterly end: last day of March, June, September, December
+        quarter_end_months = [3, 6, 9, 12]
+        current = start_date
+        while current <= end_date:
+            # Find next quarter end
+            for qm in quarter_end_months:
+                if current.month <= qm:
+                    # Calculate last day of quarter month
+                    if qm == 12:
+                        q_end = date(current.year, 12, 31)
+                    else:
+                        next_month_start = date(current.year, qm + 1, 1)
+                        q_end = next_month_start - timedelta(days=1)
+
+                    if q_end >= start_date and q_end <= end_date:
+                        if q_end not in result_dates:
+                            result_dates.append(q_end)
+                    break
+            # Move to next quarter
+            if current.month >= 10:
+                current = date(current.year + 1, 1, 1)
+            else:
+                current = date(current.year, ((current.month - 1) // 3 + 1) * 3 + 1, 1)
+
+    elif freq == '3mo_start':
+        # Quarterly start: first day of January, April, July, October
+        quarter_start_months = [1, 4, 7, 10]
+        current = start_date
+        while current <= end_date:
+            for qm in quarter_start_months:
+                q_start = date(current.year, qm, 1)
+                if q_start >= start_date and q_start <= end_date:
+                    if q_start not in result_dates:
+                        result_dates.append(q_start)
+            # Move to next year
+            current = date(current.year + 1, 1, 1)
+
+    elif freq == '1y':
+        # Yearly end: December 31st
+        current_year = start_date.year
+        while True:
+            year_end = date(current_year, 12, 31)
+            if year_end > end_date:
+                break
+            if year_end >= start_date:
+                result_dates.append(year_end)
+            current_year += 1
+
+    elif freq == '1y_start':
+        # Yearly start: January 1st
+        current_year = start_date.year
+        while True:
+            year_start = date(current_year, 1, 1)
+            if year_start > end_date:
+                break
+            if year_start >= start_date:
+                result_dates.append(year_start)
+            current_year += 1
+
+    else:
+        raise ValueError(f"Unsupported frequency: {freq}")
+
+    return sorted(set(result_dates))
 
 # Load the Rust extension
 from polars_backtest._polars_backtest import (
@@ -55,6 +273,10 @@ __all__ = [
     "drawdown_series",
     "portfolio_return",
     "equal_weights",
+    # Helper functions for testing
+    "_parse_resample_freq",
+    "_parse_offset",
+    "_get_period_end_dates",
 ]
 
 # Get the path to the shared library
@@ -249,67 +471,91 @@ def _resample_position(
     Returns:
         Resampled position DataFrame with dates at period boundaries (trading days).
     """
-    pd = _ensure_pandas()
-    from pandas.tseries.frequencies import to_offset
-
     if resample == 'D':
         return position
 
     date_col = position.columns[0]
     stock_cols = position.columns[1:]
 
-    # Convert to pandas for resampling
-    pos_dates = position[date_col].to_list()
-    pos_pd = pd.DataFrame(
-        {col: position[col].to_list() for col in stock_cols},
-        index=pd.DatetimeIndex([pd.Timestamp(d) for d in pos_dates])
-    )
-
-    # Forward fill position to all trading dates first
-    all_dates_pd = pd.DatetimeIndex([pd.Timestamp(d) for d in price_dates])
-    pos_filled = pos_pd.reindex(all_dates_pd).ffill()
-
-    # Normalize resample string for pandas 2.2+ compatibility
-    freq = resample
-    if pd.__version__ >= '2.2.0':
-        # Old strings need 'E' suffix for end-of-period
-        old_resample_strings = ['M', 'BM', 'SM', 'CBM', 'Q', 'BQ', 'A', 'Y', 'BY']
-        if freq in old_resample_strings:
-            freq += 'E'
-
-    # Generate rebalance dates using pandas date_range
-    # Extend end_date to include the next period end (Finlab behavior)
-    # This allows capturing pending entries for the upcoming rebalance
-    start_date = all_dates_pd[0]
-    end_date = all_dates_pd[-1]
-
-    # Extend end_date by one period to include upcoming rebalance date
+    # Parse resample frequency
     try:
-        one_period = to_offset(freq)
-        extended_end = end_date + one_period
-    except (ValueError, TypeError):
-        extended_end = end_date
-
-    try:
-        rebalance_dates = pd.date_range(start=start_date, end=extended_end, freq=freq)
+        freq, weekday = _parse_resample_freq(resample)
     except ValueError as e:
         raise ValueError(f"Invalid resample frequency: {resample}. Error: {e}")
+
+    # Convert price_dates to date objects for comparison
+    def to_date(d) -> date:
+        if isinstance(d, date):
+            return d
+        elif isinstance(d, str):
+            return date.fromisoformat(d)
+        else:
+            # Assume datetime-like
+            return d.date() if hasattr(d, 'date') else date.fromisoformat(str(d)[:10])
+
+    all_dates = [to_date(d) for d in price_dates]
+
+    # Create all_dates DataFrame for joining
+    all_dates_df = pl.DataFrame({date_col: [str(d) for d in all_dates]})
+
+    # Forward fill position to all trading dates
+    pos_filled = (
+        all_dates_df
+        .join(position, on=date_col, how="left")
+        .with_columns([
+            pl.col(col).forward_fill() for col in stock_cols
+        ])
+    )
+
+    # Generate rebalance dates
+    start_date = all_dates[0]
+    end_date = all_dates[-1]
+
+    # Extend end_date by one period to include upcoming rebalance date (Finlab behavior)
+    if freq == '1w':
+        extended_end = end_date + timedelta(weeks=1)
+    elif freq == '1mo' or freq == '1mo_start':
+        # Add approximately one month
+        if end_date.month == 12:
+            extended_end = date(end_date.year + 1, 1, end_date.day)
+        else:
+            try:
+                extended_end = date(end_date.year, end_date.month + 1, end_date.day)
+            except ValueError:
+                # Handle day overflow (e.g., Jan 31 -> Feb 28)
+                extended_end = date(end_date.year, end_date.month + 2, 1) - timedelta(days=1)
+    elif freq == '3mo' or freq == '3mo_start':
+        # Add approximately one quarter
+        new_month = end_date.month + 3
+        new_year = end_date.year + (new_month - 1) // 12
+        new_month = ((new_month - 1) % 12) + 1
+        try:
+            extended_end = date(new_year, new_month, end_date.day)
+        except ValueError:
+            extended_end = date(new_year, new_month + 1, 1) - timedelta(days=1)
+    elif freq == '1y' or freq == '1y_start':
+        extended_end = date(end_date.year + 1, end_date.month, end_date.day)
+    else:
+        extended_end = end_date
+
+    # Get period-end dates
+    rebalance_dates = _get_period_end_dates(start_date, extended_end, freq, weekday)
 
     # Apply resample_offset if provided
     if resample_offset is not None:
         try:
-            offset = to_offset(resample_offset)
-            rebalance_dates = rebalance_dates + offset
+            offset = _parse_offset(resample_offset)
+            rebalance_dates = [d + offset for d in rebalance_dates]
         except ValueError as e:
             raise ValueError(f"Invalid resample_offset: {resample_offset}. Error: {e}")
 
     # Filter to valid trading dates and find the last trading day <= each rebalance date
-    trading_dates_set = set(all_dates_pd)
+    all_dates_set = set(all_dates)
     selected_dates = []
 
     for rebal_date in rebalance_dates:
         # Find the last trading day that is <= rebalance date
-        valid_dates = [d for d in all_dates_pd if d <= rebal_date]
+        valid_dates = [d for d in all_dates if d <= rebal_date]
         if valid_dates:
             last_trading_day = max(valid_dates)
             if last_trading_day not in selected_dates:
@@ -319,20 +565,23 @@ def _resample_position(
         # If no valid dates found, return original position
         return position
 
-    # Get position values at selected dates
-    pos_at_dates = pos_filled.loc[pos_filled.index.isin(selected_dates)]
+    # Sort selected dates
+    selected_dates = sorted(selected_dates)
 
-    # Remove duplicates and sort
-    pos_at_dates = pos_at_dates[~pos_at_dates.index.duplicated(keep='last')]
-    pos_at_dates = pos_at_dates.sort_index()
+    # Convert selected_dates to strings for filtering
+    selected_date_strs = [str(d) for d in selected_dates]
 
-    # Convert back to Polars
-    resampled_dates = [str(d.date()) for d in pos_at_dates.index.tolist()]
-    result_data = {date_col: resampled_dates}
-    for col in stock_cols:
-        result_data[col] = pos_at_dates[col].tolist()
+    # Filter pos_filled to selected dates
+    pos_at_dates = pos_filled.filter(pl.col(date_col).is_in(selected_date_strs))
 
-    return pl.DataFrame(result_data)
+    # Remove duplicates and ensure sorted
+    pos_at_dates = (
+        pos_at_dates
+        .unique(subset=[date_col], keep="last")
+        .sort(date_col)
+    )
+
+    return pos_at_dates
 
 
 def _filter_changed_positions(position: pl.DataFrame) -> pl.DataFrame:

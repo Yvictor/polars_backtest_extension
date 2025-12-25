@@ -35,13 +35,6 @@ dev = [
     "pytest-cov",
     "hypothesis",
 ]
-resample = [
-    "pandas>=2.0.0",  # Required for non-daily resampling (W/M/Q/Y)
-]
-finlab = [
-    "pandas>=2.0.0",  # Required for Finlab compatibility
-    "numpy>=1.20.0",
-]
 
 [tool.maturin]
 features = ["pyo3/extension-module"]
@@ -65,5 +58,6 @@ dev = [
     "dotenv>=0.9.9",
     "finlab>=1.5.5",
     "ipykernel>=6.31.0",
+    "pandas>=2.3.3",
     "pytest>=8.4.2",
 ]
