@@ -639,6 +639,11 @@ fn simulate_backtest<T: TradeTracker>(
                     }
                 }
 
+                // Update previous_prices AFTER touched_exit detection but before T+1 stops
+                // This ensures touched_exit uses the correct prev_price, then we update it
+                // for the next day's calculations.
+                update_previous_prices(&mut portfolio, &close_prices[t]);
+
                 // Detect stops for T+1 execution (today's detection -> tomorrow's execution)
                 // Skip if touched_exit mode (already processed above)
                 let mut today_stops = if config.touched_exit {
@@ -1302,7 +1307,7 @@ fn detect_touched_exit(
     high_prices: &[f64],
     low_prices: &[f64],
     close_prices: &[f64],
-    prev_prices: &[f64],
+    _prev_prices: &[f64], // Kept for API compatibility but we use pos.previous_price
     config: &BacktestConfig,
 ) -> Vec<TouchedExitResult> {
     portfolio
@@ -1313,7 +1318,6 @@ fn detect_touched_exit(
                 || stock_id >= high_prices.len()
                 || stock_id >= low_prices.len()
                 || stock_id >= close_prices.len()
-                || stock_id >= prev_prices.len()
             {
                 return None;
             }
@@ -1322,16 +1326,18 @@ fn detect_touched_exit(
             let high_price = high_prices[stock_id];
             let low_price = low_prices[stock_id];
             let close_price = close_prices[stock_id];
-            let prev_price = prev_prices[stock_id];
 
-            // Skip if any price is invalid
+            // Use pos.previous_price which tracks the last valid price for this position.
+            // This handles NaN days correctly (previous_price only updates on valid days).
+            let prev_price = pos.previous_price;
+
+            // Skip if any OHLC price is invalid or prev_price is not set
             if open_price.is_nan()
                 || high_price.is_nan()
                 || low_price.is_nan()
                 || close_price.is_nan()
-                || prev_price.is_nan()
-                || prev_price <= 0.0
                 || close_price <= 0.0
+                || prev_price <= 0.0
             {
                 return None;
             }
@@ -1339,6 +1345,11 @@ fn detect_touched_exit(
             // Get cr from position (already updated by update_max_prices: cr *= r)
             let cr_new = pos.cr;
             let maxcr = pos.maxcr;
+
+            // Skip if cr is invalid (shouldn't happen but safety check)
+            if cr_new.is_nan() || cr_new <= 0.0 {
+                return None;
+            }
 
             // Calculate r = close / prev_price (same as Finlab line 305)
             let r = close_price / prev_price;
@@ -1398,9 +1409,7 @@ fn detect_touched_exit(
             //
             // After pos *= r, pos = pos_old * r = entry_pos * cr_old * r = entry_pos * cr_new
             // So exit_ratio relative to current pos (after r update):
-            // - touch_open: exit_ratio = open_r / r / cr_new * cr_new = open_r / r (wrong!)
-            //   Actually: pos_final = pos_old * open_r, pos_current = pos_old * r
-            //   So exit_ratio = pos_final / pos_current = open_r / r
+            // - touch_open: exit_ratio = open_r / r
             // - touch_high: exit_ratio = max_r / cr_new
             // - touch_low: exit_ratio = min_r / cr_new
             //
@@ -1490,6 +1499,8 @@ fn execute_pending_stops_finlab(
 /// r = price_values[d, sidprice] / previous_price[sidprice]
 /// cr[sid] *= r
 /// ```
+/// Update cr, last_market_value, and maxcr for all positions.
+/// Does NOT update previous_price - call update_previous_prices separately.
 fn update_max_prices(portfolio: &mut PortfolioState, prices: &[f64]) {
     for (&stock_id, pos) in portfolio.positions.iter_mut() {
         if stock_id < prices.len() {
@@ -1517,8 +1528,20 @@ fn update_max_prices(portfolio: &mut PortfolioState, prices: &[f64]) {
             // maxcr = max(maxcr, cr)  (lines 319-320 of restored_backtest_core.pyx)
             pos.maxcr = pos.maxcr.max(pos.cr);
 
-            // Update previous_price for next day (MUST be after r calculation!)
-            pos.previous_price = current_price;
+            // NOTE: previous_price is NOT updated here.
+            // Call update_previous_prices after detect_touched_exit.
+        }
+    }
+}
+
+/// Update previous_price for all positions after touched_exit detection.
+fn update_previous_prices(portfolio: &mut PortfolioState, prices: &[f64]) {
+    for (&stock_id, pos) in portfolio.positions.iter_mut() {
+        if stock_id < prices.len() {
+            let current_price = prices[stock_id];
+            if !current_price.is_nan() && current_price > 0.0 {
+                pos.previous_price = current_price;
+            }
         }
     }
 }
