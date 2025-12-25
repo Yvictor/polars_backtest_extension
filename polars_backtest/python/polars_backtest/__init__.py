@@ -335,10 +335,95 @@ def _resample_position(
     return pl.DataFrame(result_data)
 
 
+def _filter_changed_positions(position: pl.DataFrame) -> pl.DataFrame:
+    """Filter position DataFrame to only rows where position changed.
+
+    This implements Finlab's resample=None behavior:
+    - Only rebalance when portfolio composition changes
+    - Always include the first row if it has any non-null values
+
+    Finlab logic (backtest.py lines 574-580):
+        change = (position.diff().abs().sum(axis=1) != 0) | (
+            (position.index == position.index[0]) & position.iloc[0].notna().any())
+        position = position.loc[change]
+
+    Args:
+        position: Position DataFrame with date column and stock columns.
+
+    Returns:
+        Filtered position DataFrame with only changed rows.
+    """
+    if position.height <= 1:
+        return position
+
+    date_col = position.columns[0]
+    stock_cols = position.columns[1:]
+
+    # Cast boolean columns to float for diff calculation
+    # Finlab does: position.astype(float).fillna(0)
+    cast_exprs = []
+    for col in stock_cols:
+        dtype = position[col].dtype
+        if dtype == pl.Boolean:
+            cast_exprs.append(pl.col(col).cast(pl.Float64).alias(col))
+        elif dtype not in [pl.Float32, pl.Float64]:
+            cast_exprs.append(pl.col(col).cast(pl.Float64).alias(col))
+
+    if cast_exprs:
+        position_float = position.with_columns(cast_exprs)
+    else:
+        position_float = position
+
+    # Calculate diff for each stock column
+    # diff().abs().sum(axis=1) != 0 means position changed
+    diff_exprs = [
+        pl.col(col).diff().abs().fill_null(0.0).alias(f"_diff_{col}")
+        for col in stock_cols
+    ]
+
+    # Add diff columns
+    with_diff = position_float.with_columns(diff_exprs)
+
+    # Sum of absolute diffs across all stocks
+    diff_cols = [f"_diff_{col}" for col in stock_cols]
+    with_diff = with_diff.with_columns(
+        pl.sum_horizontal(diff_cols).alias("_diff_sum")
+    )
+
+    # First row should always be included if it has any non-null values
+    # Check if first row has any non-zero/non-null values
+    first_row_has_values = False
+    if position.height > 0:
+        first_row = position.row(0)
+        for i, col in enumerate(position.columns):
+            if col != date_col:
+                val = first_row[i]
+                if val is not None and val != 0:
+                    first_row_has_values = True
+                    break
+
+    # Create mask: diff_sum != 0 OR first row
+    with_diff = with_diff.with_row_index("_row_idx")
+    if first_row_has_values:
+        mask = (pl.col("_diff_sum") != 0) | (pl.col("_row_idx") == 0)
+    else:
+        mask = pl.col("_diff_sum") != 0
+
+    # Get the row indices to keep
+    kept_indices = with_diff.filter(mask).get_column("_row_idx").to_list()
+
+    # Filter original position using the indices (preserves original types)
+    result = position.with_row_index("_row_idx").filter(
+        pl.col("_row_idx").is_in(kept_indices)
+    ).drop("_row_idx")
+
+    return result
+
+
 def backtest(
     prices: pl.DataFrame,
     position: pl.DataFrame,
-    resample: str = 'D',
+    resample: str | None = 'D',
     resample_offset: str | None = None,
     rebalance_indices: list[int] | None = None,
     fee_ratio: float = 0.001425,
@@ -371,7 +456,8 @@ def backtest(
                   - Boolean values: treated as equal-weight signals (True = hold)
                   - Float values: treated as custom weights (will be normalized)
         resample: Rebalance frequency. Supports:
-                  - 'D': Daily (default, no resampling)
+                  - None: Only rebalance when position changes (Finlab default)
+                  - 'D': Daily (rebalance every day)
                   - 'W': Weekly (rebalance on last trading day of each week)
                   - 'W-FRI': Weekly on Friday
                   - 'W-MON': Weekly on Monday
@@ -435,7 +521,10 @@ def backtest(
         raise ValueError("Position and prices must have common stock columns")
 
     # Apply resample if needed
-    if resample != 'D':
+    if resample is None:
+        # resample=None: Only rebalance when position changes (Finlab behavior)
+        position = _filter_changed_positions(position)
+    elif resample != 'D':
         position = _resample_position(position, price_dates, resample, resample_offset)
 
     # Select only common stocks and reorder
@@ -624,7 +713,7 @@ class Report:
 def backtest_with_report(
     close: pl.DataFrame,
     position: pl.DataFrame,
-    resample: str = 'D',
+    resample: str | None = 'D',
     resample_offset: str | None = None,
     trade_at_price: str | pl.DataFrame = "close",
     open: pl.DataFrame | None = None,
@@ -640,6 +729,7 @@ def backtest_with_report(
     position_limit: float = 1.0,
     retain_cost_when_rebalance: bool = False,
     stop_trading_next_period: bool = True,
+    touched_exit: bool = False,
 ) -> Report:
     """Run backtest with trades tracking, returning a Report object.
 
@@ -669,7 +759,8 @@ def backtest_with_report(
                Used for cumulative return calculation.
         position: DataFrame with rebalance dates as index and position weights as columns.
         resample: Rebalance frequency. Supports:
-                  - 'D': Daily (default, no resampling)
+                  - None: Only rebalance when position changes (Finlab default)
+                  - 'D': Daily (rebalance every day)
                   - 'W': Weekly (rebalance on last trading day of each week)
                   - 'W-FRI': Weekly on Friday
                   - 'W-MON': Weekly on Monday
@@ -698,6 +789,10 @@ def backtest_with_report(
         retain_cost_when_rebalance: If True, retain transaction costs when rebalancing.
         stop_trading_next_period: If True, stop trading the stock next period after
                                  stop loss/take profit triggers.
+        touched_exit: If True, use OHLC prices for intraday stop detection.
+                     When high/low prices touch stop_loss/take_profit thresholds,
+                     exit at the touched price rather than waiting for close.
+                     NOTE: NOT YET IMPLEMENTED - will raise NotImplementedError.
 
     Returns:
         Report object with creturn, position, and trades
@@ -725,6 +820,14 @@ def backtest_with_report(
         ...     factor=adj_factor,
         ... )
     """
+    # Check for unimplemented features
+    if touched_exit:
+        raise NotImplementedError(
+            "touched_exit is not yet implemented in polars_backtest. "
+            "This feature requires OHLC prices for intraday stop detection. "
+            "See backtest_flow.md for implementation details."
+        )
+
     # Resolve trade_at_price to a DataFrame
     if isinstance(trade_at_price, str):
         if trade_at_price == "close":
@@ -775,7 +878,10 @@ def backtest_with_report(
     dates = close.select(date_col).to_series().to_list()
 
     # Apply resample if needed
-    if resample != 'D':
+    if resample is None:
+        # resample=None: Only rebalance when position changes (Finlab behavior)
+        position = _filter_changed_positions(position)
+    elif resample != 'D':
         position = _resample_position(position, dates, resample, resample_offset)
 
     # Ensure position has same stock columns
