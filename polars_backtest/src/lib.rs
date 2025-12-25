@@ -36,6 +36,7 @@ impl PyBacktestConfig {
         retain_cost_when_rebalance=false,
         stop_trading_next_period=true,
         finlab_mode=false,
+        touched_exit=false,
     ))]
     fn new(
         fee_ratio: f64,
@@ -47,6 +48,7 @@ impl PyBacktestConfig {
         retain_cost_when_rebalance: bool,
         stop_trading_next_period: bool,
         finlab_mode: bool,
+        touched_exit: bool,
     ) -> Self {
         Self {
             inner: BacktestConfig {
@@ -59,6 +61,7 @@ impl PyBacktestConfig {
                 retain_cost_when_rebalance,
                 stop_trading_next_period,
                 finlab_mode,
+                touched_exit,
             },
         }
     }
@@ -108,9 +111,14 @@ impl PyBacktestConfig {
         self.inner.finlab_mode
     }
 
+    #[getter]
+    fn touched_exit(&self) -> bool {
+        self.inner.touched_exit
+    }
+
     fn __repr__(&self) -> String {
         format!(
-            "BacktestConfig(fee_ratio={}, tax_ratio={}, stop_loss={}, take_profit={}, trail_stop={}, position_limit={}, retain_cost_when_rebalance={}, stop_trading_next_period={}, finlab_mode={})",
+            "BacktestConfig(fee_ratio={}, tax_ratio={}, stop_loss={}, take_profit={}, trail_stop={}, position_limit={}, retain_cost_when_rebalance={}, stop_trading_next_period={}, finlab_mode={}, touched_exit={})",
             self.inner.fee_ratio,
             self.inner.tax_ratio,
             self.inner.stop_loss,
@@ -120,6 +128,7 @@ impl PyBacktestConfig {
             self.inner.retain_cost_when_rebalance,
             self.inner.stop_trading_next_period,
             self.inner.finlab_mode,
+            self.inner.touched_exit,
         )
     }
 }
@@ -380,7 +389,7 @@ impl From<BacktestResult> for PyBacktestResult {
 /// It uses:
 /// - adj_prices: Adjusted prices for return calculation (creturn)
 /// - original_prices: Original prices for trade records (entry/exit prices)
-/// - high_prices/low_prices: Optional, for touched_exit support
+/// - open_prices/high_prices/low_prices: Optional, for touched_exit support
 ///
 /// The trade records match Finlab's trades DataFrame format, using
 /// original prices for entry/exit to match real trading execution.
@@ -391,19 +400,21 @@ impl From<BacktestResult> for PyBacktestResult {
 ///     weights: DataFrame with rebalance dates as rows, stocks as columns (Float64)
 ///     rebalance_indices: List of row indices in prices where rebalancing occurs
 ///     config: BacktestConfig (optional)
+///     open_prices: DataFrame with open prices (optional, for touched_exit)
 ///     high_prices: DataFrame with high prices (optional, for touched_exit)
 ///     low_prices: DataFrame with low prices (optional, for touched_exit)
 ///
 /// Returns:
 ///     BacktestResult containing creturn and trades list
 #[pyfunction]
-#[pyo3(signature = (adj_prices, original_prices, weights, rebalance_indices, config=None, high_prices=None, low_prices=None))]
+#[pyo3(signature = (adj_prices, original_prices, weights, rebalance_indices, config=None, open_prices=None, high_prices=None, low_prices=None))]
 fn backtest_with_trades(
     adj_prices: PyDataFrame,
     original_prices: PyDataFrame,
     weights: PyDataFrame,
     rebalance_indices: Vec<usize>,
     config: Option<PyBacktestConfig>,
+    open_prices: Option<PyDataFrame>,
     high_prices: Option<PyDataFrame>,
     low_prices: Option<PyDataFrame>,
 ) -> PyResult<PyBacktestResult> {
@@ -421,7 +432,12 @@ fn backtest_with_trades(
     let weights_2d = df_to_f64_2d(&weights_df)
         .map_err(|e| PyValueError::new_err(format!("Failed to convert weights: {}", e)))?;
 
-    // Convert optional high/low prices
+    // Convert optional OHLC prices
+    let open_prices_2d = open_prices
+        .map(|df| df_to_f64_2d(&df.0))
+        .transpose()
+        .map_err(|e| PyValueError::new_err(format!("Failed to convert open_prices: {}", e)))?;
+
     let high_prices_2d = high_prices
         .map(|df| df_to_f64_2d(&df.0))
         .transpose()
@@ -434,9 +450,11 @@ fn backtest_with_trades(
 
     let cfg = config.map(|c| c.inner).unwrap_or_default();
 
-    // Build PriceData with optional high/low
-    let prices = match (&high_prices_2d, &low_prices_2d) {
-        (Some(high), Some(low)) => PriceData::with_ohlc(&adj_prices_2d, &original_prices_2d, high, low),
+    // Build PriceData with optional OHLC
+    let prices = match (&open_prices_2d, &high_prices_2d, &low_prices_2d) {
+        (Some(open), Some(high), Some(low)) => {
+            PriceData::with_ohlc(&adj_prices_2d, &original_prices_2d, open, high, low)
+        }
         _ => PriceData::new(&adj_prices_2d, &original_prices_2d),
     };
 

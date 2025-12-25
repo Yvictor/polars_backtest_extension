@@ -820,13 +820,13 @@ def backtest_with_report(
         ...     factor=adj_factor,
         ... )
     """
-    # Check for unimplemented features
+    # Check for touched_exit requirements
     if touched_exit:
-        raise NotImplementedError(
-            "touched_exit is not yet implemented in polars_backtest. "
-            "This feature requires OHLC prices for intraday stop detection. "
-            "See backtest_flow.md for implementation details."
-        )
+        if open is None or high is None or low is None:
+            raise ValueError(
+                "touched_exit=True requires open, high, and low price DataFrames. "
+                "Please provide all OHLC prices for intraday stop detection."
+            )
 
     # Resolve trade_at_price to a DataFrame
     if isinstance(trade_at_price, str):
@@ -1024,7 +1024,17 @@ def backtest_with_report(
         retain_cost_when_rebalance=retain_cost_when_rebalance,
         stop_trading_next_period=stop_trading_next_period,
         finlab_mode=True,  # Use finlab mode for creturn calculation (matches Finlab perfectly)
+        touched_exit=touched_exit,
     )
+
+    # Prepare OHLC data for touched_exit mode
+    open_data = None
+    high_data = None
+    low_data = None
+    if touched_exit and open is not None and high is not None and low is not None:
+        open_data = open.select(position_stock_cols)
+        high_data = high.select(position_stock_cols)
+        low_data = low.select(position_stock_cols)
 
     # Run backtest with trades tracking
     # close_data: adjusted prices for return calculation
@@ -1035,6 +1045,9 @@ def backtest_with_report(
         position_data,
         rebalance_indices,
         config,
+        open_data,
+        high_data,
+        low_data,
     )
 
     # Create Report object
