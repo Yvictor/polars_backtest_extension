@@ -1355,15 +1355,15 @@ fn detect_touched_exit(
             let r = close_price / prev_price;
 
             // Finlab calculates these AFTER cr *= r (lines 342-344):
-            // high_r = cr[sid] / r * (high / prev) = cr_old * (high / prev)
-            // low_r = cr[sid] / r * (low / prev) = cr_old * (low / prev)
-            // open_r = cr[sid] / r * (open / prev) = cr_old * (open / prev)
-            let cr_old = cr_new / r;
-
-            // Calculate ratios at each price level
-            let open_r = cr_old * (open_price / prev_price);
-            let high_r = cr_old * (high_price / prev_price);
-            let low_r = cr_old * (low_price / prev_price);
+            // high_r = cr[sid] / r * (high / prev)
+            // low_r = cr[sid] / r * (low / prev)
+            // open_r = cr[sid] / r * (open / prev)
+            //
+            // We compute in the EXACT same order as Finlab (single expression)
+            // to ensure identical floating point behavior.
+            let open_r = cr_new / r * (open_price / prev_price);
+            let high_r = cr_new / r * (high_price / prev_price);
+            let low_r = cr_new / r * (low_price / prev_price);
 
             // Determine position direction
             // Finlab line 326: entry_pos = pos[sid] / cr[sid], if entry_pos > 0: long

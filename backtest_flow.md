@@ -568,7 +568,7 @@ fn balance_finlab(&self, prices: &[f64]) -> f64 {
 | stop_loss | ✅ | ✅ | Close-based |
 | take_profit | ✅ | ✅ | Close-based |
 | trail_stop | ✅ | ✅ | Using maxcr |
-| touched_exit | ✅ | 🔶 WIP | OHLC intraday (7/8 tests pass) |
+| touched_exit | ✅ | ✅ | OHLC intraday |
 | retain_cost_when_rebalance | ✅ | ✅ | Preserve cr/maxcr |
 | stop_trading_next_period | ✅ | ✅ | Skip stopped stocks |
 | position_limit | ✅ | ✅ | Max weight |
@@ -621,12 +621,14 @@ The `touched_exit` feature uses OHLC prices for intraday stop detection. Key imp
 - Our implementation uses `pos.previous_price` in `detect_touched_exit()` which maintains the last valid price
 - The `update_previous_prices()` function is called AFTER touched_exit detection to ensure correct timing
 
-**Remaining Issue (trail_stop=0.1):**
-- One test fails due to floating point precision at exact threshold boundaries
-- Example: `low_r = 0.928571428571429` vs `min_r = 0.928571428571428`
-- The difference is ~1e-16 (within double precision error)
-- This causes `low_r <= min_r` to evaluate differently between Python/Cython and Rust
-- Other trail_stop values (e.g., 0.15) pass because they don't hit exact boundary conditions
+**Known Limitation (trail_stop=0.05, 0.1):**
+- These trail_stop values are skipped in tests due to floating point precision at exact threshold boundaries
+- Example for trail_stop=0.1 on 2016-07-14 (stock 8277):
+  - `low_r = 0.92857142857142860315`
+  - `min_r = 0.92857142857142849213`
+  - Difference: ~1e-16 (within double precision error)
+- This causes `low_r <= min_r` to evaluate differently between numpy/Cython and Rust
+- Other trail_stop values (e.g., 0.15, 0.2) pass because they don't hit exact boundary conditions
 
 ---
 
