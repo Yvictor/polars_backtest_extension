@@ -1066,10 +1066,17 @@ fn check_stops(
 /// Uses Finlab's cr/maxcr formula for stop detection:
 /// - cr is updated daily via cumulative multiplication: cr *= r (where r = today/yesterday)
 ///   This matches Finlab's floating point behavior exactly (line 319 of restored_backtest_core.pyx)
-/// - maxcr = max_price / stop_entry_price (max cumulative return)
+/// - maxcr = max cumulative return ratio
+///
+/// For long positions (entry_pos > 0):
 /// - max_r = 1 + take_profit
 /// - min_r = max(1 - stop_loss, maxcr - trail_stop)
 /// - Trigger: cr >= max_r (take profit) or cr < min_r (stop loss/trail)
+///
+/// For short positions (entry_pos < 0):
+/// - max_r = min(1 + stop_loss, maxcr + trail_stop)
+/// - min_r = 1 - take_profit
+/// - Trigger: cr >= max_r (stop loss/trail) or cr < min_r (take profit)
 fn detect_stops_finlab(
     portfolio: &PortfolioState,
     prices: &[f64],
@@ -1104,29 +1111,61 @@ fn detect_stops_finlab(
             // Note: maxcr is updated by update_max_prices() before this function is called
             let maxcr = pos.maxcr;
 
+            // Determine if position is long or short
+            // Finlab: entry_pos = pos[sid] / cr[sid]
+            // Since cr is always positive, the sign depends on pos[sid] (last_market_value)
+            let is_long = pos.last_market_value >= 0.0;
+
             // Finlab stop conditions (lines 326-393 of restored_backtest_core.pyx):
-            // For long positions:
-            //   max_r = 1 + take_profit
-            //   min_r = max(1 - stop_loss, maxcr - trail_stop)
-            // Trigger: cr_at_close >= max_r (take profit) or cr_at_close < min_r (stop loss/trail)
+            if is_long {
+                // Long positions:
+                //   max_r = 1 + take_profit
+                //   min_r = max(1 - stop_loss, maxcr - trail_stop)
+                // Trigger: cr_at_close >= max_r (take profit) or cr_at_close < min_r (stop loss/trail)
 
-            // Check take profit: cr_at_close >= 1 + take_profit
-            if config.take_profit < f64::INFINITY && cr_at_close >= 1.0 + config.take_profit {
-                return Some(stock_id);
-            }
+                // Check take profit: cr_at_close >= 1 + take_profit
+                if config.take_profit < f64::INFINITY && cr_at_close >= 1.0 + config.take_profit {
+                    return Some(stock_id);
+                }
 
-            // Calculate min_r using Finlab formula
-            let stop_threshold = 1.0 - config.stop_loss;
-            let trail_threshold = if config.trail_stop < f64::INFINITY {
-                maxcr - config.trail_stop
+                // Calculate min_r using Finlab formula
+                let stop_threshold = 1.0 - config.stop_loss;
+                let trail_threshold = if config.trail_stop < f64::INFINITY {
+                    maxcr - config.trail_stop
+                } else {
+                    f64::NEG_INFINITY
+                };
+                let min_r = stop_threshold.max(trail_threshold);
+
+                // Check stop loss / trail stop: cr_at_close < min_r (Finlab uses < not <=)
+                if cr_at_close < min_r {
+                    return Some(stock_id);
+                }
             } else {
-                f64::NEG_INFINITY
-            };
-            let min_r = stop_threshold.max(trail_threshold);
+                // Short positions:
+                //   max_r = min(1 + stop_loss, maxcr + trail_stop)
+                //   min_r = 1 - take_profit
+                // Trigger: cr_at_close >= max_r (stop loss/trail) or cr_at_close < min_r (take profit)
 
-            // Check stop loss / trail stop: cr_at_close < min_r (Finlab uses < not <=)
-            if cr_at_close < min_r {
-                return Some(stock_id);
+                // Calculate max_r for short positions
+                let stop_threshold = 1.0 + config.stop_loss;
+                let trail_threshold = if config.trail_stop < f64::INFINITY {
+                    maxcr + config.trail_stop
+                } else {
+                    f64::INFINITY
+                };
+                let max_r = stop_threshold.min(trail_threshold);
+
+                // Check stop loss / trail stop: cr_at_close >= max_r
+                if cr_at_close >= max_r {
+                    return Some(stock_id);
+                }
+
+                // Check take profit: cr_at_close < 1 - take_profit
+                let min_r = 1.0 - config.take_profit;
+                if config.take_profit < f64::INFINITY && cr_at_close < min_r {
+                    return Some(stock_id);
+                }
             }
 
             None

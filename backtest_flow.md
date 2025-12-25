@@ -572,7 +572,7 @@ fn balance_finlab(&self, prices: &[f64]) -> f64 {
 | retain_cost_when_rebalance | ✅ | ✅ | Preserve cr/maxcr |
 | stop_trading_next_period | ✅ | ✅ | Skip stopped stocks |
 | position_limit | ✅ | ✅ | Max weight |
-| Short positions | ✅ | ❌ | Negative weights |
+| Short positions | ✅ | ✅ | Negative weights |
 | mae_mfe analysis | ✅ | ❌ | Trade analysis |
 | Trade records | ✅ | ✅ | Different format |
 | Factor adjustment | Via Market | Via factor DataFrame | |

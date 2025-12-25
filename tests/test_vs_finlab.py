@@ -153,6 +153,74 @@ def test_trades_match(price_data):
 
 
 # =============================================================================
+# Short Position Tests (NOT YET IMPLEMENTED)
+# =============================================================================
+# Short positions use negative weights. Finlab's stop logic is inverted:
+# - Long: max_r = 1 + take_profit, min_r = max(1 - stop_loss, maxcr - trail_stop)
+# - Short: max_r = min(1 + stop_loss, maxcr + trail_stop), min_r = 1 - take_profit
+
+
+def test_short_basic(price_data):
+    """Test basic short positions with negative weights."""
+    close, adj_close = price_data
+    # Short when price is below 300-day low (inverse of long signal)
+    position = (close <= close.rolling(300).min()) * -1
+    run_comparison(adj_close, position, "short_basic", resample='M')
+
+
+@pytest.mark.parametrize("stop_loss", [0.05, 0.1])
+def test_short_stop_loss(price_data, stop_loss):
+    """Test short positions with stop_loss - triggers when price rises."""
+    close, adj_close = price_data
+    position = (close <= close.rolling(300).min()) * -1
+    run_comparison(adj_close, position, f"short+stop_loss={stop_loss}",
+                   resample='M', stop_loss=stop_loss)
+
+
+@pytest.mark.parametrize("take_profit", [0.1, 0.2])
+def test_short_take_profit(price_data, take_profit):
+    """Test short positions with take_profit - triggers when price drops."""
+    close, adj_close = price_data
+    position = (close <= close.rolling(300).min()) * -1
+    run_comparison(adj_close, position, f"short+take_profit={take_profit}",
+                   resample='M', take_profit=take_profit)
+
+
+@pytest.mark.parametrize("trail_stop", [0.1, 0.15])
+def test_short_trail_stop(price_data, trail_stop):
+    """Test short positions with trail_stop."""
+    close, adj_close = price_data
+    position = (close <= close.rolling(300).min()) * -1
+    run_comparison(adj_close, position, f"short+trail_stop={trail_stop}",
+                   resample='M', trail_stop=trail_stop)
+
+
+def test_short_combined_stops(price_data):
+    """Test short positions with combined stop_loss and take_profit."""
+    close, adj_close = price_data
+    position = (close <= close.rolling(300).min()) * -1
+    run_comparison(adj_close, position, "short+combined",
+                   resample='M', stop_loss=0.1, take_profit=0.2)
+
+
+def test_long_short_mixed(price_data):
+    """Test mixed long and short positions in the same portfolio."""
+    close, adj_close = price_data
+    # Long when above 300-day max, short when below 300-day min
+    long_signal = (close >= close.rolling(300).max()).astype(float)
+    short_signal = ((close <= close.rolling(300).min()) * -1).astype(float)
+    position = long_signal + short_signal
+    run_comparison(adj_close, position, "long_short_mixed", resample='M')
+
+def test_short_with_retain_cost(price_data):
+    """Test short positions with retain_cost_when_rebalance=True."""
+    close, adj_close = price_data
+    position = (close <= close.rolling(300).min()) * -1
+    run_comparison(adj_close, position, "short+retain_cost",
+                   resample='M', stop_loss=0.1, retain_cost_when_rebalance=True)
+
+
+# =============================================================================
 # Touched Exit Tests (NOT YET IMPLEMENTED)
 # =============================================================================
 # touched_exit uses OHLC prices for intraday stop detection.
