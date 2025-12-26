@@ -441,12 +441,19 @@ else:
 
 #### Stage 4.3: Zero-Copy 處理（多方案 Benchmark）
 **Goal**: 完全移除 wide format 轉換，達成 zero-copy
+**Status**: In Progress
 
-**Tasks:**
+**已完成:**
+1. ✅ 優化 `df_to_f64_2d()` 使用 columnar access
+   - 使用 `cast(&DataType::Float64)` 統一類型
+   - 使用 `cont_slice()` 獲取 zero-copy slice
+   - 以 column slices 建構 row-major 結果
+2. ✅ 所有測試通過 (17 + 37 = 54 tests)
+
+**待完成:**
 1. 新增 `btcore/src/day_processing.rs`
-2. 實作多種方案
-3. 建立 benchmark 測試
-4. 根據 benchmark 結果選擇最佳方案
+2. 實作多種方案 benchmark
+3. 根據 benchmark 結果選擇最佳方案
 
 ---
 

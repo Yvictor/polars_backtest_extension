@@ -207,6 +207,7 @@ fn backtest_weights(
 }
 
 /// Helper to convert DataFrame to Vec<Vec<f64>> (row-major)
+/// Optimized version using columnar access with cont_slice()
 fn df_to_f64_2d(df: &polars::prelude::DataFrame) -> Result<Vec<Vec<f64>>, String> {
     use polars::prelude::*;
 
@@ -217,26 +218,36 @@ fn df_to_f64_2d(df: &polars::prelude::DataFrame) -> Result<Vec<Vec<f64>>, String
         return Ok(vec![]);
     }
 
-    let mut result = Vec::with_capacity(n_rows);
+    // Get column slices (zero-copy when possible)
+    let col_slices: Vec<Vec<f64>> = df
+        .get_columns()
+        .iter()
+        .map(|col| {
+            // Cast to f64 if needed
+            let f64_col = col.cast(&DataType::Float64)
+                .map_err(|e| format!("Failed to cast column: {}", e))?;
+            let ca = f64_col.f64()
+                .map_err(|e| format!("Failed to get f64 chunked array: {}", e))?;
 
+            // Try zero-copy slice, fallback to collect if chunked or has nulls
+            match ca.cont_slice() {
+                Ok(slice) => Ok(slice.to_vec()),
+                Err(_) => {
+                    // Fallback: collect with NaN for nulls
+                    Ok(ca.into_iter()
+                        .map(|v| v.unwrap_or(f64::NAN))
+                        .collect())
+                }
+            }
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+
+    // Build row-major result from column slices
+    let mut result = Vec::with_capacity(n_rows);
     for row_idx in 0..n_rows {
         let mut row = Vec::with_capacity(n_cols);
-        for col in df.get_columns() {
-            let val = col
-                .get(row_idx)
-                .map_err(|e| format!("Failed to get value: {}", e))?;
-
-            let f64_val = match val {
-                AnyValue::Float64(v) => v,
-                AnyValue::Float32(v) => v as f64,
-                AnyValue::Int64(v) => v as f64,
-                AnyValue::Int32(v) => v as f64,
-                AnyValue::UInt64(v) => v as f64,
-                AnyValue::UInt32(v) => v as f64,
-                AnyValue::Null => f64::NAN,
-                _ => return Err(format!("Unsupported type: {:?}", val)),
-            };
-            row.push(f64_val);
+        for col_data in &col_slices {
+            row.push(col_data[row_idx]);
         }
         result.push(row);
     }
