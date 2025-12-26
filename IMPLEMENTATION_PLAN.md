@@ -412,42 +412,93 @@ fn backtest(df: PyDataFrame, ...) -> PyResult<PyBacktestResult> {
 2. 移除 Python pivot 邏輯 (`_long_to_wide()`)
 3. 跑所有測試確認
 
-#### Stage 4.3: Zero-Copy Day-by-Day 處理
-**Goal**: 完全移除 wide format 轉換，逐日 zero-copy 處理
+#### Stage 4.3: Zero-Copy 處理（多方案 Benchmark）
+**Goal**: 完全移除 wide format 轉換，達成 zero-copy
 
 **Tasks:**
 1. 新增 `btcore/src/day_processing.rs`
-2. 實作 `process_day()` 接收 slices
-3. 用 `cont_slice()` 達成 zero-copy
-4. 逐日處理，保持 stateful 邏輯
-5. 結果與 wide format 完全一致
+2. 實作多種方案
+3. 建立 benchmark 測試
+4. 根據 benchmark 結果選擇最佳方案
 
-**技術細節:**
+---
+
+**方案 A: partition_by**
 ```rust
-fn backtest(df: PyDataFrame, ...) -> PyResult<PyBacktestResult> {
-    let partitions = df.partition_by(["date"], true)?;
-    let mut portfolio = PortfolioState::new();
-
-    for date_df in &partitions {
-        // zero-copy slice 存取
-        let prices = date_df.column(price_col)?.f64()?.cont_slice()?;
-        let weights = date_df.column(weight_col)?.f64()?.cont_slice()?;
-
-        // 逐日處理 (btcore 不依賴 polars)
-        btcore::process_day(&mut portfolio, symbols, prices, weights, config);
-        creturn.push(portfolio.balance());
-    }
-
-    Ok(PyBacktestResult { creturn, trades: vec![] })
+let partitions = df.partition_by(["date"], true)?;
+for date_df in &partitions {
+    let prices = date_df.column("close")?.f64()?.cont_slice()?;
+    btcore::process_day(&mut portfolio, prices, weights);
 }
 ```
+- 優點：API 簡潔，Polars 原生支援
+- 缺點：Vec\<DataFrame\> 分配開銷
+
+---
+
+**方案 B: Sort + Boundary Detection**
+```rust
+let df = df.sort(["date"], Default::default())?;
+let dates = df.column("date")?.date()?.cont_slice()?;
+let prices = df.column("close")?.f64()?.cont_slice()?;
+
+// 單次遍歷找邊界
+let boundaries = find_date_boundaries(dates);  // Vec<(start, end)>
+
+for (start, end) in boundaries {
+    let day_prices = &prices[start..end];  // 純 slice，零分配
+    btcore::process_day(&mut portfolio, day_prices, ...);
+}
+```
+- 優點：最小記憶體分配，純 slice 操作
+- 缺點：需要自己維護邊界邏輯
+
+---
+
+**方案 C: group_by + apply**
+```rust
+df.group_by(["date"])?.apply(|group_df| {
+    // 在 closure 中處理每個 group
+})?;
+```
+- 優點：可並行處理
+- 缺點：回測需要 sequential state，可能不適用
+
+---
+
+**方案 D: Polars Lazy + Streaming**
+```rust
+let lf = df.lazy()
+    .group_by(["date"])
+    .agg([...])
+    .collect()?;
+```
+- 優點：Polars 優化器自動優化
+- 缺點：回測的 stateful 邏輯難以表達
+
+---
+
+**Benchmark 計畫:**
+```rust
+// benches/backtest_benchmark.rs
+fn benchmark_partition_by(c: &mut Criterion) { ... }
+fn benchmark_sort_boundary(c: &mut Criterion) { ... }
+fn benchmark_group_apply(c: &mut Criterion) { ... }
+```
+
+測試資料：
+- Small: 1000 dates × 100 symbols
+- Medium: 5000 dates × 500 symbols
+- Large: 10000 dates × 2000 symbols
 
 ---
 
 ### 檔案變更
 
 **Rust:**
-- `polars_backtest/src/lib.rs` - 新增 `backtest()` PyO3 函數（用 partition_by）
+- `polars_backtest/src/lib.rs` - 新增 `backtest()` PyO3 函數
+- `polars_backtest/src/strategies.rs` (新) - 多種處理策略實作
+- `polars_backtest/benches/backtest_benchmark.rs` (新) - Criterion benchmark
 - `btcore/src/day_processing.rs` (新) - 單日處理邏輯，接收 slices
 - `btcore/src/lib.rs` - Export day_processing 模組
 - btcore 不新增 polars 依賴（保持純 Rust）
