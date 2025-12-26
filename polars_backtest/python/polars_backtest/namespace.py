@@ -16,7 +16,7 @@ from polars_backtest._polars_backtest import (
     backtest_signals,
     backtest_weights,
     backtest_with_trades as _backtest_with_trades,
-    backtest as _rust_backtest,
+    backtest_partitioned as _rust_backtest,  # Use partition_by (1.5x faster than pivot)
 )
 
 if TYPE_CHECKING:

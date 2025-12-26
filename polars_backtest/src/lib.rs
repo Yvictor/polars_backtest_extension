@@ -551,6 +551,132 @@ fn compute_rebalance_indices(
     }
 }
 
+/// Build wide format matrices from partitions (avoids pivot)
+///
+/// Uses partition_by to split data by date, then builds matrices directly.
+/// This can be faster than pivot for certain data patterns.
+fn build_wide_from_partitions(
+    df: &DataFrame,
+    date_col: &str,
+    symbol_col: &str,
+    value_col: &str,
+) -> PolarsResult<(Vec<String>, Vec<String>, Vec<Vec<f64>>)> {
+    use std::collections::HashMap;
+
+    // Get unique symbols for column ordering
+    let symbols_series = df.column(symbol_col)?.str()?;
+    let unique_symbols: Vec<String> = symbols_series
+        .unique()?
+        .into_iter()
+        .filter_map(|s| s.map(|s| s.to_string()))
+        .collect();
+
+    // Build symbol → index mapping
+    let symbol_to_idx: HashMap<&str, usize> = unique_symbols
+        .iter()
+        .enumerate()
+        .map(|(i, s)| (s.as_str(), i))
+        .collect();
+
+    let n_symbols = unique_symbols.len();
+
+    // Sort by date and partition
+    let df_sorted = df.sort([date_col], SortMultipleOptions::default())?;
+    let partitions = df_sorted.partition_by([date_col], true)?;
+
+    let mut dates: Vec<String> = Vec::with_capacity(partitions.len());
+    let mut rows: Vec<Vec<f64>> = Vec::with_capacity(partitions.len());
+
+    for partition in &partitions {
+        // Get date from first row
+        let date_val = partition
+            .column(date_col)?
+            .get(0)
+            .map_err(|e| PolarsError::ComputeError(format!("Failed to get date: {}", e).into()))?;
+        let date_str = match date_val {
+            AnyValue::String(s) => s.to_string(),
+            AnyValue::StringOwned(s) => s.to_string(),
+            _ => format!("{:?}", date_val),
+        };
+        dates.push(date_str);
+
+        // Build row with NaN for missing symbols
+        let mut row = vec![f64::NAN; n_symbols];
+
+        let symbols = partition.column(symbol_col)?.str()?;
+        let values = partition.column(value_col)?.cast(&DataType::Float64)?;
+        let values_f64 = values.f64()?;
+
+        for i in 0..partition.height() {
+            if let Some(symbol) = symbols.get(i) {
+                if let Some(&idx) = symbol_to_idx.get(symbol) {
+                    row[idx] = values_f64.get(i).unwrap_or(f64::NAN);
+                }
+            }
+        }
+
+        rows.push(row);
+    }
+
+    Ok((dates, unique_symbols, rows))
+}
+
+/// Run backtest on long format DataFrame using partition_by (no pivot)
+///
+/// This is an alternative to backtest() that avoids pivot by using partition_by.
+/// May be faster for certain data patterns.
+#[pyfunction]
+#[pyo3(signature = (
+    df,
+    date_col="date",
+    symbol_col="symbol",
+    price_col="close",
+    weight_col="weight",
+    resample=None,
+    config=None
+))]
+fn backtest_partitioned(
+    df: PyDataFrame,
+    date_col: &str,
+    symbol_col: &str,
+    price_col: &str,
+    weight_col: &str,
+    resample: Option<&str>,
+    config: Option<PyBacktestConfig>,
+) -> PyResult<PyBacktestResult> {
+    let df = df.0;
+
+    // Validate required columns exist
+    for col_name in [date_col, symbol_col, price_col, weight_col] {
+        if df.column(col_name).is_err() {
+            return Err(PyValueError::new_err(format!(
+                "Missing required column: '{}'", col_name
+            )));
+        }
+    }
+
+    // Build wide format from partitions
+    let (dates, _symbols, prices_2d) = build_wide_from_partitions(&df, date_col, symbol_col, price_col)
+        .map_err(|e| PyValueError::new_err(format!("Failed to build prices: {}", e)))?;
+
+    let (_, _, weights_2d) = build_wide_from_partitions(&df, date_col, symbol_col, weight_col)
+        .map_err(|e| PyValueError::new_err(format!("Failed to build weights: {}", e)))?;
+
+    // Compute rebalance indices
+    let rebalance_indices = compute_rebalance_indices(&dates, resample);
+
+    // Get config
+    let cfg = config.map(|c| c.inner).unwrap_or_default();
+
+    // Run backtest
+    let creturn = run_backtest(&prices_2d, &weights_2d, &rebalance_indices, &cfg);
+
+    Ok(PyBacktestResult {
+        creturn,
+        trades: vec![],
+    })
+}
+
 /// Run backtest with long format input (Stage 4 API)
 ///
 /// This is the main API for backtesting with long format data.
@@ -665,6 +791,7 @@ fn _polars_backtest(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyTradeRecord>()?;
     m.add_class::<PyBacktestResult>()?;
     m.add_function(wrap_pyfunction!(backtest, m)?)?;
+    m.add_function(wrap_pyfunction!(backtest_partitioned, m)?)?;
     m.add_function(wrap_pyfunction!(backtest_signals, m)?)?;
     m.add_function(wrap_pyfunction!(backtest_weights, m)?)?;
     m.add_function(wrap_pyfunction!(backtest_with_trades, m)?)?;
