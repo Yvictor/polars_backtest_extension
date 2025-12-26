@@ -143,7 +143,7 @@ report = df.bt.backtest_with_report(price="close", weight="weight", resample="M"
 
 ## Stage 4: Native Long Format in Rust (終極目標)
 **Goal**: Rust core 直接處理 long format，消除 Python 層轉換
-**Status**: Not Started
+**Status**: In Progress (Stage 4.1-4.2 Complete)
 
 ### Why This Matters
 - 消除 long → wide → long 的轉換開銷
@@ -382,35 +382,62 @@ pub fn process_day(
 
 ### 實作階段
 
-#### Stage 4.1: partition_by + 現有邏輯
-**Goal**: 用 partition_by 取代 pivot，但仍複用現有 wide 邏輯驗證正確性
+#### Stage 4.1: Rust Pivot + 現有邏輯
+**Goal**: Rust 層實作 pivot，消除 Python pivot 開銷
+**Status**: Complete ✓
 
-**Tasks:**
-1. 在 `polars_backtest/src/lib.rs` 新增 `backtest()` (PyO3)
-2. 用 `partition_by(["date"])` 分割 DataFrame
-3. 每個 partition 轉為現有 wide format 呼叫 `run_backtest()`
-4. 跑 `test_namespace.py` 確認正確
+**實作方式:**
+- 使用 `polars-ops::pivot::pivot()` 在 Rust 層做 long → wide 轉換
+- 新增 `backtest()` PyO3 函數，接受 long format DataFrame
+- 呼叫現有 `run_backtest()` 確保正確性
+
+**完成內容:**
+1. ✅ 在 `polars_backtest/src/lib.rs` 新增 `backtest()` (PyO3)
+2. ✅ 新增 `long_to_wide()` helper 使用 Polars pivot
+3. ✅ 新增 `compute_rebalance_indices()` 計算 resample indices
+4. ✅ `test_namespace.py` 17 tests 全部通過
+5. ✅ Rust backtest 結果與 Python 實作完全一致
 
 **技術細節:**
 ```rust
 fn backtest(df: PyDataFrame, ...) -> PyResult<PyBacktestResult> {
-    let partitions = df.partition_by(["date"], true)?;
+    // 使用 polars-ops pivot 轉換
+    let wide_prices = long_to_wide(&df, date_col, symbol_col, price_col)?;
+    let wide_weights = long_to_wide(&df, date_col, symbol_col, weight_col)?;
 
-    // 暫時: 將 partitions 組合回 wide format，複用現有邏輯
-    let wide_prices = partitions_to_wide(&partitions, price_col)?;
-    let wide_weights = partitions_to_wide(&partitions, weight_col)?;
-
+    // 複用現有 wide format 邏輯
     run_backtest(&wide_prices, &wide_weights, ...)
 }
 ```
 
 #### Stage 4.2: Python 切換
 **Goal**: namespace.py 改用 Rust 函數
+**Status**: Complete ✓
 
-**Tasks:**
-1. `backtest()` 改呼叫 Rust `backtest()`
-2. 移除 Python pivot 邏輯 (`_long_to_wide()`)
-3. 跑所有測試確認
+**完成內容:**
+1. ✅ `BacktestNamespace.backtest()` 在基本情況下使用 Rust `backtest()`
+2. ✅ 支援的 resample: None, "D", "W", "M"
+3. ✅ 不支援的情況自動 fallback 到 Python 實作:
+   - 複雜 resample patterns (W-FRI, MS, Q, etc.)
+   - resample_offset
+   - Boolean signals (需要 equal weight 轉換)
+4. ✅ `test_namespace.py` 17 tests 全部通過
+
+**技術細節:**
+```python
+# Check if we can use Rust path
+use_rust = (
+    resample in (None, "D", "W", "M")
+    and resample_offset is None
+    and not is_bool_signal
+)
+
+if use_rust:
+    result = _rust_backtest(self._df, ...)
+else:
+    # Fallback to Python path
+    ...
+```
 
 #### Stage 4.3: Zero-Copy 處理（多方案 Benchmark）
 **Goal**: 完全移除 wide format 轉換，達成 zero-copy

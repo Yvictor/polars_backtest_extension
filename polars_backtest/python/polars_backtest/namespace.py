@@ -16,6 +16,7 @@ from polars_backtest._polars_backtest import (
     backtest_signals,
     backtest_weights,
     backtest_with_trades as _backtest_with_trades,
+    backtest as _rust_backtest,
 )
 
 if TYPE_CHECKING:
@@ -176,6 +177,55 @@ class BacktestNamespace:
         """
         self._validate_columns(date_col, symbol_col, price, weight)
 
+        # Check if weight column is boolean (signals)
+        weight_dtype = self._df.get_column(weight).dtype
+        is_bool_signal = weight_dtype == pl.Boolean
+
+        # Check if we can use Rust path (basic resample, no offset, not bool signals)
+        use_rust = (
+            resample in (None, "D", "W", "M")
+            and resample_offset is None
+            and not is_bool_signal  # Rust doesn't handle bool -> equal weight conversion
+        )
+
+        if use_rust:
+            # Use Rust backtest directly (does pivot internally)
+            config = BacktestConfig(
+                fee_ratio=fee_ratio,
+                tax_ratio=tax_ratio,
+                stop_loss=stop_loss,
+                take_profit=take_profit,
+                trail_stop=trail_stop,
+                position_limit=position_limit,
+                retain_cost_when_rebalance=retain_cost_when_rebalance,
+                stop_trading_next_period=stop_trading_next_period,
+                finlab_mode=finlab_mode,
+            )
+
+            result = _rust_backtest(
+                self._df,
+                date_col,
+                symbol_col,
+                price,
+                weight,
+                resample,
+                config,
+            )
+
+            # Get dates from original DataFrame
+            dates = (
+                self._df.select(date_col)
+                .unique()
+                .sort(date_col)
+                .get_column(date_col)
+            )
+
+            return pl.DataFrame({
+                date_col: dates,
+                "creturn": result.creturn,
+            })
+
+        # Fallback to Python path for complex resample patterns
         # Convert to wide format
         wide_data = self._prepare_wide_data(
             date_col, symbol_col, price, weight

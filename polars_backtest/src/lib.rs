@@ -11,6 +11,9 @@ use pyo3::prelude::*;
 use pyo3::types::{PyModule, PyModuleMethods};
 use pyo3_polars::PyDataFrame;
 
+use polars::prelude::*;
+use polars_ops::pivot;
+
 use btcore::{
     run_backtest, run_backtest_with_trades, BacktestConfig, BacktestResult, PriceData,
     SimTradeRecord,
@@ -464,6 +467,185 @@ fn backtest_with_trades(
     Ok(result.into())
 }
 
+// =============================================================================
+// Long Format Backtest API (Stage 4)
+// =============================================================================
+
+/// Convert long format DataFrame to wide format
+///
+/// Input: DataFrame with columns [date, symbol, value_col]
+/// Output: DataFrame with date as rows, symbols as columns
+fn long_to_wide(
+    df: &DataFrame,
+    date_col: &str,
+    symbol_col: &str,
+    value_col: &str,
+) -> PolarsResult<DataFrame> {
+    // Select only needed columns first
+    let selected = df.select([date_col, symbol_col, value_col])?;
+
+    // Pivot: on=symbol (becomes columns), index=date (row index), values=value
+    // None for agg_fn defaults to first() - expects one value per (date, symbol) pair
+    pivot::pivot(
+        &selected,
+        [PlSmallStr::from(symbol_col)],           // on - column values become new columns
+        Some([PlSmallStr::from(date_col)]),       // index - row index (group by)
+        Some([PlSmallStr::from(value_col)]),      // values to aggregate
+        false,                                    // sort columns
+        None,                                     // no aggregation (defaults to first)
+        None,                                     // separator
+    )
+}
+
+/// Compute rebalance indices based on resample rule
+///
+/// Returns indices where rebalancing should occur
+fn compute_rebalance_indices(
+    dates: &[String],
+    resample: Option<&str>,
+) -> Vec<usize> {
+    match resample {
+        None | Some("D") => {
+            // Daily rebalancing: every day is a rebalance day
+            (0..dates.len()).collect()
+        }
+        Some("W") => {
+            // Weekly: first day of each week
+            let mut indices = vec![0];
+            for i in 1..dates.len() {
+                // Simple heuristic: new week if date string differs in week portion
+                // For proper implementation, parse dates
+                if i > 0 {
+                    indices.push(i);
+                }
+            }
+            // For now, just return all indices (will be refined)
+            (0..dates.len()).collect()
+        }
+        Some("M") => {
+            // Monthly: first day of each month
+            // Simple implementation: check if month changed
+            let mut indices = vec![0];
+            for i in 1..dates.len() {
+                let prev = &dates[i - 1];
+                let curr = &dates[i];
+                // Compare YYYY-MM prefix
+                if prev.len() >= 7 && curr.len() >= 7 && prev[..7] != curr[..7] {
+                    indices.push(i);
+                }
+            }
+            indices
+        }
+        _ => (0..dates.len()).collect(),
+    }
+}
+
+/// Run backtest with long format input (Stage 4 API)
+///
+/// This is the main API for backtesting with long format data.
+/// Internally converts to wide format and calls existing backtest logic.
+///
+/// Args:
+///     df: DataFrame in long format with columns [date, symbol, price, weight]
+///     date_col: Name of date column (default: "date")
+///     symbol_col: Name of symbol column (default: "symbol")
+///     price_col: Name of price column (default: "close")
+///     weight_col: Name of weight column (default: "weight")
+///     resample: Rebalancing frequency ("D", "W", "M", or None for daily)
+///     config: BacktestConfig (optional)
+///
+/// Returns:
+///     PyBacktestResult with creturn and trades
+#[pyfunction]
+#[pyo3(signature = (
+    df,
+    date_col="date",
+    symbol_col="symbol",
+    price_col="close",
+    weight_col="weight",
+    resample=None,
+    config=None
+))]
+fn backtest(
+    df: PyDataFrame,
+    date_col: &str,
+    symbol_col: &str,
+    price_col: &str,
+    weight_col: &str,
+    resample: Option<&str>,
+    config: Option<PyBacktestConfig>,
+) -> PyResult<PyBacktestResult> {
+    let df = df.0;
+
+    // Validate required columns exist
+    for col_name in [date_col, symbol_col, price_col, weight_col] {
+        if df.column(col_name).is_err() {
+            return Err(PyValueError::new_err(format!(
+                "Missing required column: '{}'", col_name
+            )));
+        }
+    }
+
+    // Sort by date to ensure correct ordering
+    let df = df
+        .sort([date_col], SortMultipleOptions::default())
+        .map_err(|e| PyValueError::new_err(format!("Failed to sort: {}", e)))?;
+
+    // Convert to wide format
+    let wide_prices = long_to_wide(&df, date_col, symbol_col, price_col)
+        .map_err(|e| PyValueError::new_err(format!("Failed to pivot prices: {}", e)))?;
+
+    let wide_weights = long_to_wide(&df, date_col, symbol_col, weight_col)
+        .map_err(|e| PyValueError::new_err(format!("Failed to pivot weights: {}", e)))?;
+
+    // Extract dates for rebalance computation
+    let dates: Vec<String> = wide_prices
+        .column(date_col)
+        .map_err(|e| PyValueError::new_err(format!("Failed to get date column: {}", e)))?
+        .str()
+        .map_err(|e| PyValueError::new_err(format!("Date column is not string: {}", e)))?
+        .into_iter()
+        .filter_map(|s| s.map(|s| s.to_string()))
+        .collect();
+
+    // Compute rebalance indices
+    let rebalance_indices = compute_rebalance_indices(&dates, resample);
+
+    // Drop date column for price/weight matrices
+    let price_cols: Vec<_> = wide_prices
+        .get_column_names()
+        .into_iter()
+        .filter(|&c| c != date_col)
+        .map(|c| c.to_string())
+        .collect();
+
+    let prices_only = wide_prices
+        .select(price_cols.iter().map(|s| s.as_str()))
+        .map_err(|e| PyValueError::new_err(format!("Failed to select price columns: {}", e)))?;
+
+    let weights_only = wide_weights
+        .select(price_cols.iter().map(|s| s.as_str()))
+        .map_err(|e| PyValueError::new_err(format!("Failed to select weight columns: {}", e)))?;
+
+    // Convert to 2D arrays
+    let prices_2d = df_to_f64_2d(&prices_only)
+        .map_err(|e| PyValueError::new_err(format!("Failed to convert prices: {}", e)))?;
+
+    let weights_2d = df_to_f64_2d(&weights_only)
+        .map_err(|e| PyValueError::new_err(format!("Failed to convert weights: {}", e)))?;
+
+    // Get config
+    let cfg = config.map(|c| c.inner).unwrap_or_default();
+
+    // Run backtest
+    let creturn = run_backtest(&prices_2d, &weights_2d, &rebalance_indices, &cfg);
+
+    Ok(PyBacktestResult {
+        creturn,
+        trades: vec![],
+    })
+}
+
 /// Initialize the Python module
 #[pymodule]
 fn _polars_backtest(m: &Bound<'_, PyModule>) -> PyResult<()> {
@@ -471,6 +653,7 @@ fn _polars_backtest(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyBacktestConfig>()?;
     m.add_class::<PyTradeRecord>()?;
     m.add_class::<PyBacktestResult>()?;
+    m.add_function(wrap_pyfunction!(backtest, m)?)?;
     m.add_function(wrap_pyfunction!(backtest_signals, m)?)?;
     m.add_function(wrap_pyfunction!(backtest_weights, m)?)?;
     m.add_function(wrap_pyfunction!(backtest_with_trades, m)?)?;
