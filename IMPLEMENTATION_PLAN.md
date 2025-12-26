@@ -150,15 +150,233 @@ report = df.bt.backtest_with_report(price="close", weight="weight", resample="M"
 - 更自然的 Polars-native 資料流
 - 這是整個重構的終極目標
 
-### Tasks
-1. 設計 long format 的 Rust 資料結構
-2. 修改 `btcore` 支援 (date, symbol, price, weight) 格式
-3. 使用 polars-arrow 直接操作 columnar data
-4. 新實作必須通過 `test_vs_finlab.py` 驗證
+---
+
+### API 設計
+
+**API 命名規則:**
+- `backtest()` - 預設 API，接受 long format
+- `backtest_wide()` - wide format API，用於 Finlab 驗證
+
+**使用者 API 不變:**
+```python
+result = df.bt.backtest(price="close", weight="weight")
+result = pl_bt.backtest(df, price="close", weight="weight")
+```
+
+**內部實作變更:**
+```
+現狀:
+  backtest() → Python pivot → backtest_wide() → Rust
+
+Stage 4:
+  backtest() → Rust 直接處理
+```
+
+---
+
+### 測試策略
+
+**核心原則: 透過現有測試驗證正確性**
+
+```
+test_vs_finlab.py: backtest_wide() == Finlab ✓ (Gold Standard)
+test_namespace.py: backtest() 結果正確 ✓
+
+Stage 4 驗證:
+  1. backtest_wide() 不變 → test_vs_finlab.py 繼續通過
+  2. backtest() 內部改用 Rust → test_namespace.py 確認結果一致
+```
+
+**參數組合覆蓋:**
+- `test_namespace.py` 已測試的參數組合要繼續通過
+- 確保覆蓋:
+  - resample: D, W, M, None
+  - fees: 各種費率
+  - stop_loss, take_profit, trail_stop
+  - touched_exit (需 OHLC)
+  - short positions (負權重)
+
+**效能測試:**
+```python
+def test_performance():
+    """Rust 應比 Python pivot 快"""
+    large_df = generate_large_dataset(n_dates=5000, n_symbols=2000)
+    t_before = timeit(lambda: backtest_via_pivot(large_df))
+    t_after = timeit(lambda: backtest_rust_native(large_df))
+    assert t_after < t_before
+```
+
+---
+
+### 架構設計
+
+#### Zero-Copy 設計原則
+
+**現有問題 (有 copy):**
+```rust
+// df_to_f64_2d() 逐 row 存取，每個值都 copy
+for row_idx in 0..n_rows {
+    for col in df.get_columns() {
+        let val = col.get(row_idx);  // O(1) but copies
+        row.push(f64_val);
+    }
+}
+// 結果: Vec<Vec<f64>> - 全部資料都被 copy 了
+```
+
+**Zero-Copy 方式:**
+```rust
+// 直接存取 Arrow buffer 底層 slice
+let prices = df.column("close")?.f64()?;
+let prices_slice: &[f64] = prices.cont_slice()?;  // zero-copy!
+
+let symbols = df.column("symbol")?.str()?;
+// 用 Polars 的 group_by 在 Rust 端處理
+```
+
+**關鍵條件:**
+- `cont_slice()` 需要單一 chunk 且無 null
+- 必要時先 `rechunk()` 整合
+- 回測邏輯改為直接操作 slice/ChunkedArray
+
+#### 新增 Rust PyO3 函數
+
+```rust
+// polars_backtest/src/lib.rs
+use pyo3_polars::PyExpr;
+
+#[pyfunction]
+fn backtest(
+    df: PyDataFrame,
+    date: PyExpr,              // IntoExpr
+    symbol: PyExpr,            // IntoExpr
+    price: PyExpr,             // IntoExpr
+    weight: PyExpr,            // IntoExpr
+    rebalance_rule: Option<&str>,
+    config: Option<PyBacktestConfig>,
+) -> PyResult<PyBacktestResult> {
+    let df = df.0;
+
+    // Zero-copy: 直接取得 column slices
+    let dates = df.column("date")?.date()?;
+    let symbols = df.column("symbol")?.str()?;
+    let prices = df.column("close")?.f64()?.rechunk();
+    let weights = df.column("weight")?.f64()?.rechunk();
+
+    // 用 slice 直接處理，不用 Vec<Vec<f64>>
+    let prices_slice = prices.cont_slice()?;
+    let weights_slice = weights.cont_slice()?;
+
+    // 呼叫新的 long format 回測邏輯
+    run_backtest_columnar(dates, symbols, prices_slice, weights_slice, &config)
+}
+```
+
+#### btcore 新增模組
+
+```rust
+// btcore/src/columnar.rs
+
+/// Columnar 回測 - 直接操作 slice，不轉換格式
+pub fn run_backtest_columnar(
+    dates: &DateChunked,
+    symbols: &StringChunked,
+    prices: &[f64],          // zero-copy slice
+    weights: &[f64],         // zero-copy slice
+    config: &BacktestConfig,
+) -> BacktestResult {
+    // 方案 A: 用 Polars group_by 在 Rust 處理
+    // 方案 B: 建立 symbol → indices 的 mapping，避免 pivot
+}
+```
+
+---
+
+### 實作階段
+
+#### Stage 4.1: Rust 骨架 (Pivot in Rust)
+**Goal**: 建立 Rust 接收 long format 的入口，內部先 pivot
+
+**Tasks:**
+1. 在 `polars_backtest/src/lib.rs` 新增 `backtest()` (PyO3)
+2. 使用 PyExpr 接收欄位表達式
+3. 內部用 Polars Rust API 做 pivot，複用現有 wide 邏輯
+4. 跑 `test_namespace.py` 確認正確
+
+**技術細節:**
+```rust
+// 階段 4.1: 在 Rust 做 pivot
+fn backtest(df: PyDataFrame, ...) -> PyResult<PyBacktestResult> {
+    let df = df.0;
+
+    // Polars Rust pivot (仍有 copy，但在 Rust 層)
+    let wide_prices = df.pivot(...)?;
+    let wide_weights = df.pivot(...)?;
+
+    // 複用現有邏輯
+    run_backtest(&wide_prices_2d, &wide_weights_2d, ...)
+}
+```
+
+#### Stage 4.2: Python 切換
+**Goal**: namespace.py 改用 Rust 函數
+
+**Tasks:**
+1. `backtest()` 改呼叫 Rust `backtest()`
+2. 移除 Python pivot 邏輯 (`_long_to_wide()`)
+3. 跑所有測試確認
+
+#### Stage 4.3: Zero-Copy Columnar 處理
+**Goal**: 重寫 Rust 內部邏輯，zero-copy 直接處理 long format
+
+**Tasks:**
+1. 新增 `btcore/src/columnar.rs`
+2. 實作 `run_backtest_columnar()` 直接操作 slices
+3. 用 `cont_slice()` 達成 zero-copy
+4. 不再 pivot，用 symbol indices mapping 處理
+5. 保持結果與 wide format 完全一致
+
+**技術細節:**
+```rust
+// 階段 4.3: Zero-copy columnar 處理
+fn backtest(df: PyDataFrame, ...) -> PyResult<PyBacktestResult> {
+    let df = df.0.rechunk();  // 確保單一 chunk
+
+    // Zero-copy slice 存取
+    let prices = df.column("close")?.f64()?;
+    let prices_slice = prices.cont_slice()?;  // &[f64]
+
+    // 建立 symbol → row indices mapping
+    let symbol_groups = build_symbol_index_map(&df)?;
+
+    // 直接在 columnar 資料上回測
+    run_backtest_columnar(symbol_groups, prices_slice, weights_slice, config)
+}
+```
+
+---
+
+### 檔案變更
+
+**Rust:**
+- `polars_backtest/src/lib.rs` - 新增 `backtest()` PyO3 函數
+- `btcore/src/columnar.rs` (新) - Zero-copy columnar 回測邏輯
+- `btcore/src/lib.rs` - Export columnar 模組
+- `btcore/Cargo.toml` - 可能需要 polars features (for ChunkedArray types)
+
+**Python:**
+- `polars_backtest/namespace.py` - 改用 Rust 函數
+
+---
 
 ### Success Criteria
-- 所有 `test_vs_finlab.py` 測試通過（對齊現有正確結果）
-- 效能優於現有 Python 轉換方案
+
+1. **正確性**: `test_namespace.py` 全部通過
+2. **相容性**: `test_vs_finlab.py` 繼續通過
+3. **效能**: Rust 處理 < Python pivot + Rust wide
+4. **Zero-Copy**: Stage 4.3 達成 `cont_slice()` zero-copy 存取
+5. **API**: 使用者介面不變
 
 ---
 
@@ -185,12 +403,22 @@ df (long) ──► pivot ──► position (wide) ─┐
 驗證: test_vs_finlab.py ✓ + test_namespace.py ✓
 ```
 
-### 終極目標: Stage 4 (Full Long Format)
+### Stage 4.1-4.2: Rust Pivot
 ```
 Python:                     Rust:
-df (long) ──► Arrow IPC ──► process long format directly ──► result
+df (long) ──► PyDataFrame ──► Polars pivot ──► wide format ──► existing logic ──► result
+                             (copy in Rust)
 
-驗證: 必須通過 test_vs_finlab.py (對齊現有正確結果)
+驗證: test_namespace.py ✓
+```
+
+### Stage 4.3: Zero-Copy Columnar (終極目標)
+```
+Python:                     Rust:
+df (long) ──► PyDataFrame ──► cont_slice() ──► columnar backtest ──► result
+                             (zero-copy!)
+
+驗證: test_namespace.py ✓ + 效能提升
 ```
 
 ---
