@@ -261,10 +261,17 @@ __all__ = [
     "TradeRecord",
     "BacktestResult",
     "Report",
-    "backtest_signals",
-    "backtest_weights",
+    "BacktestNamespace",
+    # Main API (long format)
     "backtest",
     "backtest_with_report",
+    # Wide format API (for finlab compatibility)
+    "backtest_wide",
+    "backtest_with_report_wide",
+    # Low-level functions
+    "backtest_signals",
+    "backtest_weights",
+    # Statistics expressions
     "daily_returns",
     "cumulative_returns",
     "sharpe_ratio",
@@ -273,10 +280,11 @@ __all__ = [
     "drawdown_series",
     "portfolio_return",
     "equal_weights",
-    # Helper functions for testing
+    # Helper functions
     "_parse_resample_freq",
     "_parse_offset",
     "_get_period_end_dates",
+    "_filter_changed_positions",
 ]
 
 # Get the path to the shared library
@@ -669,7 +677,7 @@ def _filter_changed_positions(position: pl.DataFrame) -> pl.DataFrame:
     return result
 
 
-def backtest(
+def backtest_wide(
     prices: pl.DataFrame,
     position: pl.DataFrame,
     resample: str | None = 'D',
@@ -685,7 +693,7 @@ def backtest(
     stop_trading_next_period: bool = True,
     finlab_mode: bool = False,
 ) -> pl.DataFrame:
-    """Run portfolio backtest simulation (T+1 execution, Finlab-compatible).
+    """Run portfolio backtest simulation with wide format data (T+1 execution, Finlab-compatible).
 
     This is the main backtest function that simulates a portfolio over time
     based on position signals or weights. Uses T+1 execution mode to match
@@ -959,7 +967,7 @@ class Report:
         return f"Report(creturn_len={len(self._creturn_list)}, trades_count={len(self._trades_raw)})"
 
 
-def backtest_with_report(
+def backtest_with_report_wide(
     close: pl.DataFrame,
     position: pl.DataFrame,
     resample: str | None = 'D',
@@ -980,7 +988,7 @@ def backtest_with_report(
     stop_trading_next_period: bool = True,
     touched_exit: bool = False,
 ) -> Report:
-    """Run backtest with trades tracking, returning a Report object.
+    """Run backtest with trades tracking on wide format data, returning a Report object.
 
     This function matches Finlab's backtest.sim() interface with full OHLC support.
 
@@ -1310,3 +1318,12 @@ def backtest_with_report(
         tax_ratio=tax_ratio,
         first_signal_index=first_signal_index,
     )
+
+
+# Register DataFrame namespace (df.bt) and import main API functions
+# Import at the end to avoid circular imports
+from polars_backtest.namespace import (
+    BacktestNamespace,
+    backtest,
+    backtest_with_report,
+)

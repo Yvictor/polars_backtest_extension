@@ -26,7 +26,7 @@ finlab.login(os.getenv('FINLAB_API_TOKEN'))
 
 from finlab import backtest as finlab_backtest
 from finlab import data as finlab_data
-from polars_backtest import backtest_with_report
+from polars_backtest import backtest_with_report_wide
 
 
 CRETURN_RTOL = 1e-6
@@ -82,7 +82,7 @@ def run_comparison(adj_close, position, test_name, ohlc=None, **kwargs):
             pl.col("date").cast(pl.Date).cast(pl.Utf8)
         )
 
-    polars_report = backtest_with_report(df_adj, df_pos, **ohlc_kwargs, **kwargs)
+    polars_report = backtest_with_report_wide(df_adj, df_pos, **ohlc_kwargs, **kwargs)
 
     df_finlab = pl.DataFrame({
         "date": [str(d.date()) for d in finlab_report.creturn.index],
