@@ -211,111 +211,196 @@ def test_performance():
 
 ### 架構設計
 
-#### Zero-Copy 設計原則
+#### 是否需要 Pivot？—— 不需要！
+
+**關鍵發現：用 `partition_by` 取代 pivot**
+
+Polars Rust API 提供 `partition_by`：
+```rust
+// 按 date 分割 → 每個 partition 包含該日期所有 symbols
+let partitions: Vec<DataFrame> = df.partition_by(["date"], true)?;
+
+for date_df in partitions {
+    // date_df 包含這一天所有 stocks
+    let symbols = date_df.column("symbol")?.str()?;
+    let prices = date_df.column("close")?.f64()?.cont_slice()?;  // zero-copy!
+    let weights = date_df.column("weight")?.f64()?.cont_slice()?;
+
+    // 處理這一天的所有 stocks
+    process_day(&mut portfolio, symbols, prices, weights, config)?;
+}
+```
+
+**優勢：**
+- 無需 pivot（long format 直接處理）
+- zero-copy（`cont_slice()` 直接存取 Arrow buffer）
+- 保持 time-major 迭代（與現有演算法一致）
+
+#### 架構分層
+
+```
+polars_backtest crate (有 polars 依賴):
+  ┌─────────────────────────────────────────┐
+  │  PyO3 入口: backtest(df, ...)           │
+  │  ↓                                      │
+  │  df.partition_by(["date"])              │
+  │  ↓                                      │
+  │  for date_df in partitions:             │
+  │      prices = date_df["close"].slice()  │  ← zero-copy
+  │      weights = date_df["weight"].slice()│  ← zero-copy
+  │      btcore::process_day(...)           │
+  └─────────────────────────────────────────┘
+
+btcore crate (純 Rust，無 polars 依賴):
+  ┌─────────────────────────────────────────┐
+  │  fn process_day(                        │
+  │      portfolio: &mut Portfolio,         │
+  │      symbols: &[&str],                  │
+  │      prices: &[f64],                    │  ← 接收 slices
+  │      weights: &[f64],                   │
+  │      config: &Config,                   │
+  │  )                                      │
+  └─────────────────────────────────────────┘
+```
+
+#### Zero-Copy 實現
 
 **現有問題 (有 copy):**
 ```rust
 // df_to_f64_2d() 逐 row 存取，每個值都 copy
 for row_idx in 0..n_rows {
     for col in df.get_columns() {
-        let val = col.get(row_idx);  // O(1) but copies
-        row.push(f64_val);
+        row.push(col.get(row_idx));  // copy
     }
 }
-// 結果: Vec<Vec<f64>> - 全部資料都被 copy 了
 ```
 
-**Zero-Copy 方式:**
+**新方式 (zero-copy):**
 ```rust
-// 直接存取 Arrow buffer 底層 slice
-let prices = df.column("close")?.f64()?;
-let prices_slice: &[f64] = prices.cont_slice()?;  // zero-copy!
-
-let symbols = df.column("symbol")?.str()?;
-// 用 Polars 的 group_by 在 Rust 端處理
+// partition_by + cont_slice = zero-copy
+let partitions = df.partition_by(["date"], true)?;
+for date_df in &partitions {
+    let prices = date_df.column("close")?.f64()?.rechunk();
+    let prices_slice = prices.cont_slice()?;  // &[f64], zero-copy!
+    // ...
+}
 ```
 
 **關鍵條件:**
 - `cont_slice()` 需要單一 chunk 且無 null
 - 必要時先 `rechunk()` 整合
-- 回測邏輯改為直接操作 slice/ChunkedArray
+- btcore 保持純 Rust，只接收 slices
 
 #### 新增 Rust PyO3 函數
 
 ```rust
 // polars_backtest/src/lib.rs
-use pyo3_polars::PyExpr;
 
 #[pyfunction]
 fn backtest(
     df: PyDataFrame,
-    date: PyExpr,              // IntoExpr
-    symbol: PyExpr,            // IntoExpr
-    price: PyExpr,             // IntoExpr
-    weight: PyExpr,            // IntoExpr
-    rebalance_rule: Option<&str>,
+    date_col: &str,            // "date"
+    symbol_col: &str,          // "symbol"
+    price_col: &str,           // "close"
+    weight_col: &str,          // "weight"
+    rebalance_dates: Option<Vec<String>>,  // None = 每日 rebalance
     config: Option<PyBacktestConfig>,
 ) -> PyResult<PyBacktestResult> {
     let df = df.0;
+    let cfg = config.map(|c| c.inner).unwrap_or_default();
 
-    // Zero-copy: 直接取得 column slices
-    let dates = df.column("date")?.date()?;
-    let symbols = df.column("symbol")?.str()?;
-    let prices = df.column("close")?.f64()?.rechunk();
-    let weights = df.column("weight")?.f64()?.rechunk();
+    // partition_by date → 每個 partition 是一天的資料
+    let partitions = df
+        .sort([date_col], SortMultipleOptions::default())?
+        .partition_by([date_col], true)?;
 
-    // 用 slice 直接處理，不用 Vec<Vec<f64>>
-    let prices_slice = prices.cont_slice()?;
-    let weights_slice = weights.cont_slice()?;
+    // 建立 symbol → index mapping (for Portfolio tracking)
+    let all_symbols = df.column(symbol_col)?.str()?.unique()?;
+    let symbol_to_idx: HashMap<&str, usize> = all_symbols
+        .into_iter()
+        .flatten()
+        .enumerate()
+        .map(|(i, s)| (s, i))
+        .collect();
 
-    // 呼叫新的 long format 回測邏輯
-    run_backtest_columnar(dates, symbols, prices_slice, weights_slice, &config)
+    let mut portfolio = PortfolioState::new();
+    let mut creturn = Vec::with_capacity(partitions.len());
+
+    for date_df in &partitions {
+        let symbols = date_df.column(symbol_col)?.str()?;
+        let prices = date_df.column(price_col)?.f64()?.rechunk();
+        let weights = date_df.column(weight_col)?.f64()?.rechunk();
+
+        let prices_slice = prices.cont_slice()?;
+        let weights_slice = weights.cont_slice()?;
+
+        // 呼叫 btcore 處理這一天
+        btcore::process_day(
+            &mut portfolio,
+            &symbol_to_idx,
+            symbols,
+            prices_slice,
+            weights_slice,
+            &cfg,
+        );
+
+        creturn.push(portfolio.balance());
+    }
+
+    Ok(PyBacktestResult { creturn, trades: vec![] })
 }
 ```
 
-#### btcore 新增模組
+#### btcore 新增 API
 
 ```rust
-// btcore/src/columnar.rs
+// btcore/src/day_processing.rs (新檔案)
 
-/// Columnar 回測 - 直接操作 slice，不轉換格式
-pub fn run_backtest_columnar(
-    dates: &DateChunked,
-    symbols: &StringChunked,
-    prices: &[f64],          // zero-copy slice
-    weights: &[f64],         // zero-copy slice
+/// 處理單日的回測邏輯
+/// 接收 slices，不依賴 Polars 類型
+pub fn process_day(
+    portfolio: &mut PortfolioState,
+    symbol_to_idx: &HashMap<&str, usize>,
+    symbols: impl Iterator<Item = Option<&str>>,  // 當日所有 symbols
+    prices: &[f64],                               // 當日價格 (與 symbols 對應)
+    weights: &[f64],                              // 當日權重 (與 symbols 對應)
     config: &BacktestConfig,
-) -> BacktestResult {
-    // 方案 A: 用 Polars group_by 在 Rust 處理
-    // 方案 B: 建立 symbol → indices 的 mapping，避免 pivot
+) {
+    // 1. 更新持倉價值
+    // 2. 檢測 stops
+    // 3. 執行 rebalance (如果需要)
+    // 4. 更新 portfolio state
 }
 ```
+
+**優勢:**
+- btcore 不依賴 polars（保持純 Rust）
+- 接收 slices，達成 zero-copy
+- 單日處理邏輯可重用於不同資料來源
 
 ---
 
 ### 實作階段
 
-#### Stage 4.1: Rust 骨架 (Pivot in Rust)
-**Goal**: 建立 Rust 接收 long format 的入口，內部先 pivot
+#### Stage 4.1: partition_by + 現有邏輯
+**Goal**: 用 partition_by 取代 pivot，但仍複用現有 wide 邏輯驗證正確性
 
 **Tasks:**
 1. 在 `polars_backtest/src/lib.rs` 新增 `backtest()` (PyO3)
-2. 使用 PyExpr 接收欄位表達式
-3. 內部用 Polars Rust API 做 pivot，複用現有 wide 邏輯
+2. 用 `partition_by(["date"])` 分割 DataFrame
+3. 每個 partition 轉為現有 wide format 呼叫 `run_backtest()`
 4. 跑 `test_namespace.py` 確認正確
 
 **技術細節:**
 ```rust
-// 階段 4.1: 在 Rust 做 pivot
 fn backtest(df: PyDataFrame, ...) -> PyResult<PyBacktestResult> {
-    let df = df.0;
+    let partitions = df.partition_by(["date"], true)?;
 
-    // Polars Rust pivot (仍有 copy，但在 Rust 層)
-    let wide_prices = df.pivot(...)?;
-    let wide_weights = df.pivot(...)?;
+    // 暫時: 將 partitions 組合回 wide format，複用現有邏輯
+    let wide_prices = partitions_to_wide(&partitions, price_col)?;
+    let wide_weights = partitions_to_wide(&partitions, weight_col)?;
 
-    // 複用現有邏輯
-    run_backtest(&wide_prices_2d, &wide_weights_2d, ...)
+    run_backtest(&wide_prices, &wide_weights, ...)
 }
 ```
 
@@ -327,31 +412,33 @@ fn backtest(df: PyDataFrame, ...) -> PyResult<PyBacktestResult> {
 2. 移除 Python pivot 邏輯 (`_long_to_wide()`)
 3. 跑所有測試確認
 
-#### Stage 4.3: Zero-Copy Columnar 處理
-**Goal**: 重寫 Rust 內部邏輯，zero-copy 直接處理 long format
+#### Stage 4.3: Zero-Copy Day-by-Day 處理
+**Goal**: 完全移除 wide format 轉換，逐日 zero-copy 處理
 
 **Tasks:**
-1. 新增 `btcore/src/columnar.rs`
-2. 實作 `run_backtest_columnar()` 直接操作 slices
+1. 新增 `btcore/src/day_processing.rs`
+2. 實作 `process_day()` 接收 slices
 3. 用 `cont_slice()` 達成 zero-copy
-4. 不再 pivot，用 symbol indices mapping 處理
-5. 保持結果與 wide format 完全一致
+4. 逐日處理，保持 stateful 邏輯
+5. 結果與 wide format 完全一致
 
 **技術細節:**
 ```rust
-// 階段 4.3: Zero-copy columnar 處理
 fn backtest(df: PyDataFrame, ...) -> PyResult<PyBacktestResult> {
-    let df = df.0.rechunk();  // 確保單一 chunk
+    let partitions = df.partition_by(["date"], true)?;
+    let mut portfolio = PortfolioState::new();
 
-    // Zero-copy slice 存取
-    let prices = df.column("close")?.f64()?;
-    let prices_slice = prices.cont_slice()?;  // &[f64]
+    for date_df in &partitions {
+        // zero-copy slice 存取
+        let prices = date_df.column(price_col)?.f64()?.cont_slice()?;
+        let weights = date_df.column(weight_col)?.f64()?.cont_slice()?;
 
-    // 建立 symbol → row indices mapping
-    let symbol_groups = build_symbol_index_map(&df)?;
+        // 逐日處理 (btcore 不依賴 polars)
+        btcore::process_day(&mut portfolio, symbols, prices, weights, config);
+        creturn.push(portfolio.balance());
+    }
 
-    // 直接在 columnar 資料上回測
-    run_backtest_columnar(symbol_groups, prices_slice, weights_slice, config)
+    Ok(PyBacktestResult { creturn, trades: vec![] })
 }
 ```
 
@@ -360,13 +447,13 @@ fn backtest(df: PyDataFrame, ...) -> PyResult<PyBacktestResult> {
 ### 檔案變更
 
 **Rust:**
-- `polars_backtest/src/lib.rs` - 新增 `backtest()` PyO3 函數
-- `btcore/src/columnar.rs` (新) - Zero-copy columnar 回測邏輯
-- `btcore/src/lib.rs` - Export columnar 模組
-- `btcore/Cargo.toml` - 可能需要 polars features (for ChunkedArray types)
+- `polars_backtest/src/lib.rs` - 新增 `backtest()` PyO3 函數（用 partition_by）
+- `btcore/src/day_processing.rs` (新) - 單日處理邏輯，接收 slices
+- `btcore/src/lib.rs` - Export day_processing 模組
+- btcore 不新增 polars 依賴（保持純 Rust）
 
 **Python:**
-- `polars_backtest/namespace.py` - 改用 Rust 函數
+- `polars_backtest/namespace.py` - 改用 Rust `backtest()` 函數
 
 ---
 
