@@ -16,11 +16,15 @@
 //! - Position limit per stock
 //! - Comprehensive statistics calculation
 
+pub mod config;
 pub mod portfolio;
+pub mod position;
 pub mod rebalance;
 pub mod returns;
 pub mod simulation;
 pub mod stats;
+pub mod stops;
+pub mod tracker;
 pub mod trades;
 pub mod weights;
 

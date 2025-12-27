@@ -1,4 +1,4 @@
-//! Core backtest simulation engine
+//! Wide format backtest simulation engine
 //!
 //! This module implements the main backtest simulation loop that matches
 //! Finlab's backtest_core Cython implementation.
@@ -9,504 +9,14 @@
 //! 1. **Boolean signals** - Converted to equal weights (like Finlab with bool positions)
 //! 2. **Float weights** - Custom weights, normalized to sum=1 (like Finlab with float positions)
 
-use std::collections::HashMap;
+// Import from refactored modules
+use crate::config::BacktestConfig;
+use crate::portfolio::PortfolioState;
+use crate::position::Position;
+use crate::stops::{detect_stops, detect_stops_finlab, detect_touched_exit};
+use crate::tracker::{BacktestResult, NoopTracker, RealTracker, TradeTracker};
+use crate::weights::{normalize_weights_finlab, IntoWeights};
 
-/// A single trade record matching Finlab's trades DataFrame structure
-///
-/// Fields use original prices (not adjusted) for entry/exit prices,
-/// matching Finlab's actual trading record format.
-#[derive(Debug, Clone)]
-pub struct TradeRecord {
-    /// Stock ID (column index in price matrix)
-    pub stock_id: usize,
-    /// Actual entry date (row index in price matrix, T+1 after signal)
-    /// None for pending entries that have signal but not yet executed
-    pub entry_index: Option<usize>,
-    /// Actual exit date (row index in price matrix)
-    pub exit_index: Option<usize>,
-    /// Signal date for entry (row index in price matrix)
-    pub entry_sig_index: usize,
-    /// Signal date for exit (row index in price matrix)
-    pub exit_sig_index: Option<usize>,
-    /// Position weight at entry
-    pub position_weight: f64,
-    /// Entry price (ORIGINAL price, not adjusted)
-    pub entry_price: f64,
-    /// Exit price (ORIGINAL price, not adjusted)
-    pub exit_price: Option<f64>,
-    /// Trade return (calculated using original prices with fees)
-    pub trade_return: Option<f64>,
-}
-
-impl TradeRecord {
-    /// Calculate holding period in days
-    pub fn holding_period(&self) -> Option<usize> {
-        match (self.entry_index, self.exit_index) {
-            (Some(entry), Some(exit)) => Some(exit - entry),
-            _ => None,
-        }
-    }
-
-    /// Calculate trade return with fees
-    ///
-    /// Finlab formula:
-    /// trade_return = (1 - fee_ratio) * (exit_price / entry_price) * (1 - tax_ratio - fee_ratio) - 1
-    pub fn calculate_return(&self, fee_ratio: f64, tax_ratio: f64) -> Option<f64> {
-        self.exit_price.map(|exit_price| {
-            (1.0 - fee_ratio) * (exit_price / self.entry_price) * (1.0 - tax_ratio - fee_ratio) - 1.0
-        })
-    }
-}
-
-/// Open position tracking for trades generation
-#[derive(Debug, Clone)]
-struct OpenTrade {
-    /// Stock ID
-    #[allow(dead_code)]
-    stock_id: usize,
-    /// Entry index (actual entry date, T+1)
-    entry_index: usize,
-    /// Signal index (entry signal date)
-    entry_sig_index: usize,
-    /// Position weight
-    weight: f64,
-    /// Entry price (original, not adjusted)
-    entry_price: f64,
-}
-
-/// Result of a backtest simulation including trades
-#[derive(Debug, Clone)]
-pub struct BacktestResult {
-    /// Cumulative returns at each time step
-    pub creturn: Vec<f64>,
-    /// List of completed trades
-    pub trades: Vec<TradeRecord>,
-}
-
-// ============================================================================
-// Trade Tracker Trait - abstracts trade tracking for zero-cost abstraction
-// ============================================================================
-
-/// Trait for tracking trades during simulation
-///
-/// This allows `run_backtest` to use `NoopTracker` (zero overhead)
-/// while `run_backtest_with_trades` uses `RealTracker` (full tracking).
-trait TradeTracker {
-    /// Create a new tracker
-    fn new() -> Self;
-
-    /// Record opening a new trade
-    fn open_trade(
-        &mut self,
-        stock_id: usize,
-        entry_index: usize,
-        signal_index: usize,
-        entry_price: f64,
-        weight: f64,
-    );
-
-    /// Record closing a trade (rebalance or stop)
-    fn close_trade(
-        &mut self,
-        stock_id: usize,
-        exit_index: usize,
-        exit_sig_index: Option<usize>,
-        exit_price: f64,
-        fee_ratio: f64,
-        tax_ratio: f64,
-    );
-
-    /// Check if a trade is open for a stock
-    fn has_open_trade(&self, stock_id: usize) -> bool;
-
-    /// Get entry price for an open trade (needed for return calculation)
-    #[allow(dead_code)]
-    fn get_entry_price(&self, stock_id: usize) -> Option<f64>;
-
-    /// Add a pending entry (signal given but not yet executed)
-    /// Used for trades at the end of simulation where entry would happen on the next day
-    fn add_pending_entry(&mut self, stock_id: usize, signal_index: usize, weight: f64);
-
-    /// Finalize all open trades at the end of simulation
-    fn finalize(
-        self,
-        last_index: usize,
-        trade_prices: &[f64],
-        fee_ratio: f64,
-        tax_ratio: f64,
-    ) -> Vec<TradeRecord>;
-}
-
-/// No-op trade tracker - zero overhead for simple backtest
-struct NoopTracker;
-
-impl TradeTracker for NoopTracker {
-    #[inline]
-    fn new() -> Self {
-        Self
-    }
-
-    #[inline]
-    fn open_trade(&mut self, _: usize, _: usize, _: usize, _: f64, _: f64) {}
-
-    #[inline]
-    fn close_trade(&mut self, _: usize, _: usize, _: Option<usize>, _: f64, _: f64, _: f64) {}
-
-    #[inline]
-    fn has_open_trade(&self, _: usize) -> bool {
-        false
-    }
-
-    #[inline]
-    fn get_entry_price(&self, _: usize) -> Option<f64> {
-        None
-    }
-
-    #[inline]
-    fn add_pending_entry(&mut self, _: usize, _: usize, _: f64) {}
-
-    #[inline]
-    fn finalize(self, _: usize, _: &[f64], _: f64, _: f64) -> Vec<TradeRecord> {
-        vec![]
-    }
-}
-
-/// Real trade tracker - tracks all trades for full reporting
-struct RealTracker {
-    open_trades: HashMap<usize, OpenTrade>,
-    completed_trades: Vec<TradeRecord>,
-}
-
-impl TradeTracker for RealTracker {
-    fn new() -> Self {
-        Self {
-            open_trades: HashMap::new(),
-            completed_trades: Vec::new(),
-        }
-    }
-
-    fn open_trade(
-        &mut self,
-        stock_id: usize,
-        entry_index: usize,
-        signal_index: usize,
-        entry_price: f64,
-        weight: f64,
-    ) {
-        self.open_trades.insert(
-            stock_id,
-            OpenTrade {
-                stock_id,
-                entry_index,
-                entry_sig_index: signal_index,
-                weight,
-                entry_price,
-            },
-        );
-    }
-
-    fn close_trade(
-        &mut self,
-        stock_id: usize,
-        exit_index: usize,
-        exit_sig_index: Option<usize>,
-        exit_price: f64,
-        fee_ratio: f64,
-        tax_ratio: f64,
-    ) {
-        if let Some(open_trade) = self.open_trades.remove(&stock_id) {
-            let trade = TradeRecord {
-                stock_id,
-                entry_index: Some(open_trade.entry_index),
-                exit_index: Some(exit_index),
-                entry_sig_index: open_trade.entry_sig_index,
-                exit_sig_index,
-                position_weight: open_trade.weight,
-                entry_price: open_trade.entry_price,
-                exit_price: Some(exit_price),
-                trade_return: None,
-            };
-            let trade_return = trade.calculate_return(fee_ratio, tax_ratio);
-
-            self.completed_trades.push(TradeRecord {
-                trade_return,
-                ..trade
-            });
-        }
-    }
-
-    fn has_open_trade(&self, stock_id: usize) -> bool {
-        self.open_trades.contains_key(&stock_id)
-    }
-
-    fn get_entry_price(&self, stock_id: usize) -> Option<f64> {
-        self.open_trades.get(&stock_id).map(|t| t.entry_price)
-    }
-
-    fn add_pending_entry(&mut self, stock_id: usize, signal_index: usize, weight: f64) {
-        // Add a pending entry record (Finlab: entry_date=NaT for signals not yet executed)
-        // This is for stocks that have a buy signal on the last day but would execute on the next day
-        self.completed_trades.push(TradeRecord {
-            stock_id,
-            entry_index: None,  // Not yet executed
-            exit_index: None,
-            entry_sig_index: signal_index,
-            exit_sig_index: None,
-            position_weight: weight,
-            entry_price: f64::NAN,  // No entry price yet
-            exit_price: None,
-            trade_return: None,
-        });
-    }
-
-    fn finalize(
-        mut self,
-        _last_index: usize,
-        _trade_prices: &[f64],
-        _fee_ratio: f64,
-        _tax_ratio: f64,
-    ) -> Vec<TradeRecord> {
-        // Report open positions as still open (like Finlab: exit_date=NaT)
-        // Don't close them at the last index
-        for (stock_id, open_trade) in self.open_trades.drain() {
-            self.completed_trades.push(TradeRecord {
-                stock_id,
-                entry_index: Some(open_trade.entry_index),
-                exit_index: None, // Open position - no exit
-                entry_sig_index: open_trade.entry_sig_index,
-                exit_sig_index: None,
-                position_weight: open_trade.weight,
-                entry_price: open_trade.entry_price,
-                exit_price: None, // Open position - no exit price
-                trade_return: None, // Open position - no return calculated
-            });
-        }
-
-        self.completed_trades
-    }
-}
-
-/// Backtest configuration
-#[derive(Debug, Clone)]
-pub struct BacktestConfig {
-    /// Transaction fee ratio (default: 0.001425 for Taiwan stocks)
-    pub fee_ratio: f64,
-    /// Transaction tax ratio (default: 0.003 for Taiwan stocks)
-    pub tax_ratio: f64,
-    /// Stop loss threshold (1.0 = disabled)
-    pub stop_loss: f64,
-    /// Take profit threshold (f64::INFINITY = disabled)
-    pub take_profit: f64,
-    /// Trailing stop threshold (f64::INFINITY = disabled)
-    pub trail_stop: f64,
-    /// Maximum weight per stock (default: 1.0)
-    pub position_limit: f64,
-    /// Retain cost when rebalancing (default: false)
-    pub retain_cost_when_rebalance: bool,
-    /// Stop trading next period after stop loss/take profit (default: true)
-    pub stop_trading_next_period: bool,
-    /// Use Finlab-compatible calculation mode (default: false)
-    ///
-    /// When enabled:
-    /// - Positions track cost_basis + entry_price (not current_value)
-    /// - Balance = cash + Σ(cost_basis * close_price / entry_price)
-    /// - Rebalance uses Σ(cost_basis) as base (not market value)
-    ///
-    /// This mode exactly replicates Finlab's backtest_core.pyx calculation.
-    pub finlab_mode: bool,
-    /// Use touched exit mode (default: false)
-    ///
-    /// When enabled, uses OHLC prices for intraday stop detection.
-    /// Exits happen on the same day when high/low prices touch thresholds,
-    /// rather than T+1 execution.
-    ///
-    /// Finlab behavior (lines 339-393 of backtest_core.pyx):
-    /// - Check open price first (touch_open)
-    /// - Then check high/low for take_profit/stop_loss
-    /// - Exit immediately at touched price (not close price)
-    pub touched_exit: bool,
-}
-
-impl Default for BacktestConfig {
-    fn default() -> Self {
-        Self {
-            fee_ratio: 0.001425,
-            tax_ratio: 0.003,
-            stop_loss: 1.0,              // disabled
-            take_profit: f64::INFINITY,  // disabled
-            trail_stop: f64::INFINITY,   // disabled
-            position_limit: 1.0,
-            retain_cost_when_rebalance: false,
-            stop_trading_next_period: true,
-            finlab_mode: false,          // Use standard calculation by default
-            touched_exit: false,         // Use close-based stop detection by default
-        }
-    }
-}
-
-// Re-export IntoWeights from weights module
-pub use crate::weights::IntoWeights;
-
-use crate::weights::normalize_weights_finlab;
-
-/// Position in a single stock
-#[derive(Debug, Clone)]
-struct Position {
-    /// Current value of the position (as fraction of portfolio)
-    /// In standard mode: updated daily with returns
-    /// In Finlab mode: this is the cost_basis (constant after entry)
-    value: f64,
-    /// Entry price for value calculation in Finlab mode
-    /// In Finlab mode: used to calculate market value = cost_basis * close / entry_price
-    /// This is reset on rebalance when retain_cost_when_rebalance=false
-    entry_price: f64,
-    /// Original entry price for stop loss/take profit calculation
-    /// This is NEVER reset during rebalance - always the original entry price
-    stop_entry_price: f64,
-    /// Maximum price since entry (for trailing stop)
-    max_price: f64,
-    /// Last valid market value (Finlab: pos[sid] updated daily)
-    /// Used when current price is NaN
-    last_market_value: f64,
-    /// Cumulative return ratio for stop detection (Finlab: cr[sid] *= r)
-    /// This uses cumulative multiplication to match Finlab's floating point behavior
-    cr: f64,
-    /// Maximum cumulative return for trail stop (Finlab: maxcr[sid] = max(maxcr[sid], cr[sid]))
-    /// This uses cumulative max to match Finlab's floating point behavior
-    maxcr: f64,
-    /// Previous price for daily return calculation (r = current / previous)
-    previous_price: f64,
-}
-
-/// Portfolio state during simulation
-#[derive(Debug)]
-struct PortfolioState {
-    /// Cash balance (starts at 1.0)
-    cash: f64,
-    /// Map of stock_id -> Position
-    positions: HashMap<usize, Position>,
-}
-
-impl PortfolioState {
-    fn new() -> Self {
-        Self {
-            cash: 1.0,
-            positions: HashMap::new(),
-        }
-    }
-
-    /// Calculate total portfolio value (cash + positions)
-    /// In standard mode: cash + sum(current_value)
-    fn balance(&self) -> f64 {
-        let pos_value: f64 = self.positions.values().map(|p| p.value).sum();
-        self.cash + pos_value
-    }
-
-    /// Calculate portfolio balance in Finlab mode
-    /// Finlab formula: cash + Σ(pos[sid] * close / price)
-    /// But when close == price (both adj_close), this simplifies to cash + Σ(pos[sid])
-    /// We use last_market_value which is updated via cumulative multiplication (pos *= r)
-    /// This matches Finlab's floating point behavior exactly
-    #[allow(dead_code)]
-    fn balance_finlab(&self, prices: &[f64]) -> f64 {
-        // Finlab: balance = cash + Σ(pos[sid])
-        // where pos[sid] is updated daily via pos *= r (cumulative multiplication)
-        // We track this as last_market_value, updated in update_max_prices
-        let pos_value: f64 = self.positions.iter()
-            .map(|(&stock_id, p)| {
-                if stock_id < prices.len() {
-                    let close_price = prices[stock_id];
-                    // If current price is NaN, use last valid market value
-                    if close_price > 0.0 && !close_price.is_nan() {
-                        p.last_market_value
-                    } else {
-                        p.last_market_value
-                    }
-                } else {
-                    p.last_market_value
-                }
-            })
-            .sum();
-        self.cash + pos_value
-    }
-
-    /// Update last_market_value for all positions using cumulative multiplication
-    /// (Finlab: pos[sid] *= r, where r = price / previous_price)
-    /// This matches Finlab's floating point behavior exactly
-    fn update_market_values(&mut self, prices: &[f64]) {
-        for (&stock_id, pos) in self.positions.iter_mut() {
-            if stock_id < prices.len() {
-                let close_price = prices[stock_id];
-                if close_price > 0.0 && !close_price.is_nan() && pos.previous_price > 0.0 {
-                    // Valid price: use cumulative multiplication (Finlab: pos *= r)
-                    let r = close_price / pos.previous_price;
-                    pos.last_market_value *= r;
-                }
-                // If NaN or first day, keep last_market_value unchanged (like Finlab's pos[sid] *= 1)
-            }
-        }
-    }
-
-    /// Calculate portfolio daily return using fixed target weights (Finlab style)
-    /// Finlab uses: portfolio_return = sum(target_weight_i * stock_return_i)
-    /// This is conceptually like daily rebalancing to maintain target weights
-    #[allow(dead_code)]
-    fn daily_return_finlab(
-        &self,
-        current_prices: &[f64],
-        prev_prices: &[f64],
-        target_weights: &[f64],
-    ) -> f64 {
-        let mut total_return = 0.0;
-        let mut total_weight = 0.0;
-
-        for (stock_id, &target_weight) in target_weights.iter().enumerate() {
-            if target_weight == 0.0 {
-                continue;
-            }
-            if stock_id >= current_prices.len() || stock_id >= prev_prices.len() {
-                continue;
-            }
-
-            let curr_price = current_prices[stock_id];
-            let prev_price = prev_prices[stock_id];
-
-            // Skip if either price is invalid or NaN
-            let curr_valid = curr_price > 0.0 && !curr_price.is_nan();
-            let prev_valid = prev_price > 0.0 && !prev_price.is_nan();
-
-            if curr_valid && prev_valid {
-                let stock_return = (curr_price - prev_price) / prev_price;
-                total_return += target_weight * stock_return;
-                total_weight += target_weight;
-            } else {
-                // If price is NaN, this stock contributes 0% return
-                // but we still count its weight
-                total_weight += target_weight;
-            }
-        }
-
-        // If no valid stocks, return 0
-        if total_weight == 0.0 {
-            0.0
-        } else {
-            // Normalize by actual weight (in case some stocks are missing)
-            total_return / total_weight * total_weight.min(1.0)
-        }
-    }
-
-    /// Calculate total cost basis (used for Finlab rebalance calculation)
-    /// Finlab rebalance uses sum(cost_basis), NOT market value
-    fn total_cost_basis(&self) -> f64 {
-        let pos_value: f64 = self.positions.values().map(|p| p.value).sum();
-        self.cash + pos_value
-    }
-}
-
-/// Run backtest simulation (T+1 execution mode, like Finlab)
-///
-/// This is a unified backtest function that accepts both boolean signals and float weights.
-///
 // ============================================================================
 // Unified Simulation Engine
 // ============================================================================
@@ -578,7 +88,7 @@ fn simulate_backtest<T: TradeTracker>(
                 // ===== STEP 1: Update max_prices BEFORE stop detection =====
                 // This must happen before rebalance because rebalance resets cr to 1.0
                 // Finlab order: pos *= r, cr *= r, maxcr update, then touched_exit check
-                update_max_prices(&mut portfolio, &close_prices[t]);
+                portfolio.update_max_prices(&close_prices[t]);
 
                 // ===== TOUCHED_EXIT MODE: Detect and execute intraday stops =====
                 // touched_exit is called AFTER update_max_prices (which updates cr *= r)
@@ -587,7 +97,7 @@ fn simulate_backtest<T: TradeTracker>(
                     if let Some(ref ohlc_data) = ohlc {
                         // Detect touched exits using OHLC prices
                         let touched_exits = detect_touched_exit(
-                            &portfolio,
+                            &portfolio.positions,
                             &ohlc_data.open[t],
                             &ohlc_data.high[t],
                             &ohlc_data.low[t],
@@ -642,14 +152,14 @@ fn simulate_backtest<T: TradeTracker>(
                 // Update previous_prices AFTER touched_exit detection but before T+1 stops
                 // This ensures touched_exit uses the correct prev_price, then we update it
                 // for the next day's calculations.
-                update_previous_prices(&mut portfolio, &close_prices[t]);
+                portfolio.update_previous_prices(&close_prices[t]);
 
                 // Detect stops for T+1 execution (today's detection -> tomorrow's execution)
                 // Skip if touched_exit mode (already processed above)
                 let mut today_stops = if config.touched_exit {
                     Vec::new()
                 } else {
-                    detect_stops_finlab(&portfolio, &close_prices[t], config)
+                    detect_stops_finlab(&portfolio.positions, &close_prices[t], config)
                 };
 
                 // ===== STEP 2: Execute pending stop exits (yesterday's detection) =====
@@ -894,7 +404,7 @@ fn simulate_backtest<T: TradeTracker>(
                 }
 
                 // Detect stops for T+1 execution
-                let new_stops = detect_stops(&portfolio, &close_prices[t], config);
+                let new_stops = detect_stops(&portfolio.positions, &close_prices[t], config);
                 pending_stop_exits.extend(new_stops);
             }
 
@@ -1028,7 +538,7 @@ fn update_position_values(
 fn update_entry_prices_after_nan(
     portfolio: &mut PortfolioState,
     current_prices: &[f64],
-    prev_prices: &[f64],
+    _prev_prices: &[f64],
 ) {
     for (&stock_id, pos) in portfolio.positions.iter_mut() {
         if stock_id >= current_prices.len() {
@@ -1067,55 +577,6 @@ fn update_entry_prices_after_nan(
     }
 }
 
-/// Detect positions that should be closed due to stop conditions (T+1 preparation)
-/// Returns a list of stock IDs that should be closed on the next trading day
-fn detect_stops(
-    portfolio: &PortfolioState,
-    prices: &[f64],
-    config: &BacktestConfig,
-) -> Vec<usize> {
-    portfolio
-        .positions
-        .iter()
-        .filter_map(|(&stock_id, pos)| {
-            if stock_id >= prices.len() {
-                return None;
-            }
-
-            let current_price = prices[stock_id];
-            // Use stop_entry_price for stop loss calculation (original entry, never reset)
-            let stop_entry = pos.stop_entry_price;
-
-            if stop_entry <= 0.0 {
-                return None;
-            }
-
-            let return_since_entry = (current_price - stop_entry) / stop_entry;
-
-            // Check stop loss
-            if config.stop_loss < 1.0 && return_since_entry <= -config.stop_loss {
-                return Some(stock_id);
-            }
-
-            // Check take profit
-            if config.take_profit < f64::INFINITY && return_since_entry >= config.take_profit {
-                return Some(stock_id);
-            }
-
-            // Check trailing stop
-            // Finlab formula: triggers when (max_price - current_price) / entry_price >= trail_stop
-            if config.trail_stop < f64::INFINITY {
-                let drawdown_from_entry = (pos.max_price - current_price) / stop_entry;
-                if drawdown_from_entry >= config.trail_stop {
-                    return Some(stock_id);
-                }
-            }
-
-            None
-        })
-        .collect()
-}
-
 /// Execute pending stop exits (T+1 execution)
 /// Closes positions that were marked for exit on the previous day
 #[allow(dead_code)]
@@ -1145,7 +606,7 @@ fn check_stops(
     stopped_stocks: &mut [bool],
     config: &BacktestConfig,
 ) {
-    let positions_to_close = detect_stops(portfolio, prices, config);
+    let positions_to_close = detect_stops(&portfolio.positions, prices, config);
 
     for stock_id in positions_to_close {
         if let Some(pos) = portfolio.positions.remove(&stock_id) {
@@ -1157,299 +618,6 @@ fn check_stops(
             }
         }
     }
-}
-
-/// Detect positions that should be closed due to stop conditions in Finlab mode (T+1 preparation)
-///
-/// Uses Finlab's cr/maxcr formula for stop detection:
-/// - cr is updated daily via cumulative multiplication: cr *= r (where r = today/yesterday)
-///   This matches Finlab's floating point behavior exactly (line 319 of restored_backtest_core.pyx)
-/// - maxcr = max cumulative return ratio
-///
-/// For long positions (entry_pos > 0):
-/// - max_r = 1 + take_profit
-/// - min_r = max(1 - stop_loss, maxcr - trail_stop)
-/// - Trigger: cr >= max_r (take profit) or cr < min_r (stop loss/trail)
-///
-/// For short positions (entry_pos < 0):
-/// - max_r = min(1 + stop_loss, maxcr + trail_stop)
-/// - min_r = 1 - take_profit
-/// - Trigger: cr >= max_r (stop loss/trail) or cr < min_r (take profit)
-fn detect_stops_finlab(
-    portfolio: &PortfolioState,
-    prices: &[f64],
-    config: &BacktestConfig,
-) -> Vec<usize> {
-    portfolio
-        .positions
-        .iter()
-        .filter_map(|(&stock_id, pos)| {
-            if stock_id >= prices.len() {
-                return None;
-            }
-
-            let current_price = prices[stock_id];
-            let stop_entry = pos.stop_entry_price;
-
-            if stop_entry <= 0.0 || current_price.is_nan() || current_price <= 0.0 {
-                return None;
-            }
-
-            // Use cumulative cr from Position (Finlab: cr *= r)
-            // Note: cr is updated by update_max_prices() before this function is called
-            let cr = pos.cr;
-
-            // Finlab uses cr_at_close = cr * close / price for stop detection (line 387)
-            // Even when close == price (both adj_close), the multiply-divide operation
-            // affects floating point precision, which matters at exact threshold boundaries.
-            // Example: cr = 0.9499999999999998 < 0.95, but cr * p / p = 0.95 exactly!
-            let cr_at_close = cr * current_price / current_price;
-
-            // Use cumulative maxcr from Position (Finlab: maxcr[sid] = max(maxcr[sid], cr[sid]))
-            // Note: maxcr is updated by update_max_prices() before this function is called
-            let maxcr = pos.maxcr;
-
-            // Determine if position is long or short
-            // Finlab: entry_pos = pos[sid] / cr[sid]
-            // Since cr is always positive, the sign depends on pos[sid] (last_market_value)
-            let is_long = pos.last_market_value >= 0.0;
-
-            // Finlab stop conditions (lines 326-393 of restored_backtest_core.pyx):
-            if is_long {
-                // Long positions:
-                //   max_r = 1 + take_profit
-                //   min_r = max(1 - stop_loss, maxcr - trail_stop)
-                // Trigger: cr_at_close >= max_r (take profit) or cr_at_close < min_r (stop loss/trail)
-
-                // Check take profit: cr_at_close >= 1 + take_profit
-                if config.take_profit < f64::INFINITY && cr_at_close >= 1.0 + config.take_profit {
-                    return Some(stock_id);
-                }
-
-                // Calculate min_r using Finlab formula
-                let stop_threshold = 1.0 - config.stop_loss;
-                let trail_threshold = if config.trail_stop < f64::INFINITY {
-                    maxcr - config.trail_stop
-                } else {
-                    f64::NEG_INFINITY
-                };
-                let min_r = stop_threshold.max(trail_threshold);
-
-                // Check stop loss / trail stop: cr_at_close < min_r (Finlab uses < not <=)
-                if cr_at_close < min_r {
-                    return Some(stock_id);
-                }
-            } else {
-                // Short positions:
-                //   max_r = min(1 + stop_loss, maxcr + trail_stop)
-                //   min_r = 1 - take_profit
-                // Trigger: cr_at_close >= max_r (stop loss/trail) or cr_at_close < min_r (take profit)
-
-                // Calculate max_r for short positions
-                let stop_threshold = 1.0 + config.stop_loss;
-                let trail_threshold = if config.trail_stop < f64::INFINITY {
-                    maxcr + config.trail_stop
-                } else {
-                    f64::INFINITY
-                };
-                let max_r = stop_threshold.min(trail_threshold);
-
-                // Check stop loss / trail stop: cr_at_close >= max_r
-                if cr_at_close >= max_r {
-                    return Some(stock_id);
-                }
-
-                // Check take profit: cr_at_close < 1 - take_profit
-                let min_r = 1.0 - config.take_profit;
-                if config.take_profit < f64::INFINITY && cr_at_close < min_r {
-                    return Some(stock_id);
-                }
-            }
-
-            None
-        })
-        .collect()
-}
-
-/// Result of touched exit detection
-///
-/// Contains information needed to execute the exit at the touched price.
-#[derive(Debug, Clone)]
-struct TouchedExitResult {
-    /// Stock ID
-    stock_id: usize,
-    /// Ratio to multiply position by to get exit value
-    /// This adjusts position to the touched price level
-    exit_ratio: f64,
-    /// Whether this is a take profit (true) or stop loss (false)
-    is_take_profit: bool,
-}
-
-/// Detect intraday stop exits using OHLC prices (touched_exit mode)
-///
-/// Finlab's touched_exit logic (lines 339-393 of backtest_core.pyx):
-/// 1. Calculate open_r, high_r, low_r (cumulative return ratios at each price)
-/// 2. Check if any price touches the stop/take profit thresholds
-/// 3. Priority: open > high > low
-/// 4. Adjust position to touched price and exit immediately
-///
-/// IMPORTANT: This function should be called AFTER update_max_prices
-/// (which updates cr *= r). We need to pass close_prices to calculate r
-/// and then derive cr_old = cr / r.
-///
-/// This differs from `detect_stops_finlab` in that:
-/// - Uses OHLC prices instead of just close price
-/// - Exits happen on the same day (T+0), not T+1
-/// - Position value is adjusted to the touched price
-fn detect_touched_exit(
-    portfolio: &PortfolioState,
-    open_prices: &[f64],
-    high_prices: &[f64],
-    low_prices: &[f64],
-    close_prices: &[f64],
-    _prev_prices: &[f64], // Kept for API compatibility but we use pos.previous_price
-    config: &BacktestConfig,
-) -> Vec<TouchedExitResult> {
-    portfolio
-        .positions
-        .iter()
-        .filter_map(|(&stock_id, pos)| {
-            if stock_id >= open_prices.len()
-                || stock_id >= high_prices.len()
-                || stock_id >= low_prices.len()
-                || stock_id >= close_prices.len()
-            {
-                return None;
-            }
-
-            let open_price = open_prices[stock_id];
-            let high_price = high_prices[stock_id];
-            let low_price = low_prices[stock_id];
-            let close_price = close_prices[stock_id];
-
-            // Use pos.previous_price which tracks the last valid price for this position.
-            // This handles NaN days correctly (previous_price only updates on valid days).
-            let prev_price = pos.previous_price;
-
-            // Skip if any OHLC price is invalid or prev_price is not set
-            if open_price.is_nan()
-                || high_price.is_nan()
-                || low_price.is_nan()
-                || close_price.is_nan()
-                || close_price <= 0.0
-                || prev_price <= 0.0
-            {
-                return None;
-            }
-
-            // Get cr from position (already updated by update_max_prices: cr *= r)
-            let cr_new = pos.cr;
-            let maxcr = pos.maxcr;
-
-            // Skip if cr is invalid (shouldn't happen but safety check)
-            if cr_new.is_nan() || cr_new <= 0.0 {
-                return None;
-            }
-
-            // Calculate r = close / prev_price (same as Finlab line 305)
-            let r = close_price / prev_price;
-
-            // Finlab calculates these AFTER cr *= r (lines 342-344):
-            // high_r = cr[sid] / r * (high / prev)
-            // low_r = cr[sid] / r * (low / prev)
-            // open_r = cr[sid] / r * (open / prev)
-            //
-            // We compute in the EXACT same order as Finlab (single expression)
-            // to ensure identical floating point behavior.
-            let open_r = cr_new / r * (open_price / prev_price);
-            let high_r = cr_new / r * (high_price / prev_price);
-            let low_r = cr_new / r * (low_price / prev_price);
-
-            // Determine position direction
-            // Finlab line 326: entry_pos = pos[sid] / cr[sid], if entry_pos > 0: long
-            // Since cr is always positive, we just check pos sign
-            let is_long = pos.last_market_value > 0.0;
-
-            // Calculate thresholds (same as detect_stops_finlab)
-            // Note: Use maxcr which was updated in update_max_prices
-            let (max_r, min_r) = if is_long {
-                // Long: max_r = 1 + take_profit, min_r = max(1 - stop_loss, maxcr - trail_stop)
-                let max_r = 1.0 + config.take_profit;
-                let stop_threshold = 1.0 - config.stop_loss;
-                let trail_threshold = if config.trail_stop < f64::INFINITY {
-                    maxcr - config.trail_stop
-                } else {
-                    f64::NEG_INFINITY
-                };
-                let min_r = stop_threshold.max(trail_threshold);
-                (max_r, min_r)
-            } else {
-                // Short: max_r = min(1 + stop_loss, maxcr + trail_stop), min_r = 1 - take_profit
-                let stop_threshold = 1.0 + config.stop_loss;
-                let trail_threshold = if config.trail_stop < f64::INFINITY {
-                    maxcr + config.trail_stop
-                } else {
-                    f64::INFINITY
-                };
-                let max_r = stop_threshold.min(trail_threshold);
-                let min_r = 1.0 - config.take_profit;
-                (max_r, min_r)
-            };
-
-            // Check touch conditions (Finlab lines 348-350)
-            let touch_open = open_r >= max_r || open_r <= min_r;
-            let touch_high = high_r >= max_r;
-            let touch_low = low_r <= min_r;
-
-            // Determine exit ratio
-            // Finlab adjusts pos to touched price:
-            // - touch_open: pos *= open_r / r  =>  pos_final = pos_before_r_update * open_r
-            // - touch_high: pos = entry_pos * max_r  =>  entry_pos = pos / cr, so pos_final = pos * max_r / cr
-            // - touch_low: pos = entry_pos * min_r  =>  pos_final = pos * min_r / cr
-            //
-            // After pos *= r, pos = pos_old * r = entry_pos * cr_old * r = entry_pos * cr_new
-            // So exit_ratio relative to current pos (after r update):
-            // - touch_open: exit_ratio = open_r / r
-            // - touch_high: exit_ratio = max_r / cr_new
-            // - touch_low: exit_ratio = min_r / cr_new
-            //
-            // Priority: open > high > low (Finlab lines 354-359)
-            if touch_open {
-                // Finlab: pos[sid] *= open_r / r
-                let exit_ratio = open_r / r;
-                let is_take_profit = if is_long {
-                    open_r >= max_r
-                } else {
-                    open_r <= min_r
-                };
-                Some(TouchedExitResult {
-                    stock_id,
-                    exit_ratio,
-                    is_take_profit,
-                })
-            } else if touch_high {
-                // Finlab: pos[sid] = entry_pos * max_r = pos / cr * max_r
-                let exit_ratio = max_r / cr_new;
-                let is_take_profit = is_long; // high touch is TP for long, SL for short
-                Some(TouchedExitResult {
-                    stock_id,
-                    exit_ratio,
-                    is_take_profit,
-                })
-            } else if touch_low {
-                // Finlab: pos[sid] = entry_pos * min_r = pos / cr * min_r
-                let exit_ratio = min_r / cr_new;
-                let is_take_profit = !is_long; // low touch is SL for long, TP for short
-                Some(TouchedExitResult {
-                    stock_id,
-                    exit_ratio,
-                    is_take_profit,
-                })
-            } else {
-                None
-            }
-        })
-        .collect()
 }
 
 /// Execute pending stop exits in Finlab mode (T+1 execution)
@@ -1487,65 +655,6 @@ fn execute_pending_stops_finlab(
     }
 }
 
-/// Update max_price and cr for stop tracking
-///
-/// This function updates:
-/// - max_price: for trailing stop detection
-/// - cr: cumulative return ratio using Finlab's multiplication method (cr *= r)
-/// - previous_price: for next day's r calculation
-///
-/// Finlab's cr calculation (line 319 of restored_backtest_core.pyx):
-/// ```python
-/// r = price_values[d, sidprice] / previous_price[sidprice]
-/// cr[sid] *= r
-/// ```
-/// Update cr, last_market_value, and maxcr for all positions.
-/// Does NOT update previous_price - call update_previous_prices separately.
-fn update_max_prices(portfolio: &mut PortfolioState, prices: &[f64]) {
-    for (&stock_id, pos) in portfolio.positions.iter_mut() {
-        if stock_id < prices.len() {
-            let current_price = prices[stock_id];
-
-            // Skip if price is invalid
-            if current_price.is_nan() || current_price <= 0.0 {
-                continue;
-            }
-
-            // Update max_price for trailing stop
-            if current_price > pos.max_price {
-                pos.max_price = current_price;
-            }
-
-            // Update cr, last_market_value using Finlab's cumulative multiplication
-            // Finlab line 304-320: r = price / previous_price; pos *= r; cr *= r; maxcr = max(maxcr, cr)
-            if pos.previous_price > 0.0 {
-                let r = current_price / pos.previous_price;
-                pos.cr *= r;
-                pos.last_market_value *= r;  // Finlab: pos[sid] *= r
-            }
-
-            // Update maxcr using Finlab's cumulative max
-            // maxcr = max(maxcr, cr)  (lines 319-320 of restored_backtest_core.pyx)
-            pos.maxcr = pos.maxcr.max(pos.cr);
-
-            // NOTE: previous_price is NOT updated here.
-            // Call update_previous_prices after detect_touched_exit.
-        }
-    }
-}
-
-/// Update previous_price for all positions after touched_exit detection.
-fn update_previous_prices(portfolio: &mut PortfolioState, prices: &[f64]) {
-    for (&stock_id, pos) in portfolio.positions.iter_mut() {
-        if stock_id < prices.len() {
-            let current_price = prices[stock_id];
-            if !current_price.is_nan() && current_price > 0.0 {
-                pos.previous_price = current_price;
-            }
-        }
-    }
-}
-
 /// Check stop loss / take profit for Finlab mode (DEPRECATED - use detect/execute for T+1)
 #[allow(dead_code)]
 fn check_stops_finlab(
@@ -1554,7 +663,7 @@ fn check_stops_finlab(
     stopped_stocks: &mut [bool],
     config: &BacktestConfig,
 ) {
-    let positions_to_close = detect_stops_finlab(portfolio, prices, config);
+    let positions_to_close = detect_stops_finlab(&portfolio.positions, prices, config);
 
     for stock_id in positions_to_close {
         if let Some(pos) = portfolio.positions.remove(&stock_id) {
@@ -1567,7 +676,7 @@ fn check_stops_finlab(
         }
     }
 
-    update_max_prices(portfolio, prices);
+    portfolio.update_max_prices(prices);
 }
 
 /// Execute rebalance in Finlab mode
