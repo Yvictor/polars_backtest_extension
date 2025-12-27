@@ -5,8 +5,8 @@
 //!
 //! # Module Structure
 //!
-//! - `wide`: Wide format simulation (current implementation)
-//! - Future: `long`: Long format simulation (Stage 6)
+//! - `wide`: Wide format simulation (2D array input)
+//! - `long`: Long format simulation (sorted 1D arrays, avoids pivot overhead)
 //!
 //! # Weight Modes
 //!
@@ -14,10 +14,14 @@
 //! 1. **Boolean signals** - Converted to equal weights (like Finlab with bool positions)
 //! 2. **Float weights** - Custom weights, normalized to sum=1 (like Finlab with float positions)
 
+mod long;
 mod wide;
 
 // Re-export public API from wide module
 pub use wide::{run_backtest, run_backtest_with_trades, PriceData};
+
+// Re-export public API from long module
+pub use long::{backtest_long, LongFormatInput};
 
 // Re-export from other modules for convenience
 pub use crate::config::BacktestConfig;

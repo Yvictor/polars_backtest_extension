@@ -163,13 +163,13 @@ btcore/src/
 
 ---
 
-### Stage 6: 實現 Long Format 回測 (核心目標)
+### Stage 6: 實現 Long Format 回測 (核心目標) ✅ COMPLETED
 
 **目標**：新增 long format 直接回測，避免 pivot/partition_by
 
 **任務**：
-- [ ] 6.1 創建 `simulation/long.rs`
-- [ ] 6.2 定義 Long Format 輸入結構：
+- [x] 6.1 創建 `simulation/long.rs`
+- [x] 6.2 定義 Long Format 輸入結構：
   ```rust
   pub struct LongFormatInput<'a> {
       pub date_indices: &'a [u32],   // 已按 date 排序
@@ -178,21 +178,29 @@ btcore/src/
       pub weights: &'a [f64],
   }
   ```
-- [ ] 6.3 實現單次掃描回測核心：
+- [x] 6.3 實現單次掃描回測核心：
   ```rust
   pub fn backtest_long(
       input: &LongFormatInput,
+      n_dates: usize,
+      n_symbols: usize,
       rebalance_mask: &[bool],
       config: &BacktestConfig,
-  ) -> Vec<f64>
+  ) -> BacktestResult
   ```
-- [ ] 6.4 復用 Stage 1-4 抽取的模組（Position, stops, portfolio）
-- [ ] 6.5 添加單元測試
-- [ ] 6.6 添加 vs wide format 的一致性測試
+- [x] 6.4 復用 Stage 1-4 抽取的模組（Position, stops, portfolio）
+- [x] 6.5 添加單元測試（5 個 long format 測試）
+- [x] 6.6 添加 vs wide format 的一致性測試（4 個測試）
 
 **成功標準**：
-- Long format 結果與 wide format 一致（誤差 < 1e-10）
-- 效能提升 > 30%（避免 pivot 開銷）
+- ✅ Long format 結果與 wide format 一致（誤差 < 1e-10）
+- 效能提升待 Stage 7 Python 綁定後測量
+
+**實際改動**：
+- 新增 `simulation/long.rs` (643 行，含測試)
+- 更新 `simulation/mod.rs` 導出 long module
+- 新增 4 個整合測試 (test_long_vs_wide_*)
+- 總測試：88 單元 + 23 整合 = 111 通過
 
 ---
 
