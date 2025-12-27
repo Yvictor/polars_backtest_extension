@@ -145,6 +145,38 @@ report = df.bt.backtest_with_report(price="close", weight="weight", resample="M"
 **Goal**: Rust core 直接處理 long format，消除 Python 層轉換
 **Status**: Complete ✓ (Stage 4.1-4.3 All Done)
 
+### 最新結果 (2025-12-27)
+
+**修正內容:**
+1. ✅ 使用 `partition_by_stable` 確保日期排序（原 `partition_by` 不保證順序）
+2. ✅ 新增 `build_wide_from_partitions_dual` 單次處理 prices 和 weights
+3. ✅ 修正 monthly rebalance 為月末偵測（原為月初）
+4. ✅ 修正 weights matrix 大小問題（只取 rebalance 日的 weights）
+5. ✅ Boolean signals 支援 Rust path（cast 為 Float64）
+6. ✅ 修正 creturn 前導 1.0 問題（從 creturn 變化點切片）
+
+**正確性驗證:**
+- Long format vs Wide format 結果差異: 1.4e-14（機器精度）
+- `test_long_format.py` 通過
+- `test_namespace.py` 17 tests 通過
+- `test_vs_finlab.py` 37 tests 通過
+
+**效能比較 (真實資料 ~10M rows):**
+| 方法 | 時間 | 備註 |
+|------|------|------|
+| Wide format (baseline) | ~0.77s | `backtest_with_report_wide` |
+| Long format (partition_by) | ~1.75s | `pl_bt.backtest` |
+| Long format (pivot) | ~6.8s | 已放棄 |
+
+**現有瓶頸:**
+- `build_wide_from_partitions_dual` 約 1.5s（Long → Wide 轉換）
+- Wide format 仍快 2.3x 左右
+
+**未來優化方向:**
+- 考慮完全避免 Wide format 轉換
+- 利用 Polars native operations (group_by + agg)
+- 或實作 memory view 方式處理 Long format
+
 ### Why This Matters
 - 消除 long → wide → long 的轉換開銷
 - 更自然的 Polars-native 資料流

@@ -534,15 +534,20 @@ fn compute_rebalance_indices(
             (0..dates.len()).collect()
         }
         Some("M") => {
-            // Monthly: first day of each month
-            // Simple implementation: check if month changed
-            let mut indices = vec![0];
-            for i in 1..dates.len() {
-                let prev = &dates[i - 1];
-                let curr = &dates[i];
-                // Compare YYYY-MM prefix
-                if prev.len() >= 7 && curr.len() >= 7 && prev[..7] != curr[..7] {
+            // Monthly: last day of each month (like Finlab's resample)
+            // Rebalance happens on the last trading day before month changes
+            let mut indices = Vec::new();
+            for i in 0..dates.len() {
+                if i == dates.len() - 1 {
+                    // Last day is always a rebalance day
                     indices.push(i);
+                } else {
+                    let curr = &dates[i];
+                    let next = &dates[i + 1];
+                    // Compare YYYY-MM prefix: if next month differs, current is month-end
+                    if curr.len() >= 7 && next.len() >= 7 && curr[..7] != next[..7] {
+                        indices.push(i);
+                    }
                 }
             }
             indices
@@ -563,13 +568,14 @@ fn build_wide_from_partitions(
 ) -> PolarsResult<(Vec<String>, Vec<String>, Vec<Vec<f64>>)> {
     use std::collections::HashMap;
 
-    // Get unique symbols for column ordering
+    // Get unique symbols for column ordering (MUST be sorted for consistency!)
     let symbols_series = df.column(symbol_col)?.str()?;
-    let unique_symbols: Vec<String> = symbols_series
+    let mut unique_symbols: Vec<String> = symbols_series
         .unique()?
         .into_iter()
         .filter_map(|s| s.map(|s| s.to_string()))
         .collect();
+    unique_symbols.sort();  // Critical: ensure consistent order across prices and weights
 
     // Build symbol → index mapping
     let symbol_to_idx: HashMap<&str, usize> = unique_symbols
@@ -580,9 +586,9 @@ fn build_wide_from_partitions(
 
     let n_symbols = unique_symbols.len();
 
-    // Sort by date and partition
+    // Sort by date and use partition_by_stable to maintain order
     let df_sorted = df.sort([date_col], SortMultipleOptions::default())?;
-    let partitions = df_sorted.partition_by([date_col], true)?;
+    let partitions = df_sorted.partition_by_stable([date_col], true)?;
 
     let mut dates: Vec<String> = Vec::with_capacity(partitions.len());
     let mut rows: Vec<Vec<f64>> = Vec::with_capacity(partitions.len());
@@ -621,7 +627,85 @@ fn build_wide_from_partitions(
     Ok((dates, unique_symbols, rows))
 }
 
-/// Run backtest on long format DataFrame using partition_by (no pivot)
+/// Build TWO wide format matrices from partitions in a single pass
+///
+/// This is more efficient than calling build_wide_from_partitions twice
+/// because we only sort and partition once.
+fn build_wide_from_partitions_dual(
+    df: &DataFrame,
+    date_col: &str,
+    symbol_col: &str,
+    value_col1: &str,
+    value_col2: &str,
+) -> PolarsResult<(Vec<String>, Vec<String>, Vec<Vec<f64>>, Vec<Vec<f64>>)> {
+    use std::collections::HashMap;
+
+    // Get unique symbols for column ordering (MUST be sorted for consistency!)
+    let symbols_series = df.column(symbol_col)?.str()?;
+    let mut unique_symbols: Vec<String> = symbols_series
+        .unique()?
+        .into_iter()
+        .filter_map(|s| s.map(|s| s.to_string()))
+        .collect();
+    unique_symbols.sort();
+
+    // Build symbol → index mapping
+    let symbol_to_idx: HashMap<&str, usize> = unique_symbols
+        .iter()
+        .enumerate()
+        .map(|(i, s)| (s.as_str(), i))
+        .collect();
+
+    let n_symbols = unique_symbols.len();
+
+    // Sort by date and partition ONCE
+    let df_sorted = df.sort([date_col], SortMultipleOptions::default())?;
+    let partitions = df_sorted.partition_by_stable([date_col], true)?;
+
+    let mut dates: Vec<String> = Vec::with_capacity(partitions.len());
+    let mut rows1: Vec<Vec<f64>> = Vec::with_capacity(partitions.len());
+    let mut rows2: Vec<Vec<f64>> = Vec::with_capacity(partitions.len());
+
+    for partition in &partitions {
+        // Get date from first row
+        let date_val = partition
+            .column(date_col)?
+            .get(0)
+            .map_err(|e| PolarsError::ComputeError(format!("Failed to get date: {}", e).into()))?;
+        let date_str = match date_val {
+            AnyValue::String(s) => s.to_string(),
+            AnyValue::StringOwned(s) => s.to_string(),
+            _ => format!("{:?}", date_val),
+        };
+        dates.push(date_str);
+
+        // Build rows with NaN for missing symbols
+        let mut row1 = vec![f64::NAN; n_symbols];
+        let mut row2 = vec![f64::NAN; n_symbols];
+
+        let symbols = partition.column(symbol_col)?.str()?;
+        let values1 = partition.column(value_col1)?.cast(&DataType::Float64)?;
+        let values1_f64 = values1.f64()?;
+        let values2 = partition.column(value_col2)?.cast(&DataType::Float64)?;
+        let values2_f64 = values2.f64()?;
+
+        for i in 0..partition.height() {
+            if let Some(symbol) = symbols.get(i) {
+                if let Some(&idx) = symbol_to_idx.get(symbol) {
+                    row1[idx] = values1_f64.get(i).unwrap_or(f64::NAN);
+                    row2[idx] = values2_f64.get(i).unwrap_or(f64::NAN);
+                }
+            }
+        }
+
+        rows1.push(row1);
+        rows2.push(row2);
+    }
+
+    Ok((dates, unique_symbols, rows1, rows2))
+}
+
+/// Run backtest on long format DataFrame using partition_by
 ///
 /// This is an alternative to backtest() that avoids pivot by using partition_by.
 /// May be faster for certain data patterns.
@@ -655,21 +739,25 @@ fn backtest_partitioned(
         }
     }
 
-    // Build wide format from partitions
-    let (dates, _symbols, prices_2d) = build_wide_from_partitions(&df, date_col, symbol_col, price_col)
-        .map_err(|e| PyValueError::new_err(format!("Failed to build prices: {}", e)))?;
-
-    let (_, _, weights_2d) = build_wide_from_partitions(&df, date_col, symbol_col, weight_col)
-        .map_err(|e| PyValueError::new_err(format!("Failed to build weights: {}", e)))?;
+    // Build wide format from partitions (prices and weights in one pass)
+    let (dates, _symbols, prices_2d, weights_2d) = build_wide_from_partitions_dual(
+        &df, date_col, symbol_col, price_col, weight_col
+    ).map_err(|e| PyValueError::new_err(format!("Failed to build wide format: {}", e)))?;
 
     // Compute rebalance indices
     let rebalance_indices = compute_rebalance_indices(&dates, resample);
+
+    // Extract only rebalance-day weights (run_backtest expects weights.len() == rebalance_indices.len())
+    let rebalance_weights: Vec<Vec<f64>> = rebalance_indices
+        .iter()
+        .map(|&idx| weights_2d[idx].clone())
+        .collect();
 
     // Get config
     let cfg = config.map(|c| c.inner).unwrap_or_default();
 
     // Run backtest
-    let creturn = run_backtest(&prices_2d, &weights_2d, &rebalance_indices, &cfg);
+    let creturn = run_backtest(&prices_2d, &rebalance_weights, &rebalance_indices, &cfg);
 
     Ok(PyBacktestResult {
         creturn,

@@ -190,18 +190,21 @@ class BacktestNamespace:
 
         # Handle null values in weight column
         # Polars rolling operations return null for first N-1 rows (unlike pandas NaN -> False)
-        # Fill nulls with False for boolean or 0.0 for numeric weights
+        # Fill nulls with False/0.0, then cast bool to float for Rust path
         df = self._df
         if is_bool_signal:
-            df = df.with_columns(pl.col(weight).fill_null(False))
+            # Cast bool to float (True -> 1.0, False -> 0.0)
+            # Rust's normalize_weights_finlab will convert to equal weights
+            df = df.with_columns(
+                pl.col(weight).fill_null(False).cast(pl.Float64)
+            )
         else:
             df = df.with_columns(pl.col(weight).fill_null(0.0))
 
-        # Check if we can use Rust path (basic resample, no offset, not bool signals)
+        # Check if we can use Rust path (basic resample, no offset)
         use_rust = (
             resample in (None, "D", "W", "M")
             and resample_offset is None
-            and not is_bool_signal  # Rust doesn't handle bool -> equal weight conversion
         )
 
         if use_rust:
@@ -236,34 +239,27 @@ class BacktestNamespace:
                 .get_column(date_col)
             )
 
-            # Find first date with non-zero weight (to match wide format behavior)
-            # Wide format starts from the first rebalance date with signals
-            # Handle both boolean and float weight columns (nulls already filled above)
-            weight_col_expr = pl.col(weight)
-            if is_bool_signal:
-                weight_col_expr = weight_col_expr.cast(pl.Int32)
-
-            weight_by_date = (
-                df
-                .group_by(date_col)
-                .agg(weight_col_expr.sum().alias("_total_weight"))
-                .sort(date_col)
-            )
-            first_signal_idx = 0
-            for i, row in enumerate(weight_by_date.iter_rows()):
-                if row[1] is not None and row[1] > 0:
-                    first_signal_idx = i
+            # Find where creturn starts changing (first actual trade)
+            # With monthly resample, signals may exist before first rebalance
+            # We find the last consecutive 1.0 from the start - that's the entry day
+            first_trade_idx = 0
+            for i, c in enumerate(result.creturn):
+                if c != 1.0:
+                    # Found first change - go back one day (entry day has creturn=1.0)
+                    first_trade_idx = max(0, i - 1)
                     break
 
-            # Slice from first signal date and normalize creturn to start at 1.0
-            sliced_creturn = result.creturn[first_signal_idx:]
+            # Slice from first trade date
+            sliced_creturn = result.creturn[first_trade_idx:]
+            sliced_dates = dates[first_trade_idx:]
+
+            # Normalize so first value is 1.0 (should already be, but just in case)
             if len(sliced_creturn) > 0 and sliced_creturn[0] != 0:
-                # Normalize so first value is 1.0
                 normalizer = sliced_creturn[0]
                 sliced_creturn = [c / normalizer for c in sliced_creturn]
 
             return pl.DataFrame({
-                date_col: dates[first_signal_idx:],
+                date_col: sliced_dates,
                 "creturn": sliced_creturn,
             })
 
