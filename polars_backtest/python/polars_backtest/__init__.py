@@ -877,7 +877,7 @@ class Report:
             trades: List of TradeRecord objects from Rust
             dates: List of dates from price data
             stock_columns: List of stock column names
-            position: Position weights DataFrame
+            position: Position weights DataFrame (can be long or wide format)
             fee_ratio: Transaction fee ratio
             tax_ratio: Transaction tax ratio
             first_signal_index: Index of first date with signals (for Finlab compatibility)
@@ -904,7 +904,7 @@ class Report:
 
     @property
     def position(self) -> pl.DataFrame:
-        """Position weights DataFrame."""
+        """Position weights DataFrame (can be long or wide format)."""
         return self._position
 
     @property

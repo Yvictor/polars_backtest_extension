@@ -17,6 +17,7 @@ from polars_backtest._polars_backtest import (
     backtest_weights,
     backtest_with_trades as _backtest_with_trades,
     backtest_partitioned as _rust_backtest,  # Use partition_by (1.5x faster than pivot)
+    backtest_with_trades_partitioned as _rust_backtest_with_trades,  # partition_by + trades
 )
 
 if TYPE_CHECKING:
@@ -424,6 +425,87 @@ class BacktestNamespace:
                 if col not in self._df.columns:
                     raise ValueError(f"Column '{col}' not found in DataFrame")
 
+        # Check if weight column is boolean (signals)
+        weight_dtype = self._df.get_column(weight).dtype
+        is_bool_signal = weight_dtype == pl.Boolean
+
+        # Handle null values in weight column
+        df = self._df
+        if is_bool_signal:
+            df = df.with_columns(
+                pl.col(weight).fill_null(False).cast(pl.Float64)
+            )
+        else:
+            df = df.with_columns(pl.col(weight).fill_null(0.0))
+
+        # Check if we can use Rust path (no OHLC, basic resample, no offset)
+        use_rust = (
+            not touched_exit
+            and resample in (None, "D", "W", "M")
+            and resample_offset is None
+        )
+
+        # Get resample helpers (lazy import)
+        _resample_position, _filter_changed_positions, Report = _get_resample_helpers()
+
+        if use_rust:
+            # Use fast Rust partition_by path
+            config = BacktestConfig(
+                fee_ratio=fee_ratio,
+                tax_ratio=tax_ratio,
+                stop_loss=stop_loss,
+                take_profit=take_profit,
+                trail_stop=trail_stop,
+                position_limit=position_limit,
+                retain_cost_when_rebalance=retain_cost_when_rebalance,
+                stop_trading_next_period=stop_trading_next_period,
+                finlab_mode=True,  # Use Finlab mode for report
+            )
+
+            result = _rust_backtest_with_trades(
+                df,
+                date_col,
+                symbol_col,
+                price,
+                weight,
+                resample,
+                config,
+            )
+
+            # Get dates from DataFrame
+            dates = (
+                df.select(date_col)
+                .unique()
+                .sort(date_col)
+                .get_column(date_col)
+                .to_list()
+            )
+
+            # Find where creturn starts changing (first actual trade)
+            first_trade_idx = 0
+            for i, c in enumerate(result.creturn):
+                if c != 1.0:
+                    first_trade_idx = max(0, i - 1)
+                    break
+
+            # Get stock columns (unique symbols in data)
+            stock_columns = df.get_column(symbol_col).unique().sort().to_list()
+
+            # Keep position in long format (no pivot needed!)
+            position_long = df.select([date_col, symbol_col, weight]).sort([date_col, symbol_col])
+
+            return Report(
+                creturn=result.creturn,
+                trades=result.trades,
+                dates=dates,
+                stock_columns=stock_columns,
+                position=position_long,  # Long format position
+                fee_ratio=fee_ratio,
+                tax_ratio=tax_ratio,
+                first_signal_index=first_trade_idx,
+            )
+
+        # Fallback to Python path for complex cases (touched_exit, complex resample)
         # Convert to wide format
         wide_data = self._prepare_wide_data(
             date_col, symbol_col, price, weight,
@@ -434,9 +516,6 @@ class BacktestNamespace:
         price_dates = wide_data["price_dates"]
 
         stock_cols = [c for c in prices_wide.columns if c != date_col]
-
-        # Get resample helpers (lazy import)
-        _resample_position, _filter_changed_positions, Report = _get_resample_helpers()
 
         # Apply resample
         if resample is None:

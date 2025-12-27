@@ -765,6 +765,65 @@ fn backtest_partitioned(
     })
 }
 
+/// Run backtest with trades on long format DataFrame using partition_by
+///
+/// Like backtest_partitioned but also tracks trades for Report generation.
+#[pyfunction]
+#[pyo3(signature = (
+    df,
+    date_col="date",
+    symbol_col="symbol",
+    price_col="close",
+    weight_col="weight",
+    resample=None,
+    config=None
+))]
+fn backtest_with_trades_partitioned(
+    df: PyDataFrame,
+    date_col: &str,
+    symbol_col: &str,
+    price_col: &str,
+    weight_col: &str,
+    resample: Option<&str>,
+    config: Option<PyBacktestConfig>,
+) -> PyResult<PyBacktestResult> {
+    let df = df.0;
+
+    // Validate required columns exist
+    for col_name in [date_col, symbol_col, price_col, weight_col] {
+        if df.column(col_name).is_err() {
+            return Err(PyValueError::new_err(format!(
+                "Missing required column: '{}'", col_name
+            )));
+        }
+    }
+
+    // Build wide format from partitions (prices and weights in one pass)
+    let (dates, _symbols, prices_2d, weights_2d) = build_wide_from_partitions_dual(
+        &df, date_col, symbol_col, price_col, weight_col
+    ).map_err(|e| PyValueError::new_err(format!("Failed to build wide format: {}", e)))?;
+
+    // Compute rebalance indices
+    let rebalance_indices = compute_rebalance_indices(&dates, resample);
+
+    // Extract only rebalance-day weights (run_backtest expects weights.len() == rebalance_indices.len())
+    let rebalance_weights: Vec<Vec<f64>> = rebalance_indices
+        .iter()
+        .map(|&idx| weights_2d[idx].clone())
+        .collect();
+
+    // Get config
+    let cfg = config.map(|c| c.inner).unwrap_or_default();
+
+    // Build PriceData (no OHLC for this version)
+    let prices = PriceData::new(&prices_2d, &prices_2d);
+
+    // Run backtest with trades tracking
+    let result = run_backtest_with_trades(&prices, &rebalance_weights, &rebalance_indices, &cfg);
+
+    Ok(result.into())
+}
+
 /// Run backtest with long format input (Stage 4 API)
 ///
 /// This is the main API for backtesting with long format data.
@@ -880,6 +939,7 @@ fn _polars_backtest(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyBacktestResult>()?;
     m.add_function(wrap_pyfunction!(backtest, m)?)?;
     m.add_function(wrap_pyfunction!(backtest_partitioned, m)?)?;
+    m.add_function(wrap_pyfunction!(backtest_with_trades_partitioned, m)?)?;
     m.add_function(wrap_pyfunction!(backtest_signals, m)?)?;
     m.add_function(wrap_pyfunction!(backtest_weights, m)?)?;
     m.add_function(wrap_pyfunction!(backtest_with_trades, m)?)?;
