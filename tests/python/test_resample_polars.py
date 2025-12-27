@@ -8,7 +8,7 @@ import pytest
 import polars as pl
 from datetime import date, timedelta
 
-from polars_backtest import backtest, backtest_with_report
+from polars_backtest import backtest_wide, backtest_with_report_wide
 
 
 class TestParseResampleFreq:
@@ -234,7 +234,7 @@ class TestResamplePosition:
             "2330": [1.0],
         })
 
-        result = backtest(close, position, resample='D')
+        result = backtest_wide(close, position, resample='D')
         assert len(result) == 3
 
     def test_weekly_resample(self):
@@ -253,7 +253,7 @@ class TestResamplePosition:
             "2330": [1.0] * len(dates),
         })
 
-        result = backtest(close, position, resample='W')
+        result = backtest_wide(close, position, resample='W')
         assert len(result) == len(dates)
 
     def test_monthly_resample(self):
@@ -273,7 +273,7 @@ class TestResamplePosition:
             "2330": [1.0] * len(dates),
         })
 
-        result = backtest(close, position, resample='M')
+        result = backtest_wide(close, position, resample='M')
         assert len(result) == len(dates)
 
     def test_resample_offset_positive(self):
@@ -292,7 +292,7 @@ class TestResamplePosition:
         })
 
         # Should not crash
-        result = backtest(close, position, resample='W', resample_offset='1D')
+        result = backtest_wide(close, position, resample='W', resample_offset='1D')
         assert len(result) == len(dates)
 
     def test_resample_offset_negative(self):
@@ -311,7 +311,7 @@ class TestResamplePosition:
         })
 
         # Should not crash
-        result = backtest(close, position, resample='W', resample_offset='-1D',
+        result = backtest_wide(close, position, resample='W', resample_offset='-1D',
                          fee_ratio=0.0, tax_ratio=0.0)
         assert len(result) == len(dates)
 
@@ -327,7 +327,7 @@ class TestResamplePosition:
         })
 
         with pytest.raises(ValueError, match="Invalid resample frequency"):
-            backtest(close, position, resample='X')
+            backtest_wide(close, position, resample='X')
 
 
 class TestBacktestWithReportResample:
@@ -349,7 +349,7 @@ class TestBacktestWithReportResample:
             "2330": [1.0] * len(dates),
         })
 
-        report = backtest_with_report(
+        report = backtest_with_report_wide(
             close=close,
             position=position,
             resample='M',
@@ -373,7 +373,7 @@ class TestBacktestWithReportResample:
             "2330": [1.0] * len(dates),
         })
 
-        report = backtest_with_report(
+        report = backtest_with_report_wide(
             close=close,
             position=position,
             resample='W',
@@ -399,7 +399,7 @@ class TestResampleNone:
             "2330": [1.0, 1.0, 1.0, 0.5, 0.5],  # Change at index 0 and 3
         })
 
-        result = backtest(close, position, resample=None)
+        result = backtest_wide(close, position, resample=None)
         assert len(result) == len(dates)
 
     def test_resample_none_with_report(self):
@@ -414,7 +414,7 @@ class TestResampleNone:
             "2330": [1.0, 1.0, 1.0, 0.5, 0.5],
         })
 
-        report = backtest_with_report(
+        report = backtest_with_report_wide(
             close=close,
             position=position,
             resample=None,
@@ -439,7 +439,7 @@ class TestEdgeCases:
             "2330": [1.0],
         })
 
-        result = backtest(close, position, resample='D')
+        result = backtest_wide(close, position, resample='D')
         assert len(result) == len(dates)
 
     def test_position_dates_subset_of_price_dates(self):
@@ -454,7 +454,7 @@ class TestEdgeCases:
             "2330": [1.0, 0.5],
         })
 
-        result = backtest(close, position, resample='D')
+        result = backtest_wide(close, position, resample='D')
         assert len(result) == len(dates)
 
     def test_multi_stock_resample(self):
@@ -474,7 +474,7 @@ class TestEdgeCases:
             "2317": [0.5] * len(dates),
         })
 
-        result = backtest(close, position, resample='W')
+        result = backtest_wide(close, position, resample='W')
         assert len(result) == len(dates)
 
 

@@ -1,7 +1,7 @@
 """Test trades tracking functionality.
 
 Tests verify that:
-1. backtest_with_report() returns proper trades records
+1. backtest_with_report_wide() returns proper trades records
 2. trades use ORIGINAL prices (not adjusted) for entry/exit prices
 3. The trades format matches Finlab's trades DataFrame structure
 4. trade_at_price parameter works correctly
@@ -25,7 +25,7 @@ finlab.login(os.getenv('FINLAB_API_TOKEN'))
 from finlab import backtest as finlab_backtest
 from finlab import data as finlab_data
 
-from polars_backtest import backtest, backtest_with_report, Report
+from polars_backtest import backtest_wide, backtest_with_report_wide, Report
 
 
 @pytest.fixture(scope="module")
@@ -102,7 +102,7 @@ def test_basic_trades_tracking(price_data, factor_data):
     weights_pl = pl.DataFrame({"date": rebalance_date_strs, stock: filtered_position.tolist()})
 
     # Run our backtest with factor
-    report = backtest_with_report(
+    report = backtest_with_report_wide(
         close=adj_prices_pl,
         position=weights_pl,
         factor=factor_pl,
@@ -184,7 +184,7 @@ def test_multi_stock_trades(price_data, factor_data):
     weights_pl = pl.DataFrame(weights_data)
 
     # Run our backtest with factor
-    report = backtest_with_report(
+    report = backtest_with_report_wide(
         close=adj_prices_pl,
         position=weights_pl,
         factor=factor_pl,
@@ -236,10 +236,10 @@ def test_creturn_matches_standard(price_data, factor_data):
     weights_pl = pl.DataFrame({"date": [date_strs[0]], stock: [1.0]})
 
     # Run standard backtest
-    standard_result = backtest(adj_prices_pl, weights_pl)
+    standard_result = backtest_wide(adj_prices_pl, weights_pl)
 
     # Run backtest_with_report with factor
-    report = backtest_with_report(
+    report = backtest_with_report_wide(
         close=adj_prices_pl,
         position=weights_pl,
         factor=factor_pl,
@@ -275,7 +275,7 @@ def test_trade_at_price_requires_ohlc():
     })
 
     with pytest.raises(ValueError, match="requires 'open' DataFrame"):
-        backtest_with_report(
+        backtest_with_report_wide(
             close=close,
             position=position,
             trade_at_price='open',  # No open DataFrame provided
@@ -294,7 +294,7 @@ def test_trade_at_price_invalid():
     })
 
     with pytest.raises(ValueError, match="Invalid trade_at_price"):
-        backtest_with_report(
+        backtest_with_report_wide(
             close=close,
             position=position,
             trade_at_price='invalid',
@@ -312,7 +312,7 @@ def test_report_properties():
         "2330": [1.0],
     })
 
-    report = backtest_with_report(close=close, position=position)
+    report = backtest_with_report_wide(close=close, position=position)
 
     # Check creturn is a DataFrame with date and creturn columns
     assert isinstance(report.creturn, pl.DataFrame)
@@ -349,7 +349,7 @@ def test_empty_trades():
         "2330": [0.0],  # No position
     })
 
-    report = backtest_with_report(close=close, position=position)
+    report = backtest_with_report_wide(close=close, position=position)
 
     # trades should be empty but have correct columns
     assert len(report.trades) == 0
@@ -378,7 +378,7 @@ def test_factor_restores_original_prices():
         "2330": [1.0],
     })
 
-    report = backtest_with_report(
+    report = backtest_with_report_wide(
         close=adj_close,
         position=position,
         factor=factor,
@@ -419,7 +419,7 @@ def test_factor_with_trade_at_price_open():
         "2330": [1.0],
     })
 
-    report = backtest_with_report(
+    report = backtest_with_report_wide(
         close=adj_close,
         position=position,
         trade_at_price='open',

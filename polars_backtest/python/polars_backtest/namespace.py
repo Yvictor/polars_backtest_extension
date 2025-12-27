@@ -97,8 +97,12 @@ class BacktestNamespace:
         open_col: str | None = None,
         high_col: str | None = None,
         low_col: str | None = None,
+        df: pl.DataFrame | None = None,
     ) -> dict:
         """Convert long format data to wide format for Rust backend.
+
+        Args:
+            df: DataFrame to use (defaults to self._df if not provided)
 
         Returns:
             Dict with wide format DataFrames:
@@ -106,9 +110,12 @@ class BacktestNamespace:
             - position: weight DataFrame
             - open/high/low: optional OHLC DataFrames
         """
+        if df is None:
+            df = self._df
+
         # Get unique dates from prices
         price_dates = (
-            self._df.select(date_col)
+            df.select(date_col)
             .unique()
             .sort(date_col)
             .get_column(date_col)
@@ -116,8 +123,8 @@ class BacktestNamespace:
         )
 
         # Convert to wide format
-        prices_wide = _long_to_wide(self._df, price_col, date_col, symbol_col)
-        position_wide = _long_to_wide(self._df, weight_col, date_col, symbol_col)
+        prices_wide = _long_to_wide(df, price_col, date_col, symbol_col)
+        position_wide = _long_to_wide(df, weight_col, date_col, symbol_col)
 
         result = {
             "prices": prices_wide,
@@ -126,12 +133,12 @@ class BacktestNamespace:
         }
 
         # Optional OHLC
-        if open_col and open_col in self._df.columns:
-            result["open"] = _long_to_wide(self._df, open_col, date_col, symbol_col)
-        if high_col and high_col in self._df.columns:
-            result["high"] = _long_to_wide(self._df, high_col, date_col, symbol_col)
-        if low_col and low_col in self._df.columns:
-            result["low"] = _long_to_wide(self._df, low_col, date_col, symbol_col)
+        if open_col and open_col in df.columns:
+            result["open"] = _long_to_wide(df, open_col, date_col, symbol_col)
+        if high_col and high_col in df.columns:
+            result["high"] = _long_to_wide(df, high_col, date_col, symbol_col)
+        if low_col and low_col in df.columns:
+            result["low"] = _long_to_wide(df, low_col, date_col, symbol_col)
 
         return result
 
@@ -181,6 +188,15 @@ class BacktestNamespace:
         weight_dtype = self._df.get_column(weight).dtype
         is_bool_signal = weight_dtype == pl.Boolean
 
+        # Handle null values in weight column
+        # Polars rolling operations return null for first N-1 rows (unlike pandas NaN -> False)
+        # Fill nulls with False for boolean or 0.0 for numeric weights
+        df = self._df
+        if is_bool_signal:
+            df = df.with_columns(pl.col(weight).fill_null(False))
+        else:
+            df = df.with_columns(pl.col(weight).fill_null(0.0))
+
         # Check if we can use Rust path (basic resample, no offset, not bool signals)
         use_rust = (
             resample in (None, "D", "W", "M")
@@ -203,7 +219,7 @@ class BacktestNamespace:
             )
 
             result = _rust_backtest(
-                self._df,
+                df,
                 date_col,
                 symbol_col,
                 price,
@@ -212,23 +228,49 @@ class BacktestNamespace:
                 config,
             )
 
-            # Get dates from original DataFrame
+            # Get dates from DataFrame
             dates = (
-                self._df.select(date_col)
+                df.select(date_col)
                 .unique()
                 .sort(date_col)
                 .get_column(date_col)
             )
 
+            # Find first date with non-zero weight (to match wide format behavior)
+            # Wide format starts from the first rebalance date with signals
+            # Handle both boolean and float weight columns (nulls already filled above)
+            weight_col_expr = pl.col(weight)
+            if is_bool_signal:
+                weight_col_expr = weight_col_expr.cast(pl.Int32)
+
+            weight_by_date = (
+                df
+                .group_by(date_col)
+                .agg(weight_col_expr.sum().alias("_total_weight"))
+                .sort(date_col)
+            )
+            first_signal_idx = 0
+            for i, row in enumerate(weight_by_date.iter_rows()):
+                if row[1] is not None and row[1] > 0:
+                    first_signal_idx = i
+                    break
+
+            # Slice from first signal date and normalize creturn to start at 1.0
+            sliced_creturn = result.creturn[first_signal_idx:]
+            if len(sliced_creturn) > 0 and sliced_creturn[0] != 0:
+                # Normalize so first value is 1.0
+                normalizer = sliced_creturn[0]
+                sliced_creturn = [c / normalizer for c in sliced_creturn]
+
             return pl.DataFrame({
-                date_col: dates,
-                "creturn": result.creturn,
+                date_col: dates[first_signal_idx:],
+                "creturn": sliced_creturn,
             })
 
         # Fallback to Python path for complex resample patterns
-        # Convert to wide format
+        # Convert to wide format (using df with nulls filled)
         wide_data = self._prepare_wide_data(
-            date_col, symbol_col, price, weight
+            date_col, symbol_col, price, weight, df=df
         )
         prices_wide = wide_data["prices"]
         position_wide = wide_data["position"]
@@ -299,10 +341,34 @@ class BacktestNamespace:
                 prices_data, position_data, rebalance_indices, config
             )
 
+        # Find first rebalance index with any non-zero signals (like Finlab)
+        first_signal_rebalance_idx = 0
+        for i in range(len(position_data)):
+            row = position_data[i]
+            # Check if any value in this row is non-zero (True or > 0)
+            has_signal = any(
+                row[col][0] is not None and row[col][0] > 0
+                for col in position_data.columns
+            )
+            if has_signal:
+                first_signal_rebalance_idx = i
+                break
+
+        # Get first signal date index in price data
+        first_signal_idx = rebalance_indices[first_signal_rebalance_idx] if rebalance_indices else 0
+
+        # Slice from first signal date and normalize creturn to start at 1.0
+        sliced_creturn = creturn[first_signal_idx:]
+        if len(sliced_creturn) > 0 and sliced_creturn[0] != 0:
+            normalizer = sliced_creturn[0]
+            sliced_creturn = [c / normalizer for c in sliced_creturn]
+
+        dates = prices_wide.get_column(date_col)
+
         # Build result
         return pl.DataFrame({
-            date_col: prices_wide.get_column(date_col),
-            "creturn": creturn,
+            date_col: dates[first_signal_idx:],
+            "creturn": sliced_creturn,
         })
 
     def backtest_with_report(

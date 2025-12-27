@@ -24,7 +24,7 @@ finlab.login(os.getenv('FINLAB_API_TOKEN'))
 from finlab import backtest as finlab_backtest
 from finlab import data as finlab_data
 
-from polars_backtest import backtest, backtest_with_report
+from polars_backtest import backtest_wide, backtest_with_report_wide
 
 
 @pytest.fixture(scope="module")
@@ -67,8 +67,8 @@ def test_resample_daily_default(price_data):
     weights_pl = pl.DataFrame({"date": rebalance_date_strs, stock: filtered_position.tolist()})
 
     # Run with explicit resample='D' and without (default)
-    result_explicit = backtest(adj_prices_pl, weights_pl, resample='D')
-    result_default = backtest(adj_prices_pl, weights_pl)
+    result_explicit = backtest_wide(adj_prices_pl, weights_pl, resample='D')
+    result_default = backtest_wide(adj_prices_pl, weights_pl)
 
     # Should be identical
     max_diff = max(abs(a - b) for a, b in zip(
@@ -106,7 +106,7 @@ def test_resample_weekly(price_data):
     daily_weights_pl = pl.DataFrame(daily_weights_data)
 
     # Run our backtest with resample='W'
-    result = backtest(adj_prices_pl, daily_weights_pl, resample='W')
+    result = backtest_wide(adj_prices_pl, daily_weights_pl, resample='W')
 
     # Compare final returns
     finlab_final = finlab_report.creturn.iloc[-1]
@@ -144,7 +144,7 @@ def test_resample_monthly(price_data):
     daily_weights_pl = pl.DataFrame(daily_weights_data)
 
     # Run our backtest with resample='M'
-    result = backtest(adj_prices_pl, daily_weights_pl, resample='M')
+    result = backtest_wide(adj_prices_pl, daily_weights_pl, resample='M')
 
     # Compare final returns
     finlab_final = finlab_report.creturn.iloc[-1]
@@ -166,7 +166,7 @@ def test_resample_invalid():
     })
 
     with pytest.raises(ValueError, match="Invalid resample frequency"):
-        backtest(close, position, resample='X')
+        backtest_wide(close, position, resample='X')
 
 
 def test_resample_with_report(price_data):
@@ -184,7 +184,7 @@ def test_resample_with_report(price_data):
     daily_weights_pl = pl.DataFrame({"date": date_strs, stock: [1.0] * len(date_strs)})
 
     # Run with monthly resample
-    report = backtest_with_report(
+    report = backtest_with_report_wide(
         close=adj_prices_pl,
         position=daily_weights_pl,
         resample='M',
@@ -226,7 +226,7 @@ def test_resample_weekly_friday(price_data):
     daily_weights_pl = pl.DataFrame(daily_weights_data)
 
     # Run our backtest with resample='W-FRI'
-    result = backtest(adj_prices_pl, daily_weights_pl, resample='W-FRI')
+    result = backtest_wide(adj_prices_pl, daily_weights_pl, resample='W-FRI')
 
     # Compare final returns
     finlab_final = finlab_report.creturn.iloc[-1]
@@ -264,7 +264,7 @@ def test_resample_offset(price_data):
     daily_weights_pl = pl.DataFrame(daily_weights_data)
 
     # Run our backtest with resample='W' and resample_offset='1D'
-    result = backtest(adj_prices_pl, daily_weights_pl, resample='W', resample_offset='1D')
+    result = backtest_wide(adj_prices_pl, daily_weights_pl, resample='W', resample_offset='1D')
 
     # Compare final returns
     finlab_final = finlab_report.creturn.iloc[-1]
@@ -289,7 +289,7 @@ def test_resample_offset_negative():
     })
 
     # Run with W and offset='-1D' (shift back one day)
-    result = backtest(close, position, resample='W', resample_offset='-1D',
+    result = backtest_wide(close, position, resample='W', resample_offset='-1D',
                      fee_ratio=0.0, tax_ratio=0.0)
 
     # Should not crash and return valid results
