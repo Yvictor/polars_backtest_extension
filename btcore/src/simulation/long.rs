@@ -17,7 +17,7 @@ use arrow::array::{Float64Array, Int32Array, StringViewArray};
 
 use crate::config::BacktestConfig;
 use crate::position::Position;
-use crate::tracker::BacktestResult;
+use crate::tracker::{BacktestResult, LongBacktestResult, LongTradeRecord};
 
 /// Portfolio with string symbol keys (for zero-copy backtest)
 pub struct Portfolio {
@@ -70,6 +70,8 @@ pub enum ResampleFreq {
     Weekly,
     /// Monthly rebalancing (end of month)
     Monthly,
+    /// Only rebalance when position changes (Finlab default, resample=None)
+    PositionChange,
 }
 
 impl ResampleFreq {
@@ -78,8 +80,196 @@ impl ResampleFreq {
         match s {
             Some("M") | Some("ME") => Self::Monthly,
             Some("W") | Some("W-FRI") => Self::Weekly,
+            Some("D") => Self::Daily,
+            None => Self::PositionChange,
             _ => Self::Daily,
         }
+    }
+}
+
+// ============================================================================
+// String Trade Tracker - for long format with string symbols and i32 dates
+// ============================================================================
+
+/// Open trade for string-based tracking
+#[derive(Debug, Clone)]
+struct StringOpenTrade {
+    /// Symbol
+    symbol: String,
+    /// Entry date (days since epoch)
+    entry_date: i32,
+    /// Signal date (days since epoch)
+    entry_sig_date: i32,
+    /// Position weight
+    weight: f64,
+    /// Entry price
+    entry_price: f64,
+}
+
+/// Trait for tracking trades in long format
+pub(crate) trait StringTradeTracker {
+    fn new() -> Self;
+
+    /// Record opening a new trade
+    fn open_trade(
+        &mut self,
+        symbol: &str,
+        entry_date: i32,
+        signal_date: i32,
+        entry_price: f64,
+        weight: f64,
+    );
+
+    /// Record closing a trade
+    fn close_trade(
+        &mut self,
+        symbol: &str,
+        exit_date: i32,
+        exit_sig_date: Option<i32>,
+        exit_price: f64,
+        fee_ratio: f64,
+        tax_ratio: f64,
+    );
+
+    /// Check if a trade is open for a symbol
+    fn has_open_trade(&self, symbol: &str) -> bool;
+
+    /// Add a pending entry (signal given but not yet executed)
+    fn add_pending_entry(&mut self, symbol: &str, signal_date: i32, weight: f64);
+
+    /// Finalize all open trades at the end of simulation
+    fn finalize(self, fee_ratio: f64, tax_ratio: f64) -> Vec<LongTradeRecord>;
+}
+
+/// No-op trade tracker - zero overhead for simple backtest
+pub(crate) struct NoopStringTracker;
+
+impl StringTradeTracker for NoopStringTracker {
+    #[inline]
+    fn new() -> Self {
+        Self
+    }
+
+    #[inline]
+    fn open_trade(&mut self, _: &str, _: i32, _: i32, _: f64, _: f64) {}
+
+    #[inline]
+    fn close_trade(&mut self, _: &str, _: i32, _: Option<i32>, _: f64, _: f64, _: f64) {}
+
+    #[inline]
+    fn has_open_trade(&self, _: &str) -> bool {
+        false
+    }
+
+    #[inline]
+    fn add_pending_entry(&mut self, _: &str, _: i32, _: f64) {}
+
+    #[inline]
+    fn finalize(self, _: f64, _: f64) -> Vec<LongTradeRecord> {
+        vec![]
+    }
+}
+
+/// Real trade tracker for long format
+pub(crate) struct RealStringTracker {
+    open_trades: HashMap<String, StringOpenTrade>,
+    completed_trades: Vec<LongTradeRecord>,
+}
+
+impl StringTradeTracker for RealStringTracker {
+    fn new() -> Self {
+        Self {
+            open_trades: HashMap::new(),
+            completed_trades: Vec::new(),
+        }
+    }
+
+    fn open_trade(
+        &mut self,
+        symbol: &str,
+        entry_date: i32,
+        signal_date: i32,
+        entry_price: f64,
+        weight: f64,
+    ) {
+        self.open_trades.insert(
+            symbol.to_string(),
+            StringOpenTrade {
+                symbol: symbol.to_string(),
+                entry_date,
+                entry_sig_date: signal_date,
+                weight,
+                entry_price,
+            },
+        );
+    }
+
+    fn close_trade(
+        &mut self,
+        symbol: &str,
+        exit_date: i32,
+        exit_sig_date: Option<i32>,
+        exit_price: f64,
+        fee_ratio: f64,
+        tax_ratio: f64,
+    ) {
+        if let Some(open_trade) = self.open_trades.remove(symbol) {
+            let trade = LongTradeRecord {
+                symbol: open_trade.symbol,
+                entry_date: Some(open_trade.entry_date),
+                exit_date: Some(exit_date),
+                entry_sig_date: open_trade.entry_sig_date,
+                exit_sig_date,
+                position_weight: open_trade.weight,
+                entry_price: open_trade.entry_price,
+                exit_price: Some(exit_price),
+                trade_return: None,
+            };
+            let trade_return = trade.calculate_return(fee_ratio, tax_ratio);
+
+            self.completed_trades.push(LongTradeRecord {
+                trade_return,
+                ..trade
+            });
+        }
+    }
+
+    fn has_open_trade(&self, symbol: &str) -> bool {
+        self.open_trades.contains_key(symbol)
+    }
+
+    fn add_pending_entry(&mut self, symbol: &str, signal_date: i32, weight: f64) {
+        // Add a pending entry record (entry_date=None for signals not yet executed)
+        self.completed_trades.push(LongTradeRecord {
+            symbol: symbol.to_string(),
+            entry_date: None,
+            exit_date: None,
+            entry_sig_date: signal_date,
+            exit_sig_date: None,
+            position_weight: weight,
+            entry_price: f64::NAN,
+            exit_price: None,
+            trade_return: None,
+        });
+    }
+
+    fn finalize(mut self, _fee_ratio: f64, _tax_ratio: f64) -> Vec<LongTradeRecord> {
+        // Report open positions as still open (exit_date=None)
+        for (_symbol, open_trade) in self.open_trades.drain() {
+            self.completed_trades.push(LongTradeRecord {
+                symbol: open_trade.symbol,
+                entry_date: Some(open_trade.entry_date),
+                exit_date: None,
+                entry_sig_date: open_trade.entry_sig_date,
+                exit_sig_date: None,
+                position_weight: open_trade.weight,
+                entry_price: open_trade.entry_price,
+                exit_price: None,
+                trade_return: None,
+            });
+        }
+
+        self.completed_trades
     }
 }
 
@@ -123,6 +313,9 @@ where
     let mut stopped_stocks: HashMap<String, bool> = HashMap::new();
     let mut pending_weights: Option<HashMap<String, f64>> = None;
     let mut pending_stop_exits: Vec<String> = Vec::new();
+    let mut active_weights: HashMap<String, f64> = HashMap::new();
+    let mut has_first_signal = false;
+    let mut position_changed = false; // For PositionChange resample mode
     let mut current_date: Option<i32> = None;
     let mut today_prices: HashMap<&str, f64> = HashMap::new();
     let mut today_weights: HashMap<&str, f64> = HashMap::new();
@@ -141,13 +334,22 @@ where
             // STEP 1: Update positions
             update_positions(&mut portfolio, &today_prices);
 
-            // STEP 2: Execute pending stops
+            // STEP 2: Execute pending stops (from yesterday's detection)
             execute_pending_stops(
                 &mut portfolio,
                 &mut pending_stop_exits,
                 &mut stopped_stocks,
                 config,
             );
+
+            // STEP 2.5: Detect new stops (schedule for tomorrow's execution)
+            if config.stop_loss < 1.0
+                || config.take_profit < f64::INFINITY
+                || config.trail_stop < f64::INFINITY
+            {
+                let new_stops = detect_stops_string(&portfolio, &today_prices, config);
+                pending_stop_exits.extend(new_stops);
+            }
 
             // STEP 3: Execute pending rebalance
             if let Some(target_weights) = pending_weights.take() {
@@ -161,25 +363,87 @@ where
                 stopped_stocks.clear();
             }
 
-            // STEP 4: Check rebalance
-            let should_rebalance = match resample {
-                ResampleFreq::Monthly => is_month_end_i32(prev_date, date),
-                ResampleFreq::Weekly => true,
-                ResampleFreq::Daily => true,
-            };
+            // STEP 4: Update active weights based on today's signals
+            // Behavior varies by resample frequency to match Wide format (Finlab):
+            // - Daily: always update (empty signals = exit all)
+            // - Weekly: forward-fill within week, apply on week-end
+            // - Monthly: ONLY use signals from month-end day (no forward-fill)
+            let normalized = normalize_weights(
+                &today_weights,
+                &stopped_stocks,
+                config.position_limit,
+            );
 
-            if should_rebalance && !today_weights.is_empty() {
-                let normalized = normalize_weights(
-                    &today_weights,
-                    &stopped_stocks,
-                    config.position_limit,
-                );
-                if !normalized.is_empty() {
-                    pending_weights = Some(normalized);
+            // Check if prev_date is a rebalance boundary
+            let is_month_end = is_month_end_i32(prev_date, date);
+            let is_week_end = is_week_end_i32(prev_date, date);
+
+            match resample {
+                ResampleFreq::Daily => {
+                    // Daily: always update, empty signals means exit all
+                    if !normalized.is_empty() {
+                        has_first_signal = true;
+                    }
+                    if has_first_signal {
+                        active_weights = normalized;
+                    }
+                }
+                ResampleFreq::Weekly => {
+                    // Weekly: ONLY use signals from week-end day
+                    // This matches Wide format which resamples position to week-ends
+                    if is_week_end {
+                        // On week-end, use today's signals directly (could be empty)
+                        let has_signals = !normalized.is_empty();
+                        active_weights = normalized;
+                        if has_signals {
+                            has_first_signal = true;
+                        }
+                    }
+                    // On non-week-end days, ignore today_weights entirely
+                }
+                ResampleFreq::Monthly => {
+                    // Monthly: ONLY use signals from month-end day
+                    // This matches Wide format which resamples position to month-ends
+                    if is_month_end {
+                        // On month-end, use today's signals directly (could be empty)
+                        let has_signals = !normalized.is_empty();
+                        active_weights = normalized;
+                        if has_signals {
+                            has_first_signal = true;
+                        }
+                    }
+                    // On non-month-end days, ignore today_weights entirely
+                }
+                ResampleFreq::PositionChange => {
+                    // PositionChange: only rebalance when weights differ from previous active_weights
+                    // This matches Finlab's resample=None behavior (diff().abs().sum() != 0)
+                    if !normalized.is_empty() {
+                        has_first_signal = true;
+                    }
+                    // Compare BEFORE updating active_weights, save result for STEP 5
+                    position_changed = weights_differ(&active_weights, &normalized);
+                    // Always update active_weights to today's normalized weights
+                    active_weights = normalized;
                 }
             }
 
-            // STEP 5: Record creturn
+            // STEP 5: Check rebalance (only after first signal)
+            if has_first_signal {
+                let should_rebalance = match resample {
+                    ResampleFreq::Monthly => is_month_end,
+                    ResampleFreq::Weekly => is_week_end,
+                    ResampleFreq::Daily => true,
+                    ResampleFreq::PositionChange => position_changed,
+                };
+
+                // Set pending weights for T+1 execution using active_weights
+                // For Daily: include empty to trigger exit
+                if should_rebalance {
+                    pending_weights = Some(active_weights.clone());
+                }
+            }
+
+            // STEP 6: Record creturn
             creturn.push(portfolio.balance());
 
             today_prices.clear();
@@ -255,7 +519,17 @@ pub fn backtest_long_arrow(
 
     // Pending weights for T+1 execution
     let mut pending_weights: Option<HashMap<String, f64>> = None;
+    let mut pending_signal_date: Option<i32> = None;
     let mut pending_stop_exits: Vec<String> = Vec::new();
+
+    // Active weights (forward-filled) for Daily/Weekly rebalance
+    // These persist across days until new signals arrive
+    let mut active_weights: HashMap<String, f64> = HashMap::new();
+
+    // Flag to track if we've seen the first signal
+    // Only start rebalancing after this is true
+    let mut has_first_signal = false;
+    let mut position_changed = false; // For PositionChange resample mode
 
     // Track current date (i32 days since epoch)
     let mut current_date: Option<i32> = None;
@@ -280,13 +554,22 @@ pub fn backtest_long_arrow(
             // STEP 1: Update existing positions with today's prices
             update_positions(&mut portfolio, &today_prices);
 
-            // STEP 2: Execute pending stop exits
+            // STEP 2: Execute pending stop exits (from yesterday's detection)
             execute_pending_stops(
                 &mut portfolio,
                 &mut pending_stop_exits,
                 &mut stopped_stocks,
                 config,
             );
+
+            // STEP 2.5: Detect new stops (schedule for tomorrow's execution)
+            if config.stop_loss < 1.0
+                || config.take_profit < f64::INFINITY
+                || config.trail_stop < f64::INFINITY
+            {
+                let new_stops = detect_stops_string(&portfolio, &today_prices, config);
+                pending_stop_exits.extend(new_stops);
+            }
 
             // STEP 3: Execute pending rebalance (T+1 execution)
             if let Some(target_weights) = pending_weights.take() {
@@ -300,26 +583,88 @@ pub fn backtest_long_arrow(
                 stopped_stocks.clear();
             }
 
-            // STEP 4: Check if prev_date is a rebalance day
-            let should_rebalance = match resample {
-                ResampleFreq::Monthly => is_month_end_i32(prev_date, date),
-                ResampleFreq::Weekly => true, // TODO: proper weekly detection
-                ResampleFreq::Daily => true,
-            };
+            // STEP 4: Update active weights based on today's signals
+            // Behavior varies by resample frequency to match Wide format (Finlab):
+            // - Daily: always update (empty signals = exit all)
+            // - Weekly: forward-fill within week, apply on week-end
+            // - Monthly: ONLY use signals from month-end day (no forward-fill)
+            let normalized = normalize_weights(
+                &today_weights,
+                &stopped_stocks,
+                config.position_limit,
+            );
 
-            if should_rebalance && !today_weights.is_empty() {
-                // Normalize weights using Finlab's behavior
-                let normalized = normalize_weights(
-                    &today_weights,
-                    &stopped_stocks,
-                    config.position_limit,
-                );
-                if !normalized.is_empty() {
-                    pending_weights = Some(normalized);
+            // Check if prev_date is a rebalance boundary
+            let is_month_end = is_month_end_i32(prev_date, date);
+            let is_week_end = is_week_end_i32(prev_date, date);
+
+            match resample {
+                ResampleFreq::Daily => {
+                    // Daily: always update, empty signals means exit all
+                    if !normalized.is_empty() {
+                        has_first_signal = true;
+                    }
+                    if has_first_signal {
+                        active_weights = normalized;
+                    }
+                }
+                ResampleFreq::Weekly => {
+                    // Weekly: ONLY use signals from week-end day
+                    // This matches Wide format which resamples position to week-ends
+                    if is_week_end {
+                        // On week-end, use today's signals directly (could be empty)
+                        let has_signals = !normalized.is_empty();
+                        active_weights = normalized;
+                        if has_signals {
+                            has_first_signal = true;
+                        }
+                    }
+                    // On non-week-end days, ignore today_weights entirely
+                }
+                ResampleFreq::Monthly => {
+                    // Monthly: ONLY use signals from month-end day
+                    // This matches Wide format which resamples position to month-ends
+                    if is_month_end {
+                        // On month-end, use today's signals directly (could be empty)
+                        let has_signals = !normalized.is_empty();
+                        active_weights = normalized;
+                        if has_signals {
+                            has_first_signal = true;
+                        }
+                    }
+                    // On non-month-end days, ignore today_weights entirely
+                }
+                ResampleFreq::PositionChange => {
+                    // PositionChange: only rebalance when weights differ from active_weights
+                    if !normalized.is_empty() {
+                        has_first_signal = true;
+                    }
+                    // Compare BEFORE updating active_weights, save result for STEP 5
+                    position_changed = weights_differ(&active_weights, &normalized);
+                    // Always update active_weights to today's normalized weights
+                    active_weights = normalized;
                 }
             }
 
-            // STEP 5: Record cumulative return
+            // STEP 5: Check if prev_date is a rebalance day
+            // Only rebalance after we've seen the first signal
+            if has_first_signal {
+                let should_rebalance = match resample {
+                    ResampleFreq::Monthly => is_month_end,
+                    ResampleFreq::Weekly => is_week_end,
+                    ResampleFreq::Daily => true,
+                    ResampleFreq::PositionChange => position_changed,
+                };
+
+                // Set pending weights for T+1 execution
+                // For Daily: include empty to trigger exit
+                if should_rebalance {
+                    pending_weights = Some(active_weights.clone());
+                    pending_signal_date = Some(prev_date);
+                }
+            }
+
+            // STEP 6: Record cumulative return
             creturn.push(portfolio.balance());
 
             // Clear today's data for new day
@@ -402,6 +747,18 @@ fn is_month_end_i32(prev_days: i32, next_days: i32) -> bool {
     prev_ym != next_ym
 }
 
+/// Check if prev_date is a week-end using i32 dates (days since 1970-01-01)
+///
+/// Returns true if prev_date and next_date are in different ISO weeks.
+/// Week starts on Monday (ISO 8601).
+fn is_week_end_i32(prev_days: i32, next_days: i32) -> bool {
+    // 1970-01-01 was a Thursday (weekday 3, where Monday=0)
+    // Calculate ISO week number for each date
+    let prev_week = (prev_days + 3) / 7; // +3 to shift Thursday to Sunday position
+    let next_week = (next_days + 3) / 7;
+    prev_week != next_week
+}
+
 /// Convert days since 1970-01-01 to (year, month)
 #[inline]
 fn days_to_year_month(days: i32) -> (i32, u32) {
@@ -458,6 +815,93 @@ fn execute_pending_stops(
     }
 }
 
+/// Detect stops for string-keyed positions (Finlab mode)
+///
+/// Returns list of symbols that should be stopped out.
+/// Accepts prices to match Finlab's floating point behavior (cr_at_close = cr * price / price).
+fn detect_stops_string(
+    portfolio: &Portfolio,
+    prices: &HashMap<&str, f64>,
+    config: &BacktestConfig,
+) -> Vec<String> {
+    let mut stopped = Vec::new();
+
+    for (sym, pos) in portfolio.positions.iter() {
+        // Get current price for this symbol
+        let current_price = prices.get(sym.as_str()).copied().unwrap_or(0.0);
+
+        // Skip if price is invalid
+        if current_price <= 0.0 || current_price.is_nan() {
+            continue;
+        }
+
+        // Use last_market_value to determine long/short (like Wide format)
+        let is_long = pos.last_market_value >= 0.0;
+        let cr = pos.cr;
+        let maxcr = pos.maxcr;
+
+        // Finlab uses cr_at_close = cr * close / price for stop detection (line 387)
+        // Even when close == price (both adj_close), the multiply-divide operation
+        // affects floating point precision, which matters at exact threshold boundaries.
+        let cr_at_close = cr * current_price / current_price;
+
+        if is_long {
+            // Long positions:
+            //   max_r = 1 + take_profit
+            //   min_r = max(1 - stop_loss, maxcr - trail_stop)
+            // Trigger: cr >= max_r (take profit) or cr < min_r (stop loss/trail)
+
+            // Check take profit
+            if config.take_profit < f64::INFINITY && cr_at_close >= 1.0 + config.take_profit {
+                stopped.push(sym.clone());
+                continue;
+            }
+
+            // Calculate min_r using Finlab formula
+            let stop_threshold = 1.0 - config.stop_loss;
+            let trail_threshold = if config.trail_stop < f64::INFINITY {
+                maxcr - config.trail_stop
+            } else {
+                f64::NEG_INFINITY
+            };
+            let min_r = stop_threshold.max(trail_threshold);
+
+            // Check stop loss or trailing stop (Finlab uses < not <=)
+            if cr_at_close < min_r {
+                stopped.push(sym.clone());
+            }
+        } else {
+            // Short positions:
+            //   max_r = min(1 + stop_loss, maxcr + trail_stop)
+            //   min_r = 1 - take_profit
+            // Trigger: cr >= max_r (stop loss/trail) or cr < min_r (take profit)
+
+            // Calculate max_r for short positions
+            let stop_threshold = 1.0 + config.stop_loss;
+            let trail_threshold = if config.trail_stop < f64::INFINITY {
+                maxcr + config.trail_stop
+            } else {
+                f64::INFINITY
+            };
+            let max_r = stop_threshold.min(trail_threshold);
+
+            // Check stop loss or trailing stop
+            if cr_at_close >= max_r {
+                stopped.push(sym.clone());
+                continue;
+            }
+
+            // Check take profit for short
+            let min_r = 1.0 - config.take_profit;
+            if config.take_profit < f64::INFINITY && cr_at_close < min_r {
+                stopped.push(sym.clone());
+            }
+        }
+    }
+
+    stopped
+}
+
 /// Execute rebalance with string-keyed positions
 fn execute_rebalance(
     portfolio: &mut Portfolio,
@@ -473,7 +917,38 @@ fn execute_rebalance(
 
     // Calculate total balance
     let balance = portfolio.balance();
-    let total_target_weight: f64 = target_weights.values().map(|w| w.abs()).sum();
+
+    // Finlab behavior: When stop_trading_next_period is true, exclude stopped stocks
+    // from weight calculation and re-normalize remaining weights (like Wide format)
+    let (effective_weights, total_target_weight) = if config.stop_trading_next_period {
+        // Calculate original sum
+        let original_sum: f64 = target_weights.values().map(|w| w.abs()).sum();
+
+        // Filter out stopped stocks
+        let filtered: HashMap<String, f64> = target_weights
+            .iter()
+            .filter(|(sym, _)| !stopped_stocks.get(*sym).copied().unwrap_or(false))
+            .map(|(k, &v)| (k.clone(), v))
+            .collect();
+
+        // Calculate remaining sum
+        let remaining_sum: f64 = filtered.values().map(|w| w.abs()).sum();
+
+        // Re-normalize: scale up remaining weights to maintain full investment
+        if remaining_sum > 0.0 && remaining_sum < original_sum {
+            let scale_factor = original_sum / remaining_sum;
+            let scaled: HashMap<String, f64> = filtered
+                .into_iter()
+                .map(|(k, v)| (k, v * scale_factor))
+                .collect();
+            let new_sum: f64 = scaled.values().map(|w| w.abs()).sum();
+            (scaled, new_sum)
+        } else {
+            (filtered, remaining_sum)
+        }
+    } else {
+        (target_weights.clone(), target_weights.values().map(|w| w.abs()).sum())
+    };
 
     if total_target_weight == 0.0 || balance <= 0.0 {
         // Exit all positions
@@ -505,11 +980,9 @@ fn execute_rebalance(
     portfolio.positions.clear();
     let mut cash = portfolio.cash;
 
-    for (sym, &target_weight) in target_weights {
-        // Skip stopped stocks first
-        if stopped_stocks.get(sym).copied().unwrap_or(false) {
-            continue;
-        }
+    for (sym, &target_weight) in &effective_weights {
+        // Note: stopped stocks are already filtered out in effective_weights when
+        // stop_trading_next_period is true
 
         // Get price and check validity
         let price_opt = today_prices.get(sym.as_str()).copied();
@@ -600,15 +1073,41 @@ fn execute_rebalance(
         }
     }
 
-    // Handle positions outside target_weights
+    // Handle positions outside effective_weights (which has stopped stocks filtered)
     for (sym, &old_value) in old_positions.iter() {
-        if !target_weights.contains_key(sym) && old_value.abs() > 1e-10 {
+        if !effective_weights.contains_key(sym) && old_value.abs() > 1e-10 {
             let sell_fee = old_value.abs() * (config.fee_ratio + config.tax_ratio);
             cash += old_value - sell_fee;
         }
     }
 
     portfolio.cash = cash;
+}
+
+/// Check if two weight maps differ (for PositionChange mode)
+///
+/// Two weight maps differ if:
+/// 1. They have different keys (symbols)
+/// 2. Any corresponding weights differ by more than 1e-10
+fn weights_differ(a: &HashMap<String, f64>, b: &HashMap<String, f64>) -> bool {
+    // Different number of symbols
+    if a.len() != b.len() {
+        return true;
+    }
+
+    // Check each symbol
+    for (sym, &weight_a) in a.iter() {
+        match b.get(sym) {
+            Some(&weight_b) => {
+                if (weight_a - weight_b).abs() > 1e-10 {
+                    return true;
+                }
+            }
+            None => return true, // Symbol in a but not in b
+        }
+    }
+
+    false
 }
 
 /// Normalize weights using Finlab's behavior
@@ -646,6 +1145,511 @@ fn normalize_weights(
             (sym.to_string(), clipped)
         })
         .collect()
+}
+
+// ============================================================================
+// Backtest with trade tracking
+// ============================================================================
+
+/// Execute rebalance with trade tracking
+fn execute_rebalance_with_tracker<T: StringTradeTracker>(
+    portfolio: &mut Portfolio,
+    target_weights: &HashMap<String, f64>,
+    today_prices: &HashMap<&str, f64>,
+    stopped_stocks: &HashMap<String, bool>,
+    config: &BacktestConfig,
+    current_date: i32,
+    signal_date: i32,
+    tracker: &mut T,
+) {
+    // Update existing positions to market value
+    for (_sym, pos) in portfolio.positions.iter_mut() {
+        pos.value = pos.last_market_value;
+    }
+
+    // Calculate total balance
+    let balance = portfolio.balance();
+
+    // Finlab behavior: When stop_trading_next_period is true, exclude stopped stocks
+    // from weight calculation and re-normalize remaining weights (like Wide format)
+    let (effective_weights, total_target_weight) = if config.stop_trading_next_period {
+        // Calculate original sum
+        let original_sum: f64 = target_weights.values().map(|w| w.abs()).sum();
+
+        // Filter out stopped stocks
+        let filtered: HashMap<String, f64> = target_weights
+            .iter()
+            .filter(|(sym, _)| !stopped_stocks.get(*sym).copied().unwrap_or(false))
+            .map(|(k, &v)| (k.clone(), v))
+            .collect();
+
+        // Calculate remaining sum
+        let remaining_sum: f64 = filtered.values().map(|w| w.abs()).sum();
+
+        // Re-normalize: scale up remaining weights to maintain full investment
+        if remaining_sum > 0.0 && remaining_sum < original_sum {
+            let scale_factor = original_sum / remaining_sum;
+            let scaled: HashMap<String, f64> = filtered
+                .into_iter()
+                .map(|(k, v)| (k, v * scale_factor))
+                .collect();
+            let new_sum: f64 = scaled.values().map(|w| w.abs()).sum();
+            (scaled, new_sum)
+        } else {
+            (filtered, remaining_sum)
+        }
+    } else {
+        (target_weights.clone(), target_weights.values().map(|w| w.abs()).sum())
+    };
+
+    if total_target_weight == 0.0 || balance <= 0.0 {
+        // Exit all positions
+        let all_positions: Vec<String> = portfolio.positions.keys().cloned().collect();
+        for sym in all_positions {
+            if let Some(pos) = portfolio.positions.remove(&sym) {
+                let exit_price = today_prices.get(sym.as_str()).copied().unwrap_or(pos.previous_price);
+                tracker.close_trade(
+                    &sym,
+                    current_date,
+                    Some(signal_date),
+                    exit_price,
+                    config.fee_ratio,
+                    config.tax_ratio,
+                );
+                let sell_value = pos.value - pos.value.abs() * (config.fee_ratio + config.tax_ratio);
+                portfolio.cash += sell_value;
+            }
+        }
+        return;
+    }
+
+    let ratio = balance / total_target_weight.max(1.0);
+
+    // Store old positions (cost basis and market value)
+    let old_positions: HashMap<String, f64> = portfolio
+        .positions
+        .iter()
+        .map(|(k, v)| (k.clone(), v.value))
+        .collect();
+    let old_market_values: HashMap<String, f64> = portfolio
+        .positions
+        .iter()
+        .map(|(k, v)| (k.clone(), v.last_market_value))
+        .collect();
+
+    // Clear and rebuild
+    portfolio.positions.clear();
+    let mut cash = portfolio.cash;
+
+    for (sym, &target_weight) in &effective_weights {
+        // Note: stopped stocks are already filtered out in effective_weights when
+        // stop_trading_next_period is true
+
+        // Get price and check validity
+        let price_opt = today_prices.get(sym.as_str()).copied();
+        let price_valid = price_opt.map_or(false, |p| p > 0.0 && !p.is_nan());
+
+        // Target position value (scaled by ratio)
+        let target_value = target_weight * ratio;
+        let current_value = old_positions.get(sym).copied().unwrap_or(0.0);
+        let had_position = current_value.abs() > 1e-10;
+
+        // Handle NaN price case (match Finlab behavior: enter even with NaN price)
+        if !price_valid {
+            // If target is 0 and we have an old position, sell it using old market value
+            if target_weight.abs() < 1e-10 {
+                if let Some(&old_mv) = old_market_values.get(sym) {
+                    if old_mv.abs() > 1e-10 {
+                        // Close the trade
+                        if had_position {
+                            tracker.close_trade(
+                                sym,
+                                current_date,
+                                Some(signal_date),
+                                f64::NAN, // No valid price
+                                config.fee_ratio,
+                                config.tax_ratio,
+                            );
+                        }
+                        let sell_fee = old_mv.abs() * (config.fee_ratio + config.tax_ratio);
+                        cash += old_mv - sell_fee;
+                    }
+                }
+                continue;
+            }
+
+            // Finlab behavior: Enter/modify position even with NaN price
+            if target_value.abs() > 1e-10 {
+                let amount = target_value - current_value;
+                let is_buy = amount > 0.0;
+                let is_entry =
+                    (target_value >= 0.0 && amount > 0.0) || (target_value <= 0.0 && amount < 0.0);
+                let cost = if is_entry {
+                    amount.abs() * config.fee_ratio
+                } else {
+                    amount.abs() * (config.fee_ratio + config.tax_ratio)
+                };
+
+                let new_value = if is_buy {
+                    cash -= amount;
+                    current_value + amount - cost
+                } else {
+                    let sell_amount = amount.abs();
+                    cash += sell_amount - cost;
+                    current_value - sell_amount
+                };
+
+                if new_value.abs() > 1e-10 {
+                    // Open trade if this is a new position
+                    if !had_position {
+                        tracker.open_trade(sym, current_date, signal_date, f64::NAN, target_weight);
+                    }
+                    portfolio.positions.insert(
+                        sym.clone(),
+                        Position::new_with_nan_price(new_value),
+                    );
+                }
+            }
+            continue;
+        }
+
+        let price = price_opt.unwrap();
+
+        // Valid price case: exit position if target is 0
+        if target_weight.abs() < 1e-10 {
+            if current_value.abs() > 1e-10 {
+                // Close the trade
+                if had_position {
+                    tracker.close_trade(
+                        sym,
+                        current_date,
+                        Some(signal_date),
+                        price,
+                        config.fee_ratio,
+                        config.tax_ratio,
+                    );
+                }
+                let sell_fee = current_value.abs() * (config.fee_ratio + config.tax_ratio);
+                cash += current_value - sell_fee;
+            }
+            continue;
+        }
+
+        let amount = target_value - current_value;
+
+        let is_buy = amount > 0.0;
+        let is_entry = (target_value >= 0.0 && amount > 0.0) || (target_value <= 0.0 && amount < 0.0);
+        let cost = if is_entry {
+            amount.abs() * config.fee_ratio
+        } else {
+            amount.abs() * (config.fee_ratio + config.tax_ratio)
+        };
+
+        let new_position_value = if is_buy {
+            cash -= amount;
+            current_value + amount - cost
+        } else {
+            let sell_amount = amount.abs();
+            cash += sell_amount - cost;
+            current_value - sell_amount
+        };
+
+        if new_position_value.abs() > 1e-10 {
+            // Open trade if this is a new position
+            if !had_position {
+                tracker.open_trade(sym, current_date, signal_date, price, target_weight);
+            }
+            portfolio.positions.insert(
+                sym.clone(),
+                Position::new(new_position_value, price),
+            );
+        }
+    }
+
+    // Handle positions outside effective_weights (close all)
+    // Note: stopped stocks are already filtered out, so they will be sold here
+    for (sym, &old_value) in old_positions.iter() {
+        if !effective_weights.contains_key(sym) && old_value.abs() > 1e-10 {
+            let exit_price = today_prices.get(sym.as_str()).copied().unwrap_or(f64::NAN);
+            tracker.close_trade(
+                sym,
+                current_date,
+                Some(signal_date),
+                exit_price,
+                config.fee_ratio,
+                config.tax_ratio,
+            );
+            let sell_fee = old_value.abs() * (config.fee_ratio + config.tax_ratio);
+            cash += old_value - sell_fee;
+        }
+    }
+
+    portfolio.cash = cash;
+}
+
+/// Execute pending stop exits with trade tracking
+fn execute_pending_stops_with_tracker<T: StringTradeTracker>(
+    portfolio: &mut Portfolio,
+    pending_stops: &mut Vec<String>,
+    stopped_stocks: &mut HashMap<String, bool>,
+    today_prices: &HashMap<&str, f64>,
+    config: &BacktestConfig,
+    current_date: i32,
+    tracker: &mut T,
+) {
+    for sym in pending_stops.drain(..) {
+        if let Some(pos) = portfolio.positions.remove(&sym) {
+            let exit_price = today_prices.get(sym.as_str()).copied().unwrap_or(pos.previous_price);
+            tracker.close_trade(
+                &sym,
+                current_date,
+                None, // Stop exit, no signal date
+                exit_price,
+                config.fee_ratio,
+                config.tax_ratio,
+            );
+            let sell_value =
+                pos.last_market_value - pos.last_market_value.abs() * (config.fee_ratio + config.tax_ratio);
+            portfolio.cash += sell_value;
+            if config.stop_trading_next_period {
+                stopped_stocks.insert(sym, true);
+            }
+        }
+    }
+}
+
+/// Run backtest on Arrow arrays with trade tracking
+///
+/// Same as `backtest_long_arrow` but returns trade records as well.
+pub fn backtest_with_trades_long_arrow(
+    input: &LongFormatArrowInput,
+    resample: ResampleFreq,
+    config: &BacktestConfig,
+) -> LongBacktestResult {
+    let n_rows = input.dates.len();
+    if n_rows == 0 {
+        return LongBacktestResult {
+            creturn: vec![],
+            trades: vec![],
+        };
+    }
+
+    let mut portfolio = Portfolio::new();
+    let mut creturn: Vec<f64> = Vec::new();
+    let mut tracker = RealStringTracker::new();
+
+    // Track stopped stocks by symbol string
+    let mut stopped_stocks: HashMap<String, bool> = HashMap::new();
+
+    // Pending weights for T+1 execution
+    let mut pending_weights: Option<HashMap<String, f64>> = None;
+    let mut pending_signal_date: Option<i32> = None;
+    let mut pending_stop_exits: Vec<String> = Vec::new();
+
+    // Active weights (forward-filled) for Daily/Weekly rebalance
+    let mut active_weights: HashMap<String, f64> = HashMap::new();
+    let mut has_first_signal = false;
+    let mut position_changed = false; // For PositionChange resample mode
+
+    // Track current date (i32 days since epoch)
+    let mut current_date: Option<i32> = None;
+
+    // Today's prices and weights
+    let mut today_prices: HashMap<&str, f64> = HashMap::new();
+    let mut today_weights: HashMap<&str, f64> = HashMap::new();
+
+    // Process each row
+    for i in 0..n_rows {
+        let date = input.dates.value(i);
+        let symbol = input.symbols.value(i);
+        let price = input.prices.value(i);
+        let weight = input.weights.value(i);
+
+        // Check if we've moved to a new date
+        let date_changed = current_date.map_or(true, |d| d != date);
+
+        if date_changed && current_date.is_some() {
+            let prev_date = current_date.unwrap();
+
+            // STEP 1: Update existing positions with today's prices
+            update_positions(&mut portfolio, &today_prices);
+
+            // STEP 2: Execute pending stop exits (from yesterday's detection)
+            execute_pending_stops_with_tracker(
+                &mut portfolio,
+                &mut pending_stop_exits,
+                &mut stopped_stocks,
+                &today_prices,
+                config,
+                prev_date,
+                &mut tracker,
+            );
+
+            // STEP 2.5: Detect new stops (schedule for tomorrow's execution)
+            if config.stop_loss < 1.0
+                || config.take_profit < f64::INFINITY
+                || config.trail_stop < f64::INFINITY
+            {
+                let new_stops = detect_stops_string(&portfolio, &today_prices, config);
+                pending_stop_exits.extend(new_stops);
+            }
+
+            // STEP 3: Execute pending rebalance (T+1 execution)
+            if let Some(target_weights) = pending_weights.take() {
+                let sig_date = pending_signal_date.take().unwrap_or(prev_date);
+                execute_rebalance_with_tracker(
+                    &mut portfolio,
+                    &target_weights,
+                    &today_prices,
+                    &stopped_stocks,
+                    config,
+                    prev_date,
+                    sig_date,
+                    &mut tracker,
+                );
+                stopped_stocks.clear();
+            }
+
+            // STEP 4: Update active weights based on today's signals
+            // Behavior varies by resample frequency to match Wide format (Finlab):
+            // - Daily: always update (empty signals = exit all)
+            // - Weekly: forward-fill within week, apply on week-end
+            // - Monthly: ONLY use signals from month-end day (no forward-fill)
+            let normalized = normalize_weights(
+                &today_weights,
+                &stopped_stocks,
+                config.position_limit,
+            );
+
+            // Check if prev_date is a rebalance boundary
+            let is_month_end = is_month_end_i32(prev_date, date);
+            let is_week_end = is_week_end_i32(prev_date, date);
+
+            match resample {
+                ResampleFreq::Daily => {
+                    // Daily: always update, empty signals means exit all
+                    if !normalized.is_empty() {
+                        has_first_signal = true;
+                    }
+                    if has_first_signal {
+                        active_weights = normalized;
+                    }
+                }
+                ResampleFreq::Weekly => {
+                    // Weekly: ONLY use signals from week-end day
+                    // This matches Wide format which resamples position to week-ends
+                    if is_week_end {
+                        // On week-end, use today's signals directly (could be empty)
+                        let has_signals = !normalized.is_empty();
+                        active_weights = normalized;
+                        if has_signals {
+                            has_first_signal = true;
+                        }
+                    }
+                    // On non-week-end days, ignore today_weights entirely
+                }
+                ResampleFreq::Monthly => {
+                    // Monthly: ONLY use signals from month-end day
+                    // This matches Wide format which resamples position to month-ends
+                    if is_month_end {
+                        // On month-end, use today's signals directly (could be empty)
+                        let has_signals = !normalized.is_empty();
+                        active_weights = normalized;
+                        if has_signals {
+                            has_first_signal = true;
+                        }
+                    }
+                    // On non-month-end days, ignore today_weights entirely
+                }
+                ResampleFreq::PositionChange => {
+                    // PositionChange: only rebalance when weights differ from active_weights
+                    if !normalized.is_empty() {
+                        has_first_signal = true;
+                    }
+                    // Compare BEFORE updating active_weights, save result for STEP 5
+                    position_changed = weights_differ(&active_weights, &normalized);
+                    // Always update active_weights to today's normalized weights
+                    active_weights = normalized;
+                }
+            }
+
+            // STEP 5: Check if prev_date is a rebalance day (only after first signal)
+            if has_first_signal {
+                let should_rebalance = match resample {
+                    ResampleFreq::Monthly => is_month_end,
+                    ResampleFreq::Weekly => is_week_end,
+                    ResampleFreq::Daily => true,
+                    ResampleFreq::PositionChange => position_changed,
+                };
+
+                // Set pending weights for T+1 execution
+                // For Daily: include empty to trigger exit
+                if should_rebalance {
+                    pending_weights = Some(active_weights.clone());
+                    pending_signal_date = Some(prev_date);
+                }
+            }
+
+            // STEP 6: Record cumulative return
+            creturn.push(portfolio.balance());
+
+            // Clear today's data for new day
+            today_prices.clear();
+            today_weights.clear();
+        }
+
+        // Accumulate today's data
+        current_date = Some(date);
+        if price > 0.0 && !price.is_nan() {
+            today_prices.insert(symbol, price);
+        }
+        // Handle null weights (from polars rolling operations) as 0.0
+        if !weight.is_nan() && weight.abs() > 1e-10 {
+            today_weights.insert(symbol, weight);
+        }
+    }
+
+    // Process final day
+    if let Some(last_date) = current_date {
+        if !today_prices.is_empty() {
+            // STEP 1: Update positions
+            update_positions(&mut portfolio, &today_prices);
+
+            // STEP 2: Execute pending stops
+            execute_pending_stops_with_tracker(
+                &mut portfolio,
+                &mut pending_stop_exits,
+                &mut stopped_stocks,
+                &today_prices,
+                config,
+                last_date,
+                &mut tracker,
+            );
+
+            // STEP 3: Execute pending rebalance
+            if let Some(target_weights) = pending_weights.take() {
+                let sig_date = pending_signal_date.take().unwrap_or(last_date);
+                execute_rebalance_with_tracker(
+                    &mut portfolio,
+                    &target_weights,
+                    &today_prices,
+                    &stopped_stocks,
+                    config,
+                    last_date,
+                    sig_date,
+                    &mut tracker,
+                );
+            }
+
+            // STEP 4: Final balance
+            creturn.push(portfolio.balance());
+        }
+    }
+
+    // Finalize trades (include open positions)
+    let trades = tracker.finalize(config.fee_ratio, config.tax_ratio);
+
+    LongBacktestResult { creturn, trades }
 }
 
 #[cfg(test)]

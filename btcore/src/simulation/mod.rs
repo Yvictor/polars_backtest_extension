@@ -26,6 +26,7 @@ pub use long::{
     backtest_long_arrow,
     backtest_long_slice,
     backtest_with_accessor,
+    backtest_with_trades_long_arrow,
     // Types
     LongFormatArrowInput,
     Portfolio,
@@ -34,5 +35,5 @@ pub use long::{
 
 // Re-export from other modules for convenience
 pub use crate::config::BacktestConfig;
-pub use crate::tracker::{BacktestResult, TradeRecord};
+pub use crate::tracker::{BacktestResult, LongBacktestResult, LongTradeRecord, TradeRecord};
 pub use crate::weights::IntoWeights;

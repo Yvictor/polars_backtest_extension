@@ -23,7 +23,10 @@ use polars::prelude::*;
 use btcore::{
     run_backtest, run_backtest_with_trades, BacktestConfig, BacktestResult, PriceData,
     SimTradeRecord,
-    simulation::{backtest_long_arrow, LongFormatArrowInput, ResampleFreq},
+    simulation::{
+        backtest_long_arrow, backtest_with_trades_long_arrow,
+        LongBacktestResult, LongFormatArrowInput, LongTradeRecord, ResampleFreq,
+    },
 };
 
 // =============================================================================
@@ -201,6 +204,93 @@ impl From<BacktestResult> for PyBacktestResult {
     }
 }
 
+/// Python wrapper for LongTradeRecord (string symbols, i32 dates)
+#[pyclass(name = "LongTradeRecord")]
+#[derive(Clone)]
+pub struct PyLongTradeRecord {
+    #[pyo3(get)]
+    pub symbol: String,
+    #[pyo3(get)]
+    pub entry_date: Option<i32>,
+    #[pyo3(get)]
+    pub exit_date: Option<i32>,
+    #[pyo3(get)]
+    pub entry_sig_date: i32,
+    #[pyo3(get)]
+    pub exit_sig_date: Option<i32>,
+    #[pyo3(get)]
+    pub position_weight: f64,
+    #[pyo3(get)]
+    pub entry_price: f64,
+    #[pyo3(get)]
+    pub exit_price: Option<f64>,
+    #[pyo3(get)]
+    pub trade_return: Option<f64>,
+}
+
+#[pymethods]
+impl PyLongTradeRecord {
+    fn holding_days(&self) -> Option<i32> {
+        match (self.entry_date, self.exit_date) {
+            (Some(entry), Some(exit)) => Some(exit - entry),
+            _ => None,
+        }
+    }
+
+    fn __repr__(&self) -> String {
+        format!(
+            "LongTradeRecord(symbol='{}', entry_date={:?}, exit_date={:?}, weight={:.4}, return={:?})",
+            self.symbol, self.entry_date, self.exit_date,
+            self.position_weight, self.trade_return,
+        )
+    }
+}
+
+impl From<LongTradeRecord> for PyLongTradeRecord {
+    fn from(r: LongTradeRecord) -> Self {
+        Self {
+            symbol: r.symbol,
+            entry_date: r.entry_date,
+            exit_date: r.exit_date,
+            entry_sig_date: r.entry_sig_date,
+            exit_sig_date: r.exit_sig_date,
+            position_weight: r.position_weight,
+            entry_price: r.entry_price,
+            exit_price: r.exit_price,
+            trade_return: r.trade_return,
+        }
+    }
+}
+
+/// Python wrapper for LongBacktestResult
+#[pyclass(name = "LongBacktestResult")]
+#[derive(Clone)]
+pub struct PyLongBacktestResult {
+    #[pyo3(get)]
+    pub creturn: Vec<f64>,
+    #[pyo3(get)]
+    pub trades: Vec<PyLongTradeRecord>,
+}
+
+#[pymethods]
+impl PyLongBacktestResult {
+    fn __repr__(&self) -> String {
+        format!(
+            "LongBacktestResult(creturn_len={}, trades_count={})",
+            self.creturn.len(), self.trades.len(),
+        )
+    }
+}
+
+impl From<LongBacktestResult> for PyLongBacktestResult {
+    fn from(r: LongBacktestResult) -> Self {
+        Self {
+            creturn: r.creturn,
+            trades: r.trades.into_iter().map(|t| t.into()).collect(),
+        }
+    }
+}
+
 // =============================================================================
 // Main API: Long Format Backtest (zero-copy)
 // =============================================================================
@@ -211,11 +301,11 @@ impl From<BacktestResult> for PyBacktestResult {
 /// using Arrow arrays with true zero-copy access via FFI.
 ///
 /// Args:
-///     df: DataFrame with columns [date, symbol, price, weight]
-///     date_col: Name of date column (default: "date")
-///     symbol_col: Name of symbol column (default: "symbol")
-///     price_col: Name of price column (default: "close")
-///     weight_col: Name of weight column (default: "weight")
+///     df: DataFrame with columns [date, symbol, trade_at_price, position]
+///     date: Name of date column (default: "date")
+///     symbol: Name of symbol column (default: "symbol")
+///     trade_at_price: Name of price column (default: "close")
+///     position: Name of position/weight column (default: "weight")
 ///     resample: Rebalancing frequency ("D", "W", "M", or None for daily)
 ///     config: BacktestConfig (optional)
 ///     skip_sort: Skip sorting if data is already sorted by date (default: false)
@@ -225,20 +315,20 @@ impl From<BacktestResult> for PyBacktestResult {
 #[pyfunction]
 #[pyo3(signature = (
     df,
-    date_col="date",
-    symbol_col="symbol",
-    price_col="close",
-    weight_col="weight",
+    date="date",
+    symbol="symbol",
+    trade_at_price="close",
+    position="weight",
     resample=None,
     config=None,
     skip_sort=false
 ))]
 fn backtest(
     df: PyDataFrame,
-    date_col: &str,
-    symbol_col: &str,
-    price_col: &str,
-    weight_col: &str,
+    date: &str,
+    symbol: &str,
+    trade_at_price: &str,
+    position: &str,
     resample: Option<&str>,
     config: Option<PyBacktestConfig>,
     skip_sort: bool,
@@ -253,7 +343,7 @@ fn backtest(
     let n_rows = df.height();
 
     // Validate required columns exist
-    for col_name in [date_col, symbol_col, price_col, weight_col] {
+    for col_name in [date, symbol, trade_at_price, position] {
         if df.column(col_name).is_err() {
             return Err(PyValueError::new_err(format!(
                 "Missing required column: '{}'", col_name
@@ -267,7 +357,7 @@ fn backtest(
         df
     } else {
         let sorted = df
-            .sort([date_col], SortMultipleOptions::default())
+            .sort([date], SortMultipleOptions::default())
             .map_err(|e| PyValueError::new_err(format!("Failed to sort: {}", e)))?;
         eprintln!("[PROFILE] Sort: {:?} (rows={})", step_start.elapsed(), n_rows);
         sorted
@@ -275,7 +365,7 @@ fn backtest(
     step_start = Instant::now();
 
     // Get ChunkedArrays - only cast/rechunk when necessary
-    let date_col_ref = df.column(date_col)
+    let date_col_ref = df.column(date)
         .map_err(|e| PyValueError::new_err(format!("Failed to get date column: {}", e)))?;
     let date_series = if date_col_ref.dtype() == &DataType::Date {
         date_col_ref.clone()
@@ -295,7 +385,7 @@ fn backtest(
         date_phys
     };
 
-    let symbol_ref = df.column(symbol_col)
+    let symbol_ref = df.column(symbol)
         .map_err(|e| PyValueError::new_err(format!("Failed to get symbol column: {}", e)))?
         .str()
         .map_err(|e| PyValueError::new_err(format!("Symbol column must be string: {}", e)))?;
@@ -308,7 +398,7 @@ fn backtest(
         symbol_ref
     };
 
-    let price_col_ref = df.column(price_col)
+    let price_col_ref = df.column(trade_at_price)
         .map_err(|e| PyValueError::new_err(format!("Failed to get price column: {}", e)))?;
     let price_series = if price_col_ref.dtype() == &DataType::Float64 {
         price_col_ref.clone()
@@ -327,34 +417,34 @@ fn backtest(
         price_f64
     };
 
-    let weight_col_ref = df.column(weight_col)
-        .map_err(|e| PyValueError::new_err(format!("Failed to get weight column: {}", e)))?;
-    let weight_series = if weight_col_ref.dtype() == &DataType::Float64 {
-        weight_col_ref.clone()
+    let position_col_ref = df.column(position)
+        .map_err(|e| PyValueError::new_err(format!("Failed to get position column: {}", e)))?;
+    let position_series = if position_col_ref.dtype() == &DataType::Float64 {
+        position_col_ref.clone()
     } else {
-        weight_col_ref.cast(&DataType::Float64)
-            .map_err(|e| PyValueError::new_err(format!("Failed to cast weight: {}", e)))?
+        position_col_ref.cast(&DataType::Float64)
+            .map_err(|e| PyValueError::new_err(format!("Failed to cast position: {}", e)))?
     };
-    let weight_f64 = weight_series.f64()
-        .map_err(|e| PyValueError::new_err(format!("Weight must be f64: {}", e)))?;
-    let weight_nc = weight_f64.chunks().len();
-    let weight_ca_rechunked;
-    let weight_ca: &Float64Chunked = if weight_nc > 1 {
-        weight_ca_rechunked = weight_f64.rechunk();
-        &weight_ca_rechunked
+    let position_f64 = position_series.f64()
+        .map_err(|e| PyValueError::new_err(format!("Position must be f64: {}", e)))?;
+    let position_nc = position_f64.chunks().len();
+    let position_ca_rechunked;
+    let position_ca: &Float64Chunked = if position_nc > 1 {
+        position_ca_rechunked = position_f64.rechunk();
+        &position_ca_rechunked
     } else {
-        weight_f64
+        position_f64
     };
 
-    eprintln!("[PROFILE] Get ChunkedArrays (chunks: d={}, s={}, p={}, w={}): {:?}",
-              date_nc, sym_nc, price_nc, weight_nc, step_start.elapsed());
+    eprintln!("[PROFILE] Get ChunkedArrays (chunks: d={}, s={}, p={}, pos={}): {:?}",
+              date_nc, sym_nc, price_nc, position_nc, step_start.elapsed());
     step_start = Instant::now();
 
     // Get underlying polars-arrow arrays (single chunk guaranteed by rechunk)
     let date_chunks = date_ca.chunks();
     let symbol_chunks = symbol_ca.chunks();
     let price_chunks = price_ca.chunks();
-    let weight_chunks = weight_ca.chunks();
+    let position_chunks = position_ca.chunks();
 
     // Downcast to concrete polars-arrow types
     let dates_arrow = date_chunks[0]
@@ -372,10 +462,10 @@ fn backtest(
         .downcast_ref::<PrimitiveArray<f64>>()
         .ok_or_else(|| PyValueError::new_err("Failed to downcast price array"))?;
 
-    let weights_arrow = weight_chunks[0]
+    let positions_arrow = position_chunks[0]
         .as_any()
         .downcast_ref::<PrimitiveArray<f64>>()
-        .ok_or_else(|| PyValueError::new_err("Failed to downcast weight array"))?;
+        .ok_or_else(|| PyValueError::new_err("Failed to downcast position array"))?;
 
     eprintln!("[PROFILE] Get polars-arrow arrays: {:?}", step_start.elapsed());
     step_start = Instant::now();
@@ -387,8 +477,8 @@ fn backtest(
         .map_err(|e| PyValueError::new_err(format!("FFI symbol conversion failed: {}", e)))?;
     let prices_rs = ffi_convert::polars_f64_to_arrow(prices_arrow)
         .map_err(|e| PyValueError::new_err(format!("FFI price conversion failed: {}", e)))?;
-    let weights_rs = ffi_convert::polars_f64_to_arrow(weights_arrow)
-        .map_err(|e| PyValueError::new_err(format!("FFI weight conversion failed: {}", e)))?;
+    let positions_rs = ffi_convert::polars_f64_to_arrow(positions_arrow)
+        .map_err(|e| PyValueError::new_err(format!("FFI position conversion failed: {}", e)))?;
 
     eprintln!("[PROFILE] FFI conversion (polars-arrow -> arrow-rs): {:?}", step_start.elapsed());
     step_start = Instant::now();
@@ -409,7 +499,7 @@ fn backtest(
         dates: &dates_rs,
         symbols: &symbols_rs,
         prices: &prices_rs,
-        weights: &weights_rs,
+        weights: &positions_rs,
     };
 
     // Run backtest using btcore with arrow-rs arrays
@@ -422,6 +512,201 @@ fn backtest(
         creturn: result.creturn,
         trades: vec![],
     })
+}
+
+/// Run backtest with trade tracking on long format DataFrame
+///
+/// Same as `backtest()` but also returns trade records.
+///
+/// Args:
+///     df: DataFrame with columns [date, symbol, trade_at_price, position]
+///     date: Name of date column (default: "date")
+///     symbol: Name of symbol column (default: "symbol")
+///     trade_at_price: Name of price column (default: "close")
+///     position: Name of position/weight column (default: "weight")
+///     resample: Rebalancing frequency ("D", "W", "M", or None for daily)
+///     config: BacktestConfig (optional)
+///     skip_sort: Skip sorting if data is already sorted by date (default: false)
+///
+/// Returns:
+///     LongBacktestResult with creturn and trades
+#[pyfunction]
+#[pyo3(signature = (
+    df,
+    date="date",
+    symbol="symbol",
+    trade_at_price="close",
+    position="weight",
+    resample=None,
+    config=None,
+    skip_sort=false
+))]
+fn backtest_with_trades(
+    df: PyDataFrame,
+    date: &str,
+    symbol: &str,
+    trade_at_price: &str,
+    position: &str,
+    resample: Option<&str>,
+    config: Option<PyBacktestConfig>,
+    skip_sort: bool,
+) -> PyResult<PyLongBacktestResult> {
+    use polars_arrow::array::{PrimitiveArray, Utf8ViewArray};
+
+    let df = df.0;
+    let n_rows = df.height();
+
+    // Validate required columns exist
+    for col_name in [date, symbol, trade_at_price, position] {
+        if df.column(col_name).is_err() {
+            return Err(PyValueError::new_err(format!(
+                "Missing required column: '{}'", col_name
+            )));
+        }
+    }
+
+    // Sort by date if needed
+    let df = if skip_sort {
+        df
+    } else {
+        df.sort([date], SortMultipleOptions::default())
+            .map_err(|e| PyValueError::new_err(format!("Failed to sort: {}", e)))?
+    };
+
+    // Get ChunkedArrays - only cast/rechunk when necessary
+    let date_col_ref = df.column(date)
+        .map_err(|e| PyValueError::new_err(format!("Failed to get date column: {}", e)))?;
+    let date_series = if date_col_ref.dtype() == &DataType::Date {
+        date_col_ref.clone()
+    } else {
+        date_col_ref.cast(&DataType::Date)
+            .map_err(|e| PyValueError::new_err(format!("Failed to cast date: {}", e)))?
+    };
+    let date_phys = date_series.date()
+        .map_err(|e| PyValueError::new_err(format!("Date column must be Date: {}", e)))?
+        .physical();
+    let date_nc = date_phys.chunks().len();
+    let date_ca_rechunked;
+    let date_ca: &ChunkedArray<Int32Type> = if date_nc > 1 {
+        date_ca_rechunked = date_phys.rechunk();
+        &date_ca_rechunked
+    } else {
+        date_phys
+    };
+
+    let symbol_ref = df.column(symbol)
+        .map_err(|e| PyValueError::new_err(format!("Failed to get symbol column: {}", e)))?
+        .str()
+        .map_err(|e| PyValueError::new_err(format!("Symbol column must be string: {}", e)))?;
+    let sym_nc = symbol_ref.chunks().len();
+    let symbol_ca_rechunked;
+    let symbol_ca: &StringChunked = if sym_nc > 1 {
+        symbol_ca_rechunked = symbol_ref.rechunk();
+        &symbol_ca_rechunked
+    } else {
+        symbol_ref
+    };
+
+    let price_col_ref = df.column(trade_at_price)
+        .map_err(|e| PyValueError::new_err(format!("Failed to get price column: {}", e)))?;
+    let price_series = if price_col_ref.dtype() == &DataType::Float64 {
+        price_col_ref.clone()
+    } else {
+        price_col_ref.cast(&DataType::Float64)
+            .map_err(|e| PyValueError::new_err(format!("Failed to cast price: {}", e)))?
+    };
+    let price_f64 = price_series.f64()
+        .map_err(|e| PyValueError::new_err(format!("Price must be f64: {}", e)))?;
+    let price_nc = price_f64.chunks().len();
+    let price_ca_rechunked;
+    let price_ca: &Float64Chunked = if price_nc > 1 {
+        price_ca_rechunked = price_f64.rechunk();
+        &price_ca_rechunked
+    } else {
+        price_f64
+    };
+
+    let position_col_ref = df.column(position)
+        .map_err(|e| PyValueError::new_err(format!("Failed to get position column: {}", e)))?;
+    let position_series = if position_col_ref.dtype() == &DataType::Float64 {
+        position_col_ref.clone()
+    } else {
+        position_col_ref.cast(&DataType::Float64)
+            .map_err(|e| PyValueError::new_err(format!("Failed to cast position: {}", e)))?
+    };
+    let position_f64 = position_series.f64()
+        .map_err(|e| PyValueError::new_err(format!("Position must be f64: {}", e)))?;
+    let position_nc = position_f64.chunks().len();
+    let position_ca_rechunked;
+    let position_ca: &Float64Chunked = if position_nc > 1 {
+        position_ca_rechunked = position_f64.rechunk();
+        &position_ca_rechunked
+    } else {
+        position_f64
+    };
+
+    // Get underlying polars-arrow arrays (single chunk guaranteed by rechunk)
+    let date_chunks = date_ca.chunks();
+    let symbol_chunks = symbol_ca.chunks();
+    let price_chunks = price_ca.chunks();
+    let position_chunks = position_ca.chunks();
+
+    // Downcast to concrete polars-arrow types
+    let dates_arrow = date_chunks[0]
+        .as_any()
+        .downcast_ref::<PrimitiveArray<i32>>()
+        .ok_or_else(|| PyValueError::new_err("Failed to downcast date array"))?;
+
+    let symbols_arrow = symbol_chunks[0]
+        .as_any()
+        .downcast_ref::<Utf8ViewArray>()
+        .ok_or_else(|| PyValueError::new_err("Failed to downcast symbol array"))?;
+
+    let prices_arrow = price_chunks[0]
+        .as_any()
+        .downcast_ref::<PrimitiveArray<f64>>()
+        .ok_or_else(|| PyValueError::new_err("Failed to downcast price array"))?;
+
+    let positions_arrow = position_chunks[0]
+        .as_any()
+        .downcast_ref::<PrimitiveArray<f64>>()
+        .ok_or_else(|| PyValueError::new_err("Failed to downcast position array"))?;
+
+    // Convert polars-arrow arrays to arrow-rs arrays using FFI (zero-copy)
+    let dates_rs = ffi_convert::polars_i32_to_arrow(dates_arrow)
+        .map_err(|e| PyValueError::new_err(format!("FFI date conversion failed: {}", e)))?;
+    let symbols_rs = ffi_convert::polars_utf8view_to_arrow(symbols_arrow)
+        .map_err(|e| PyValueError::new_err(format!("FFI symbol conversion failed: {}", e)))?;
+    let prices_rs = ffi_convert::polars_f64_to_arrow(prices_arrow)
+        .map_err(|e| PyValueError::new_err(format!("FFI price conversion failed: {}", e)))?;
+    let positions_rs = ffi_convert::polars_f64_to_arrow(positions_arrow)
+        .map_err(|e| PyValueError::new_err(format!("FFI position conversion failed: {}", e)))?;
+
+    // Get config (default to finlab_mode=true for long format)
+    let cfg = config.map(|c| c.inner).unwrap_or_else(|| {
+        BacktestConfig {
+            finlab_mode: true,
+            ..Default::default()
+        }
+    });
+
+    // Parse resample frequency
+    let resample_freq = ResampleFreq::from_str(resample);
+
+    // Build arrow input for btcore
+    let input = LongFormatArrowInput {
+        dates: &dates_rs,
+        symbols: &symbols_rs,
+        prices: &prices_rs,
+        weights: &positions_rs,
+    };
+
+    // Run backtest with trades using btcore
+    let result = backtest_with_trades_long_arrow(&input, resample_freq, &cfg);
+
+    eprintln!("[PROFILE] backtest_with_trades: {} rows, {} trades", n_rows, result.trades.len());
+
+    Ok(result.into())
 }
 
 // =============================================================================
@@ -576,11 +861,16 @@ fn df_to_f64_2d(df: &DataFrame) -> Result<Vec<Vec<f64>>, String> {
 #[pymodule]
 fn _polars_backtest(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add("__version__", env!("CARGO_PKG_VERSION"))?;
+    // Wide format types
     m.add_class::<PyBacktestConfig>()?;
     m.add_class::<PyTradeRecord>()?;
     m.add_class::<PyBacktestResult>()?;
+    // Long format types
+    m.add_class::<PyLongTradeRecord>()?;
+    m.add_class::<PyLongBacktestResult>()?;
     // Main API (long format)
     m.add_function(wrap_pyfunction!(backtest, m)?)?;
+    m.add_function(wrap_pyfunction!(backtest_with_trades, m)?)?;
     // Wide format API (for validation)
     m.add_function(wrap_pyfunction!(backtest_wide, m)?)?;
     m.add_function(wrap_pyfunction!(backtest_with_trades_wide, m)?)?;

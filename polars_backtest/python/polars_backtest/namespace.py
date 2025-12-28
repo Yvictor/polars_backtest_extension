@@ -5,9 +5,12 @@ Provides df.bt.backtest() API for long format DataFrames.
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Union
 
 import polars as pl
+
+# Type alias for column specification (str or Expr)
+ColumnSpec = Union[str, pl.Expr]
 
 # Import from internal module to avoid circular imports
 from polars_backtest._polars_backtest import (
@@ -28,6 +31,27 @@ def _get_resample_helpers():
     """Lazy import of resample helpers to avoid circular imports."""
     import polars_backtest as pb
     return pb._resample_position, pb._filter_changed_positions, pb.Report
+
+
+def _resolve_column(
+    df: pl.DataFrame,
+    col_spec: ColumnSpec,
+    temp_name: str,
+) -> tuple[pl.DataFrame, str]:
+    """Resolve a column specification (str or Expr) to a column name.
+
+    Args:
+        df: DataFrame to process
+        col_spec: Column name (str) or expression (Expr)
+        temp_name: Temporary column name to use if col_spec is an Expr
+
+    Returns:
+        Tuple of (possibly modified DataFrame, column name to use)
+    """
+    if isinstance(col_spec, pl.Expr):
+        df = df.with_columns(col_spec.alias(temp_name))
+        return df, temp_name
+    return df, col_spec
 
 
 def _long_to_wide(
@@ -78,13 +102,13 @@ class BacktestNamespace:
 
     def _validate_columns(
         self,
-        date_col: str,
-        symbol_col: str,
-        price_col: str,
-        weight_col: str,
+        date: str,
+        symbol: str,
+        trade_at_price: str,
+        position: str,
     ) -> None:
-        """Validate required columns exist."""
-        required = [date_col, symbol_col, price_col, weight_col]
+        """Validate required columns exist (only for str column names)."""
+        required = [date, symbol, trade_at_price, position]
         missing = [c for c in required if c not in self._df.columns]
         if missing:
             raise ValueError(f"Missing required columns: {missing}")
@@ -145,10 +169,10 @@ class BacktestNamespace:
 
     def backtest(
         self,
-        price: str = "close",
-        weight: str = "weight",
-        date_col: str = "date",
-        symbol_col: str = "symbol",
+        trade_at_price: ColumnSpec = "close",
+        position: ColumnSpec = "weight",
+        date: ColumnSpec = "date",
+        symbol: ColumnSpec = "symbol",
         resample: str | None = "D",
         resample_offset: str | None = None,
         fee_ratio: float = 0.001425,
@@ -164,10 +188,10 @@ class BacktestNamespace:
         """Run backtest on long format DataFrame.
 
         Args:
-            price: Price column name (default: "close")
-            weight: Weight column name (default: "weight")
-            date_col: Date column name (default: "date")
-            symbol_col: Symbol column name (default: "symbol")
+            trade_at_price: Price column name or Expr (default: "close")
+            position: Position/weight column name or Expr (default: "weight")
+            date: Date column name or Expr (default: "date")
+            symbol: Symbol column name or Expr (default: "symbol")
             resample: Rebalance frequency ('D', 'W', 'M', 'Q', 'Y', None)
             resample_offset: Optional offset for rebalance dates
             fee_ratio: Transaction fee ratio
@@ -183,24 +207,35 @@ class BacktestNamespace:
         Returns:
             DataFrame with columns: date, creturn
         """
-        self._validate_columns(date_col, symbol_col, price, weight)
+        df = self._df
 
-        # Check if weight column is boolean (signals)
-        weight_dtype = self._df.get_column(weight).dtype
-        is_bool_signal = weight_dtype == pl.Boolean
+        # Resolve column specs (str or Expr) to column names
+        df, date_col = _resolve_column(df, date, "_bt_date")
+        df, symbol_col = _resolve_column(df, symbol, "_bt_symbol")
+        df, price_col = _resolve_column(df, trade_at_price, "_bt_price")
+        df, position_col = _resolve_column(df, position, "_bt_position")
 
-        # Handle null values in weight column
+        # Validate columns exist
+        required = [date_col, symbol_col, price_col, position_col]
+        missing = [c for c in required if c not in df.columns]
+        if missing:
+            raise ValueError(f"Missing required columns: {missing}")
+
+        # Check if position column is boolean (signals)
+        position_dtype = df.get_column(position_col).dtype
+        is_bool_signal = position_dtype == pl.Boolean
+
+        # Handle null values in position column
         # Polars rolling operations return null for first N-1 rows (unlike pandas NaN -> False)
         # Fill nulls with False/0.0, then cast bool to float for Rust path
-        df = self._df
         if is_bool_signal:
             # Cast bool to float (True -> 1.0, False -> 0.0)
             # Rust's normalize_weights_finlab will convert to equal weights
             df = df.with_columns(
-                pl.col(weight).fill_null(False).cast(pl.Float64)
+                pl.col(position_col).fill_null(False).cast(pl.Float64)
             )
         else:
-            df = df.with_columns(pl.col(weight).fill_null(0.0))
+            df = df.with_columns(pl.col(position_col).fill_null(0.0))
 
         # Check if we can use Rust path (basic resample, no offset)
         use_rust = (
@@ -230,8 +265,8 @@ class BacktestNamespace:
                 df,
                 date_col,
                 symbol_col,
-                price,
-                weight,
+                price_col,
+                position_col,
                 resample,
                 config,
                 skip_sort,
@@ -272,7 +307,7 @@ class BacktestNamespace:
         # Fallback to Python path for complex resample patterns
         # Convert to wide format (using df with nulls filled)
         wide_data = self._prepare_wide_data(
-            date_col, symbol_col, price, weight, df=df
+            date_col, symbol_col, price_col, position_col, df=df
         )
         prices_wide = wide_data["prices"]
         position_wide = wide_data["position"]
@@ -374,13 +409,13 @@ class BacktestNamespace:
 
     def backtest_with_report(
         self,
-        price: str = "close",
-        weight: str = "weight",
-        date_col: str = "date",
-        symbol_col: str = "symbol",
-        open_col: str | None = None,
-        high_col: str | None = None,
-        low_col: str | None = None,
+        trade_at_price: ColumnSpec = "close",
+        position: ColumnSpec = "weight",
+        date: ColumnSpec = "date",
+        symbol: ColumnSpec = "symbol",
+        open: ColumnSpec | None = None,
+        high: ColumnSpec | None = None,
+        low: ColumnSpec | None = None,
         resample: str | None = "D",
         resample_offset: str | None = None,
         fee_ratio: float = 0.001425,
@@ -396,13 +431,13 @@ class BacktestNamespace:
         """Run backtest with trade tracking, returning a Report object.
 
         Args:
-            price: Price column name (default: "close")
-            weight: Weight column name (default: "weight")
-            date_col: Date column name (default: "date")
-            symbol_col: Symbol column name (default: "symbol")
-            open_col: Open price column name (optional)
-            high_col: High price column name (optional)
-            low_col: Low price column name (optional)
+            trade_at_price: Price column name or Expr (default: "close")
+            position: Position/weight column name or Expr (default: "weight")
+            date: Date column name or Expr (default: "date")
+            symbol: Symbol column name or Expr (default: "symbol")
+            open: Open price column name or Expr (optional)
+            high: High price column name or Expr (optional)
+            low: Low price column name or Expr (optional)
             resample: Rebalance frequency
             resample_offset: Optional offset for rebalance dates
             fee_ratio: Transaction fee ratio
@@ -418,29 +453,48 @@ class BacktestNamespace:
         Returns:
             Report object with creturn, position, and trades
         """
-        self._validate_columns(date_col, symbol_col, price, weight)
+        df = self._df
+
+        # Resolve column specs (str or Expr) to column names
+        df, date_col = _resolve_column(df, date, "_bt_date")
+        df, symbol_col = _resolve_column(df, symbol, "_bt_symbol")
+        df, price_col = _resolve_column(df, trade_at_price, "_bt_price")
+        df, position_col = _resolve_column(df, position, "_bt_position")
+
+        # Resolve optional OHLC columns
+        open_col: str | None = None
+        high_col: str | None = None
+        low_col: str | None = None
+        if open is not None:
+            df, open_col = _resolve_column(df, open, "_bt_open")
+        if high is not None:
+            df, high_col = _resolve_column(df, high, "_bt_high")
+        if low is not None:
+            df, low_col = _resolve_column(df, low, "_bt_low")
+
+        # Validate columns exist
+        required = [date_col, symbol_col, price_col, position_col]
+        missing = [c for c in required if c not in df.columns]
+        if missing:
+            raise ValueError(f"Missing required columns: {missing}")
 
         if touched_exit:
             if not all([open_col, high_col, low_col]):
                 raise ValueError(
-                    "touched_exit=True requires open_col, high_col, and low_col"
+                    "touched_exit=True requires open, high, and low"
                 )
-            for col in [open_col, high_col, low_col]:
-                if col not in self._df.columns:
-                    raise ValueError(f"Column '{col}' not found in DataFrame")
 
-        # Check if weight column is boolean (signals)
-        weight_dtype = self._df.get_column(weight).dtype
-        is_bool_signal = weight_dtype == pl.Boolean
+        # Check if position column is boolean (signals)
+        position_dtype = df.get_column(position_col).dtype
+        is_bool_signal = position_dtype == pl.Boolean
 
-        # Handle null values in weight column
-        df = self._df
+        # Handle null values in position column
         if is_bool_signal:
             df = df.with_columns(
-                pl.col(weight).fill_null(False).cast(pl.Float64)
+                pl.col(position_col).fill_null(False).cast(pl.Float64)
             )
         else:
-            df = df.with_columns(pl.col(weight).fill_null(0.0))
+            df = df.with_columns(pl.col(position_col).fill_null(0.0))
 
         # Check if we can use Rust path (no OHLC, basic resample, no offset)
         use_rust = (
@@ -473,8 +527,8 @@ class BacktestNamespace:
                 df,
                 date_col,
                 symbol_col,
-                price,
-                weight,
+                price_col,
+                position_col,
                 resample,
                 config,
                 skip_sort,
@@ -500,7 +554,7 @@ class BacktestNamespace:
             stock_columns = df.get_column(symbol_col).unique().sort().to_list()
 
             # Keep position in long format (no pivot needed!)
-            position_long = df.select([date_col, symbol_col, weight]).sort([date_col, symbol_col])
+            position_long = df.select([date_col, symbol_col, position_col]).sort([date_col, symbol_col])
 
             return Report(
                 creturn=result.creturn,
@@ -516,8 +570,9 @@ class BacktestNamespace:
         # Fallback to Python path for complex cases (touched_exit, complex resample)
         # Convert to wide format
         wide_data = self._prepare_wide_data(
-            date_col, symbol_col, price, weight,
-            open_col, high_col, low_col
+            date_col, symbol_col, price_col, position_col,
+            open_col, high_col, low_col,
+            df=df,
         )
         prices_wide = wide_data["prices"]
         position_wide = wide_data["position"]
@@ -617,10 +672,10 @@ class BacktestNamespace:
 
 def backtest(
     df: pl.DataFrame,
-    price: str = "close",
-    weight: str = "weight",
-    date_col: str = "date",
-    symbol_col: str = "symbol",
+    trade_at_price: ColumnSpec = "close",
+    position: ColumnSpec = "weight",
+    date: ColumnSpec = "date",
+    symbol: ColumnSpec = "symbol",
     resample: str | None = "D",
     resample_offset: str | None = None,
     fee_ratio: float = 0.001425,
@@ -636,11 +691,11 @@ def backtest(
     """Run backtest on long format DataFrame.
 
     Args:
-        df: Long format DataFrame with date, symbol, price, weight columns
-        price: Price column name (default: "close")
-        weight: Weight column name (default: "weight")
-        date_col: Date column name (default: "date")
-        symbol_col: Symbol column name (default: "symbol")
+        df: Long format DataFrame with date, symbol, price, position columns
+        trade_at_price: Price column name or Expr (default: "close")
+        position: Position/weight column name or Expr (default: "weight")
+        date: Date column name or Expr (default: "date")
+        symbol: Symbol column name or Expr (default: "symbol")
         resample: Rebalance frequency ('D', 'W', 'M', 'Q', 'Y', None)
         resample_offset: Optional offset for rebalance dates
         fee_ratio: Transaction fee ratio
@@ -658,13 +713,13 @@ def backtest(
 
     Example:
         >>> import polars_backtest as pl_bt
-        >>> result = pl_bt.backtest(df, price="close", weight="weight", resample="M")
+        >>> result = pl_bt.backtest(df, trade_at_price="close", position="weight", resample="M")
     """
     return df.bt.backtest(
-        price=price,
-        weight=weight,
-        date_col=date_col,
-        symbol_col=symbol_col,
+        trade_at_price=trade_at_price,
+        position=position,
+        date=date,
+        symbol=symbol,
         resample=resample,
         resample_offset=resample_offset,
         fee_ratio=fee_ratio,
@@ -681,13 +736,13 @@ def backtest(
 
 def backtest_with_report(
     df: pl.DataFrame,
-    price: str = "close",
-    weight: str = "weight",
-    date_col: str = "date",
-    symbol_col: str = "symbol",
-    open_col: str | None = None,
-    high_col: str | None = None,
-    low_col: str | None = None,
+    trade_at_price: ColumnSpec = "close",
+    position: ColumnSpec = "weight",
+    date: ColumnSpec = "date",
+    symbol: ColumnSpec = "symbol",
+    open: ColumnSpec | None = None,
+    high: ColumnSpec | None = None,
+    low: ColumnSpec | None = None,
     resample: str | None = "D",
     resample_offset: str | None = None,
     fee_ratio: float = 0.001425,
@@ -703,14 +758,14 @@ def backtest_with_report(
     """Run backtest with trade tracking on long format DataFrame.
 
     Args:
-        df: Long format DataFrame with date, symbol, price, weight columns
-        price: Price column name (default: "close")
-        weight: Weight column name (default: "weight")
-        date_col: Date column name (default: "date")
-        symbol_col: Symbol column name (default: "symbol")
-        open_col: Open price column name (optional)
-        high_col: High price column name (optional)
-        low_col: Low price column name (optional)
+        df: Long format DataFrame with date, symbol, price, position columns
+        trade_at_price: Price column name or Expr (default: "close")
+        position: Position/weight column name or Expr (default: "weight")
+        date: Date column name or Expr (default: "date")
+        symbol: Symbol column name or Expr (default: "symbol")
+        open: Open price column name or Expr (optional)
+        high: High price column name or Expr (optional)
+        low: Low price column name or Expr (optional)
         resample: Rebalance frequency
         resample_offset: Optional offset for rebalance dates
         fee_ratio: Transaction fee ratio
@@ -728,18 +783,18 @@ def backtest_with_report(
 
     Example:
         >>> import polars_backtest as pl_bt
-        >>> report = pl_bt.backtest_with_report(df, price="close", weight="weight")
+        >>> report = pl_bt.backtest_with_report(df, trade_at_price="close", position="weight")
         >>> report.creturn  # DataFrame
         >>> report.trades   # DataFrame
     """
     return df.bt.backtest_with_report(
-        price=price,
-        weight=weight,
-        date_col=date_col,
-        symbol_col=symbol_col,
-        open_col=open_col,
-        high_col=high_col,
-        low_col=low_col,
+        trade_at_price=trade_at_price,
+        position=position,
+        date=date,
+        symbol=symbol,
+        open=open,
+        high=high,
+        low=low,
         resample=resample,
         resample_offset=resample_offset,
         fee_ratio=fee_ratio,

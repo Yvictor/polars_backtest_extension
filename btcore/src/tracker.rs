@@ -78,6 +78,59 @@ pub struct BacktestResult {
     pub trades: Vec<TradeRecord>,
 }
 
+/// Trade record for long format (string symbols, i32 dates)
+///
+/// Similar to TradeRecord but uses string symbols and i32 dates (days since epoch)
+/// instead of usize indices for direct use with Polars DataFrames.
+#[derive(Debug, Clone)]
+pub struct LongTradeRecord {
+    /// Stock symbol (string key)
+    pub symbol: String,
+    /// Actual entry date (days since epoch, T+1 after signal)
+    /// None for pending entries that have signal but not yet executed
+    pub entry_date: Option<i32>,
+    /// Actual exit date (days since epoch)
+    pub exit_date: Option<i32>,
+    /// Signal date for entry (days since epoch)
+    pub entry_sig_date: i32,
+    /// Signal date for exit (days since epoch)
+    pub exit_sig_date: Option<i32>,
+    /// Position weight at entry
+    pub position_weight: f64,
+    /// Entry price (original price, not adjusted)
+    pub entry_price: f64,
+    /// Exit price (original price, not adjusted)
+    pub exit_price: Option<f64>,
+    /// Trade return (calculated using original prices with fees)
+    pub trade_return: Option<f64>,
+}
+
+impl LongTradeRecord {
+    /// Calculate holding period in days
+    pub fn holding_days(&self) -> Option<i32> {
+        match (self.entry_date, self.exit_date) {
+            (Some(entry), Some(exit)) => Some(exit - entry),
+            _ => None,
+        }
+    }
+
+    /// Calculate trade return with fees
+    pub fn calculate_return(&self, fee_ratio: f64, tax_ratio: f64) -> Option<f64> {
+        self.exit_price.map(|exit_price| {
+            (1.0 - fee_ratio) * (exit_price / self.entry_price) * (1.0 - tax_ratio - fee_ratio) - 1.0
+        })
+    }
+}
+
+/// Result of a long format backtest with trades
+#[derive(Debug, Clone)]
+pub struct LongBacktestResult {
+    /// Cumulative returns at each time step (one per unique date)
+    pub creturn: Vec<f64>,
+    /// List of completed trades with string symbols
+    pub trades: Vec<LongTradeRecord>,
+}
+
 // ============================================================================
 // Trade Tracker Trait - abstracts trade tracking for zero-cost abstraction
 // ============================================================================

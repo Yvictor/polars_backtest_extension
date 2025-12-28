@@ -33,3 +33,6 @@ Thumbs.db
 
 # Temporary files
 *.tmp
+
+# Test cache
+.cache/
