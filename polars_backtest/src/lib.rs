@@ -17,7 +17,7 @@ use polars_ops::pivot;
 use btcore::{
     run_backtest, run_backtest_with_trades, BacktestConfig, BacktestResult, PriceData,
     SimTradeRecord,
-    simulation::{backtest_long, LongFormatInput},
+    simulation::{backtest_long, backtest_long_with_accessor, LongFormatInput, ResampleFreq},
 };
 
 /// Python wrapper for BacktestConfig
@@ -825,6 +825,131 @@ fn backtest_with_trades_partitioned(
     Ok(result.into())
 }
 
+// =============================================================================
+// Zero-copy backtest using btcore's arrow-based engine
+// =============================================================================
+
+/// Run backtest using long format engine (zero-copy, no pivot/partition_by)
+///
+/// This function processes long format data directly using Polars ChunkedArray
+/// with zero-copy access via btcore's accessor-based API.
+///
+/// Data flow: DataFrame → sort → ChunkedArray accessors → btcore → creturn
+#[pyfunction]
+#[pyo3(signature = (
+    df,
+    date_col="date",
+    symbol_col="symbol",
+    price_col="close",
+    weight_col="weight",
+    resample=None,
+    config=None,
+    skip_sort=false
+))]
+fn backtest_long_from_df(
+    df: PyDataFrame,
+    date_col: &str,
+    symbol_col: &str,
+    price_col: &str,
+    weight_col: &str,
+    resample: Option<&str>,
+    config: Option<PyBacktestConfig>,
+    skip_sort: bool,
+) -> PyResult<PyBacktestResult> {
+    use std::time::Instant;
+
+    let total_start = Instant::now();
+    let mut step_start = Instant::now();
+
+    let df = df.0;
+    let n_rows = df.height();
+
+    // Validate required columns exist
+    for col_name in [date_col, symbol_col, price_col, weight_col] {
+        if df.column(col_name).is_err() {
+            return Err(PyValueError::new_err(format!(
+                "Missing required column: '{}'", col_name
+            )));
+        }
+    }
+
+    // Note: is_sorted_flag is lost when DataFrame is passed from Python to Rust via pyo3-polars.
+    // See: https://github.com/pola-rs/pyo3-polars/issues/51
+    let df = if skip_sort {
+        eprintln!("[PROFILE] Sort: SKIPPED (skip_sort=true, rows={})", n_rows);
+        df
+    } else {
+        let sorted = df
+            .sort([date_col], SortMultipleOptions::default())
+            .map_err(|e| PyValueError::new_err(format!("Failed to sort: {}", e)))?;
+        eprintln!("[PROFILE] Sort: {:?} (rows={})", step_start.elapsed(), n_rows);
+        sorted
+    };
+    step_start = Instant::now();
+
+    // Get ChunkedArrays (zero-copy access to underlying data)
+    let date_ca = df.column(date_col)
+        .map_err(|e| PyValueError::new_err(format!("Failed to get date column: {}", e)))?
+        .str()
+        .map_err(|e| PyValueError::new_err(format!("Date column must be string: {}", e)))?
+        .clone();
+
+    let symbol_ca = df.column(symbol_col)
+        .map_err(|e| PyValueError::new_err(format!("Failed to get symbol column: {}", e)))?
+        .str()
+        .map_err(|e| PyValueError::new_err(format!("Symbol column must be string: {}", e)))?
+        .clone();
+
+    let price_series = df.column(price_col)
+        .map_err(|e| PyValueError::new_err(format!("Failed to get price column: {}", e)))?
+        .cast(&DataType::Float64)
+        .map_err(|e| PyValueError::new_err(format!("Failed to cast price: {}", e)))?;
+    let price_ca = price_series.f64()
+        .map_err(|e| PyValueError::new_err(format!("Price must be f64: {}", e)))?
+        .clone();
+
+    let weight_series = df.column(weight_col)
+        .map_err(|e| PyValueError::new_err(format!("Failed to get weight column: {}", e)))?
+        .cast(&DataType::Float64)
+        .map_err(|e| PyValueError::new_err(format!("Failed to cast weight: {}", e)))?;
+    let weight_ca = weight_series.f64()
+        .map_err(|e| PyValueError::new_err(format!("Weight must be f64: {}", e)))?
+        .clone();
+
+    eprintln!("[PROFILE] Get ChunkedArrays: {:?}", step_start.elapsed());
+    step_start = Instant::now();
+
+    // Get config
+    let cfg = config.map(|c| c.inner).unwrap_or_else(|| {
+        BacktestConfig {
+            finlab_mode: true,
+            ..Default::default()
+        }
+    });
+
+    // Parse resample frequency
+    let resample_freq = ResampleFreq::from_str(resample);
+
+    // Run backtest using btcore with closure-based accessors (zero-copy)
+    let result = backtest_long_with_accessor(
+        n_rows,
+        |i| date_ca.get(i).unwrap_or(""),
+        |i| symbol_ca.get(i).unwrap_or(""),
+        |i| price_ca.get(i).unwrap_or(f64::NAN),
+        |i| weight_ca.get(i).unwrap_or(f64::NAN),
+        resample_freq,
+        &cfg,
+    );
+
+    eprintln!("[PROFILE] Backtest (btcore): {:?}", step_start.elapsed());
+    eprintln!("[PROFILE] TOTAL: {:?}", total_start.elapsed());
+
+    Ok(PyBacktestResult {
+        creturn: result.creturn,
+        trades: vec![],
+    })
+}
+
 /// Run backtest with long format input (Stage 4 API)
 ///
 /// This is the main API for backtesting with long format data.
@@ -1040,5 +1165,6 @@ fn _polars_backtest(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(backtest_weights, m)?)?;
     m.add_function(wrap_pyfunction!(backtest_with_trades, m)?)?;
     m.add_function(wrap_pyfunction!(backtest_long_format, m)?)?;
+    m.add_function(wrap_pyfunction!(backtest_long_from_df, m)?)?;
     Ok(())
 }

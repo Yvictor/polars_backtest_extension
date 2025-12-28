@@ -127,6 +127,7 @@ pub fn backtest_long(
                     n_symbols,
                     config,
                 );
+
                 stopped_stocks = vec![false; n_symbols];
             }
         }
@@ -279,10 +280,15 @@ fn execute_rebalance_sparse(
     }
 
     // Update existing positions to market value
+    // Important: Always update pos.value = pos.last_market_value to match Finlab behavior
+    // This ensures balance calculation uses the latest market value, not old cost basis
     for (stock_id, pos) in portfolio.positions.iter_mut() {
+        // Always update value to last_market_value (matches Finlab's pos[sid] *= r behavior)
+        pos.value = pos.last_market_value;
+
+        // Update entry_price only if we have a valid price
         if let Some(&price) = prices.get(stock_id) {
             if price > 0.0 && !price.is_nan() {
-                pos.value = pos.last_market_value;
                 pos.entry_price = price;
             }
         }

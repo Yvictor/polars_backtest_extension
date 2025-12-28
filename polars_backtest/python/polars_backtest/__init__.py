@@ -254,6 +254,7 @@ from polars_backtest._polars_backtest import (
     backtest_weights,
     backtest_with_trades as _backtest_with_trades,
     backtest_long_format,
+    backtest_long_from_df,
 )
 
 __all__ = [

@@ -16,7 +16,8 @@ from polars_backtest._polars_backtest import (
     backtest_signals,
     backtest_weights,
     backtest_with_trades as _backtest_with_trades,
-    backtest_partitioned as _rust_backtest,  # Use partition_by (1.5x faster than pivot)
+    backtest_long_from_df as _rust_backtest,  # Use long format engine (zero-copy, direct processing)
+    backtest_partitioned as _rust_backtest_partition,  # partition_by for reference
     backtest_with_trades_partitioned as _rust_backtest_with_trades,  # partition_by + trades
 )
 
@@ -222,6 +223,10 @@ class BacktestNamespace:
                 finlab_mode=finlab_mode,
             )
 
+            # Check if already sorted by date (pyo3-polars loses this flag during transfer)
+            # skip_sort = df[date_col].flags.get("SORTED_ASC", False)
+            skip_sort = df.get_column(date_col).is_sorted()
+
             result = _rust_backtest(
                 df,
                 date_col,
@@ -230,6 +235,7 @@ class BacktestNamespace:
                 weight,
                 resample,
                 config,
+                skip_sort,
             )
 
             # Get dates from DataFrame

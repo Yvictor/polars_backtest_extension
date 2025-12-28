@@ -17,6 +17,8 @@ speedate = "0.15"
 thiserror = "2"
 rayon = "1.10"
 serde = { version = "1", features = ["derive"] }
+# Arrow for zero-copy data access in btcore
+arrow = { version = "54", default-features = false, features = ["ffi"] }
 
 # Polars (only for extension)
 polars = { version = "0.52", default-features = false, features = ["pivot", "rows", "partition_by", "dtype-date", "dtype-datetime", "dtype-struct", "strings"] }
