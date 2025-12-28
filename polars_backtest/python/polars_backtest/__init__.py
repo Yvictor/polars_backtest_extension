@@ -250,12 +250,11 @@ from polars_backtest._polars_backtest import (
     BacktestConfig,
     TradeRecord,
     BacktestResult,
-    backtest_signals,
-    backtest_weights,
-    backtest_with_trades as _backtest_with_trades,
-    backtest_long_from_df,
-    check_ffi_compatibility,
-    test_ffi_conversion,
+    # Main API (long format, zero-copy)
+    backtest as backtest_long,
+    # Wide format API (for validation)
+    backtest_wide as _backtest_wide_rust,
+    backtest_with_trades_wide as _backtest_with_trades_wide,
 )
 
 __all__ = [
@@ -265,15 +264,12 @@ __all__ = [
     "BacktestResult",
     "Report",
     "BacktestNamespace",
-    # Main API (long format)
+    # Main API (long format, zero-copy)
     "backtest",
     "backtest_with_report",
-    # Wide format API (for finlab compatibility)
+    # Wide format API (for validation/finlab compatibility)
     "backtest_wide",
     "backtest_with_report_wide",
-    # Low-level functions
-    "backtest_signals",
-    "backtest_weights",
     # Statistics expressions
     "daily_returns",
     "cumulative_returns",
@@ -283,11 +279,6 @@ __all__ = [
     "drawdown_series",
     "portfolio_return",
     "equal_weights",
-    # Helper functions
-    "_parse_resample_freq",
-    "_parse_offset",
-    "_get_period_end_dates",
-    "_filter_changed_positions",
 ]
 
 # Get the path to the shared library
@@ -826,13 +817,14 @@ def backtest_wide(
         finlab_mode=finlab_mode,
     )
 
-    # Run backtest
+    # Run backtest (convert bool to equal weights if needed)
     if is_bool:
-        creturn = backtest_signals(prices_data, position_data, rebalance_indices, config)
-    else:
-        # Cast to float if needed
+        # Convert bool to equal weights
         position_data = position_data.cast(pl.Float64)
-        creturn = backtest_weights(prices_data, position_data, rebalance_indices, config)
+    else:
+        position_data = position_data.cast(pl.Float64)
+
+    creturn = _backtest_wide_rust(prices_data, position_data, rebalance_indices, config)
 
     # Build result DataFrame
     dates = prices.select(date_col).to_series()
@@ -1299,7 +1291,7 @@ def backtest_with_report_wide(
     # Run backtest with trades tracking
     # close_data: adjusted prices for return calculation
     # original_prices_data: original prices for trade records
-    result = _backtest_with_trades(
+    result = _backtest_with_trades_wide(
         close_data,
         original_prices_data,
         position_data,

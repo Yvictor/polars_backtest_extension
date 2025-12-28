@@ -13,12 +13,11 @@ import polars as pl
 from polars_backtest._polars_backtest import (
     BacktestConfig,
     BacktestResult,
-    backtest_signals,
-    backtest_weights,
-    backtest_with_trades as _backtest_with_trades,
-    backtest_long_from_df as _rust_backtest,  # Use long format engine (zero-copy, direct processing)
-    backtest_partitioned as _rust_backtest_partition,  # partition_by for reference
-    backtest_with_trades_partitioned as _rust_backtest_with_trades,  # partition_by + trades
+    # Main API (long format, zero-copy)
+    backtest as _rust_backtest,
+    # Wide format API (for validation)
+    backtest_wide as _backtest_wide_rust,
+    backtest_with_trades_wide as _backtest_with_trades_wide,
 )
 
 if TYPE_CHECKING:
@@ -333,16 +332,15 @@ class BacktestNamespace:
             finlab_mode=finlab_mode,
         )
 
-        # Run backtest
+        # Run backtest (convert bool to float if needed)
         if is_bool:
-            creturn = backtest_signals(
-                prices_data, position_data, rebalance_indices, config
-            )
+            position_data = position_data.cast(pl.Float64)
         else:
             position_data = position_data.cast(pl.Float64)
-            creturn = backtest_weights(
-                prices_data, position_data, rebalance_indices, config
-            )
+
+        creturn = _backtest_wide_rust(
+            prices_data, position_data, rebalance_indices, config
+        )
 
         # Find first rebalance index with any non-zero signals (like Finlab)
         first_signal_rebalance_idx = 0
@@ -455,7 +453,7 @@ class BacktestNamespace:
         _resample_position, _filter_changed_positions, Report = _get_resample_helpers()
 
         if use_rust:
-            # Use fast Rust partition_by path
+            # Use fast Rust long format path (zero-copy, no trades tracking)
             config = BacktestConfig(
                 fee_ratio=fee_ratio,
                 tax_ratio=tax_ratio,
@@ -468,7 +466,10 @@ class BacktestNamespace:
                 finlab_mode=True,  # Use Finlab mode for report
             )
 
-            result = _rust_backtest_with_trades(
+            # Check if already sorted
+            skip_sort = df.get_column(date_col).is_sorted()
+
+            result = _rust_backtest(
                 df,
                 date_col,
                 symbol_col,
@@ -476,6 +477,7 @@ class BacktestNamespace:
                 weight,
                 resample,
                 config,
+                skip_sort,
             )
 
             # Get dates from DataFrame
@@ -502,7 +504,7 @@ class BacktestNamespace:
 
             return Report(
                 creturn=result.creturn,
-                trades=result.trades,
+                trades=[],  # Long format path doesn't track trades (use wide format for trades)
                 dates=dates,
                 stock_columns=stock_columns,
                 position=position_long,  # Long format position
@@ -583,9 +585,9 @@ class BacktestNamespace:
         if low_data is not None:
             low_data = low_data.select(position_stock_cols)
 
-        # Run backtest with trades
+        # Run backtest with trades (wide format API)
         # Note: Using adjusted prices for both adj and original (no factor available)
-        result = _backtest_with_trades(
+        result = _backtest_with_trades_wide(
             adj_prices=prices_data,
             original_prices=prices_data,  # Same as adj without factor
             weights=position_data,
