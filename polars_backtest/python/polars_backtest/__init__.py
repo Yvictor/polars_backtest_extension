@@ -253,7 +253,6 @@ from polars_backtest._polars_backtest import (
     backtest_signals,
     backtest_weights,
     backtest_with_trades as _backtest_with_trades,
-    backtest_long_format,
     backtest_long_from_df,
     check_ffi_compatibility,
     test_ffi_conversion,
@@ -275,7 +274,6 @@ __all__ = [
     # Low-level functions
     "backtest_signals",
     "backtest_weights",
-    "backtest_long_format",
     # Statistics expressions
     "daily_returns",
     "cumulative_returns",

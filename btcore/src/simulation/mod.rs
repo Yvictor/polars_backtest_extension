@@ -6,8 +6,7 @@
 //! # Module Structure
 //!
 //! - `wide`: Wide format simulation (2D array input)
-//! - `long`: Long format simulation (sorted 1D arrays, avoids pivot overhead)
-//! - `long_arrow`: Arrow-based zero-copy long format simulation
+//! - `long`: Long format simulation (sorted 1D arrays, multiple interfaces)
 //!
 //! # Weight Modes
 //!
@@ -16,19 +15,21 @@
 //! 2. **Float weights** - Custom weights, normalized to sum=1 (like Finlab with float positions)
 
 mod long;
-mod long_arrow;
 mod wide;
 
 // Re-export public API from wide module
 pub use wide::{run_backtest, run_backtest_with_trades, PriceData};
 
 // Re-export public API from long module
-pub use long::{backtest_long, LongFormatInput};
-
-// Re-export public API from long_arrow module
-pub use long_arrow::{
-    backtest_long_arrow, backtest_long_with_accessor, backtest_long_with_accessor_i32,
-    LongFormatArrowInput, ResampleFreq, StringPortfolio, StringPosition,
+pub use long::{
+    // Interfaces
+    backtest_long_arrow,
+    backtest_long_slice,
+    backtest_with_accessor,
+    // Types
+    LongFormatArrowInput,
+    Portfolio,
+    ResampleFreq,
 };
 
 // Re-export from other modules for convenience

@@ -18,7 +18,7 @@ use polars_ops::pivot;
 use btcore::{
     run_backtest, run_backtest_with_trades, BacktestConfig, BacktestResult, PriceData,
     SimTradeRecord,
-    simulation::{backtest_long, backtest_long_arrow, LongFormatInput, LongFormatArrowInput, ResampleFreq},
+    simulation::{backtest_long_arrow, LongFormatArrowInput, ResampleFreq},
 };
 
 /// Python wrapper for BacktestConfig
@@ -1152,101 +1152,6 @@ fn backtest(
     })
 }
 
-/// Backtest using long format data with zero-copy slice access
-///
-/// This function processes long format data directly without pivot/partition_by,
-/// using zero-copy slice access from Polars arrays.
-///
-/// # Arguments
-/// * `df` - Long format DataFrame with columns: date_idx, symbol_id, price, weight
-/// * `n_dates` - Total number of unique dates
-/// * `n_symbols` - Total number of unique symbols
-/// * `rebalance_mask` - Boolean Series indicating rebalance days
-/// * `config` - Backtest configuration
-///
-/// # Returns
-/// List of cumulative returns (one per date)
-#[pyfunction]
-#[pyo3(signature = (
-    date_indices,
-    symbol_ids,
-    prices,
-    weights,
-    n_dates,
-    n_symbols,
-    rebalance_mask,
-    config=None
-))]
-fn backtest_long_format(
-    date_indices: PyDataFrame,
-    symbol_ids: PyDataFrame,
-    prices: PyDataFrame,
-    weights: PyDataFrame,
-    n_dates: usize,
-    n_symbols: usize,
-    rebalance_mask: PyDataFrame,
-    config: Option<PyBacktestConfig>,
-) -> PyResult<Vec<f64>> {
-    // Extract Series from single-column DataFrames
-    let date_idx_series = date_indices.0.column("date_idx")
-        .map_err(|e| PyValueError::new_err(format!("Missing date_idx column: {}", e)))?;
-    let symbol_id_series = symbol_ids.0.column("symbol_id")
-        .map_err(|e| PyValueError::new_err(format!("Missing symbol_id column: {}", e)))?;
-    let price_series = prices.0.column("price")
-        .map_err(|e| PyValueError::new_err(format!("Missing price column: {}", e)))?;
-    let weight_series = weights.0.column("weight")
-        .map_err(|e| PyValueError::new_err(format!("Missing weight column: {}", e)))?;
-    let mask_series = rebalance_mask.0.column("rebalance")
-        .map_err(|e| PyValueError::new_err(format!("Missing rebalance column: {}", e)))?;
-
-    // Get zero-copy slices from ChunkedArrays
-    let date_idx_ca = date_idx_series.u32()
-        .map_err(|e| PyValueError::new_err(format!("date_idx must be u32: {}", e)))?;
-    let symbol_id_ca = symbol_id_series.u32()
-        .map_err(|e| PyValueError::new_err(format!("symbol_id must be u32: {}", e)))?;
-    let price_ca = price_series.f64()
-        .map_err(|e| PyValueError::new_err(format!("price must be f64: {}", e)))?;
-    let weight_ca = weight_series.f64()
-        .map_err(|e| PyValueError::new_err(format!("weight must be f64: {}", e)))?;
-    let mask_ca = mask_series.bool()
-        .map_err(|e| PyValueError::new_err(format!("rebalance must be bool: {}", e)))?;
-
-    // Zero-copy slice access (cont_slice returns &[T] directly from Arrow buffer)
-    let date_idx_slice = date_idx_ca.cont_slice()
-        .map_err(|e| PyValueError::new_err(format!("date_idx not contiguous: {}", e)))?;
-    let symbol_id_slice = symbol_id_ca.cont_slice()
-        .map_err(|e| PyValueError::new_err(format!("symbol_id not contiguous: {}", e)))?;
-    let price_slice = price_ca.cont_slice()
-        .map_err(|e| PyValueError::new_err(format!("price not contiguous: {}", e)))?;
-    let weight_slice = weight_ca.cont_slice()
-        .map_err(|e| PyValueError::new_err(format!("weight not contiguous: {}", e)))?;
-
-    // Boolean mask needs to be collected (no cont_slice for bool)
-    let rebalance_mask_vec: Vec<bool> = mask_ca.into_iter()
-        .map(|v| v.unwrap_or(false))
-        .collect();
-
-    let cfg = config.map(|c| c.inner).unwrap_or_else(|| {
-        BacktestConfig {
-            finlab_mode: true,
-            ..Default::default()
-        }
-    });
-
-    // Create input struct with zero-copy slices
-    let input = LongFormatInput {
-        date_indices: date_idx_slice,
-        symbol_ids: symbol_id_slice,
-        prices: price_slice,
-        weights: weight_slice,
-    };
-
-    // Run backtest
-    let result = backtest_long(&input, n_dates, n_symbols, &rebalance_mask_vec, &cfg);
-
-    Ok(result.creturn)
-}
-
 /// Check FFI struct sizes for polars-arrow / arrow-rs compatibility
 #[pyfunction]
 fn check_ffi_compatibility() -> PyResult<(usize, usize, usize, usize)> {
@@ -1296,7 +1201,6 @@ fn _polars_backtest(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(backtest_signals, m)?)?;
     m.add_function(wrap_pyfunction!(backtest_weights, m)?)?;
     m.add_function(wrap_pyfunction!(backtest_with_trades, m)?)?;
-    m.add_function(wrap_pyfunction!(backtest_long_format, m)?)?;
     m.add_function(wrap_pyfunction!(backtest_long_from_df, m)?)?;
     m.add_function(wrap_pyfunction!(check_ffi_compatibility, m)?)?;
     m.add_function(wrap_pyfunction!(test_ffi_conversion, m)?)?;

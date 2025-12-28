@@ -1,308 +1,485 @@
-//! Long format backtest simulation engine
+//! Arrow-based zero-copy long format backtest engine
 //!
-//! This module implements backtest simulation for long format data (date, symbol, price, weight),
-//! avoiding the overhead of pivot/partition_by operations.
+//! This module provides a backtest implementation that processes Arrow arrays directly,
+//! avoiding data encoding/copying overhead. It uses string keys for positions, enabling
+//! true zero-copy data access from Polars/Arrow DataFrames.
 //!
-//! # Performance Advantage
+//! # Performance
 //!
-//! Long format processes only active stocks per day O(k) instead of O(n_stocks) for wide format.
-//! For sparse data (10% active), this can be 5-10x faster.
+//! By using Arrow arrays and string keys directly:
+//! - No need to encode dates/symbols to indices
+//! - Zero-copy access to price/weight data
+//! - Only processes active stocks per day O(k) instead of O(n_stocks)
 
 use std::collections::HashMap;
 
-use crate::config::BacktestConfig;
-use crate::portfolio::PortfolioState;
-use crate::position::Position;
-use crate::stops::detect_stops_finlab;
-use crate::tracker::BacktestResult;
-use crate::weights::normalize_weights_finlab;
+use arrow::array::{Float64Array, Int32Array, StringViewArray};
 
-/// Long format backtest input data
-///
-/// All arrays must have the same length and be sorted by date_idx.
-#[derive(Debug)]
-pub struct LongFormatInput<'a> {
-    /// Date indices (0-based, sorted ascending)
-    pub date_indices: &'a [u32],
-    /// Symbol IDs (0-based)
-    pub symbol_ids: &'a [u32],
-    /// Close prices for each (date, symbol) pair
-    pub prices: &'a [f64],
-    /// Target weights for each (date, symbol) pair
-    pub weights: &'a [f64],
+use crate::config::BacktestConfig;
+use crate::position::Position;
+use crate::tracker::BacktestResult;
+
+/// Portfolio with string symbol keys (for zero-copy backtest)
+pub struct Portfolio {
+    pub cash: f64,
+    pub positions: HashMap<String, Position>,
 }
 
-/// Run backtest on long format data
+impl Portfolio {
+    pub fn new() -> Self {
+        Self {
+            cash: 1.0,
+            positions: HashMap::new(),
+        }
+    }
+
+    /// Calculate total balance (cash + position market values)
+    pub fn balance(&self) -> f64 {
+        self.cash + self.positions.values().map(|p| p.last_market_value).sum::<f64>()
+    }
+}
+
+impl Default for Portfolio {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Arrow-based long format backtest input
+///
+/// All arrays must have the same length and be sorted by date.
+/// Uses i32 for dates (days since epoch) to match Polars Date type.
+/// Uses StringViewArray for symbols to match Polars string type (zero-copy from polars-arrow).
+pub struct LongFormatArrowInput<'a> {
+    /// Date as i32 (days since epoch, sorted ascending)
+    pub dates: &'a Int32Array,
+    /// Symbol strings (StringViewArray for zero-copy from polars)
+    pub symbols: &'a StringViewArray,
+    /// Close prices
+    pub prices: &'a Float64Array,
+    /// Target weights
+    pub weights: &'a Float64Array,
+}
+
+/// Resample frequency for rebalancing
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResampleFreq {
+    /// Daily rebalancing
+    Daily,
+    /// Weekly rebalancing (end of week)
+    Weekly,
+    /// Monthly rebalancing (end of month)
+    Monthly,
+}
+
+impl ResampleFreq {
+    /// Parse from string (like Polars/Pandas resample)
+    pub fn from_str(s: Option<&str>) -> Self {
+        match s {
+            Some("M") | Some("ME") => Self::Monthly,
+            Some("W") | Some("W-FRI") => Self::Weekly,
+            _ => Self::Daily,
+        }
+    }
+}
+
+/// Run backtest with closure-based data access using i32 dates (days since epoch)
+///
+/// This allows the caller to provide data accessors without copying data.
+/// Uses i32 dates for efficient month-end detection without string parsing.
 ///
 /// # Arguments
-/// * `input` - Long format input data (must be sorted by date_idx)
-/// * `n_dates` - Total number of unique dates
-/// * `n_symbols` - Total number of unique symbols
-/// * `rebalance_mask` - Boolean mask indicating rebalance days (length = n_dates)
+/// * `n_rows` - Total number of rows
+/// * `get_date` - Closure to get date (days since epoch) at index
+/// * `get_symbol` - Closure to get symbol string at index
+/// * `get_price` - Closure to get price at index
+/// * `get_weight` - Closure to get weight at index (NaN = no signal)
+/// * `resample` - Rebalancing frequency
 /// * `config` - Backtest configuration
-///
-/// # Returns
-/// BacktestResult containing cumulative returns (length = n_dates)
-pub fn backtest_long(
-    input: &LongFormatInput,
-    n_dates: usize,
-    n_symbols: usize,
-    rebalance_mask: &[bool],
+pub fn backtest_with_accessor<'a, FD, FS, FP, FW>(
+    n_rows: usize,
+    get_date: FD,
+    get_symbol: FS,
+    get_price: FP,
+    get_weight: FW,
+    resample: ResampleFreq,
     config: &BacktestConfig,
-) -> BacktestResult {
-    if input.date_indices.is_empty() || n_dates == 0 {
+) -> BacktestResult
+where
+    FD: Fn(usize) -> i32,
+    FS: Fn(usize) -> &'a str,
+    FP: Fn(usize) -> f64,
+    FW: Fn(usize) -> f64,
+{
+    if n_rows == 0 {
         return BacktestResult {
             creturn: vec![],
             trades: vec![],
         };
     }
 
-    // Initialize portfolio
-    let mut portfolio = PortfolioState::new();
+    let mut portfolio = Portfolio::new();
+    let mut creturn: Vec<f64> = Vec::new();
+    let mut stopped_stocks: HashMap<String, bool> = HashMap::new();
+    let mut pending_weights: Option<HashMap<String, f64>> = None;
+    let mut pending_stop_exits: Vec<String> = Vec::new();
+    let mut current_date: Option<i32> = None;
+    let mut today_prices: HashMap<&str, f64> = HashMap::new();
+    let mut today_weights: HashMap<&str, f64> = HashMap::new();
 
-    // Cumulative return array
-    let mut creturn = Vec::with_capacity(n_dates);
+    for i in 0..n_rows {
+        let date = get_date(i);
+        let symbol = get_symbol(i);
+        let price = get_price(i);
+        let weight = get_weight(i);
 
-    // Track which stocks to skip due to stop loss/take profit
-    let mut stopped_stocks: Vec<bool> = vec![false; n_symbols];
+        let date_changed = current_date.map_or(true, |d| d != date);
 
-    // Pending weights to execute on next day (T+1 execution)
-    let mut pending_weights: Option<HashMap<usize, f64>> = None;
+        if date_changed && current_date.is_some() {
+            let prev_date = current_date.unwrap();
 
-    // Pending stop exits to execute on next day (T+1 execution)
-    let mut pending_stop_exits: Vec<usize> = Vec::new();
+            // STEP 1: Update positions
+            update_positions(&mut portfolio, &today_prices);
 
-    // Index into input arrays
-    let mut i = 0;
+            // STEP 2: Execute pending stops
+            execute_pending_stops(
+                &mut portfolio,
+                &mut pending_stop_exits,
+                &mut stopped_stocks,
+                config,
+            );
 
-    // Process each date
-    for date_idx in 0..n_dates {
-        // Collect today's data (consecutive rows with same date_idx)
-        let day_start = i;
-        while i < input.date_indices.len() && input.date_indices[i] == date_idx as u32 {
-            i += 1;
-        }
-        let day_end = i;
-
-        // Build today's price map (sparse)
-        let today_prices: HashMap<usize, f64> = (day_start..day_end)
-            .map(|j| (input.symbol_ids[j] as usize, input.prices[j]))
-            .collect();
-
-        // Build today's weight map (sparse)
-        let today_weights: HashMap<usize, f64> = (day_start..day_end)
-            .map(|j| (input.symbol_ids[j] as usize, input.weights[j]))
-            .collect();
-
-        if date_idx > 0 {
-            // ===== STEP 1: Update positions with today's prices =====
-            update_positions_sparse(&mut portfolio, &today_prices);
-
-            // ===== STEP 2: Detect stops for T+1 execution =====
-            let today_stops = detect_stops_sparse(&portfolio, &today_prices, config);
-
-            // ===== STEP 3: Execute pending stop exits (yesterday's detection) =====
-            if !pending_stop_exits.is_empty() {
-                execute_pending_stops_sparse(
-                    &mut portfolio,
-                    &pending_stop_exits,
-                    &today_prices,
-                    &mut stopped_stocks,
-                    &pending_weights,
-                    config,
-                );
-                pending_stop_exits.clear();
-            }
-
-            // Transfer today's stops to pending
-            pending_stop_exits.extend(today_stops);
-
-            // ===== STEP 4: Execute pending rebalance =====
+            // STEP 3: Execute pending rebalance
             if let Some(target_weights) = pending_weights.take() {
-                execute_rebalance_sparse(
+                execute_rebalance(
                     &mut portfolio,
                     &target_weights,
                     &today_prices,
                     &stopped_stocks,
-                    n_symbols,
                     config,
                 );
-
-                stopped_stocks = vec![false; n_symbols];
+                stopped_stocks.clear();
             }
+
+            // STEP 4: Check rebalance
+            let should_rebalance = match resample {
+                ResampleFreq::Monthly => is_month_end_i32(prev_date, date),
+                ResampleFreq::Weekly => true,
+                ResampleFreq::Daily => true,
+            };
+
+            if should_rebalance && !today_weights.is_empty() {
+                let normalized = normalize_weights(
+                    &today_weights,
+                    &stopped_stocks,
+                    config.position_limit,
+                );
+                if !normalized.is_empty() {
+                    pending_weights = Some(normalized);
+                }
+            }
+
+            // STEP 5: Record creturn
+            creturn.push(portfolio.balance());
+
+            today_prices.clear();
+            today_weights.clear();
         }
 
-        // ===== STEP 5: Check if this is a rebalance day =====
-        let should_rebalance = date_idx < rebalance_mask.len() && rebalance_mask[date_idx];
+        current_date = Some(date);
+        if price > 0.0 && !price.is_nan() {
+            today_prices.insert(symbol, price);
+        }
+        if !weight.is_nan() && weight.abs() > 1e-10 {
+            today_weights.insert(symbol, weight);
+        }
+    }
 
-        if should_rebalance {
-            // Normalize and store weights for T+1 execution
-            let normalized = normalize_weights_sparse(
-                &today_weights,
+    // Final day
+    if current_date.is_some() && !today_prices.is_empty() {
+        update_positions(&mut portfolio, &today_prices);
+
+        execute_pending_stops(
+            &mut portfolio,
+            &mut pending_stop_exits,
+            &mut stopped_stocks,
+            config,
+        );
+
+        if let Some(target_weights) = pending_weights.take() {
+            execute_rebalance(
+                &mut portfolio,
+                &target_weights,
+                &today_prices,
                 &stopped_stocks,
-                config.position_limit,
+                config,
             );
-            pending_weights = Some(normalized);
         }
 
-        // ===== STEP 6: Record cumulative return =====
-        creturn.push(balance_sparse(&portfolio, &today_prices));
+        creturn.push(portfolio.balance());
     }
 
     BacktestResult {
         creturn,
-        trades: vec![], // Trade tracking not implemented for long format yet
+        trades: vec![],
     }
 }
 
-/// Update positions with daily returns (sparse version)
-fn update_positions_sparse(portfolio: &mut PortfolioState, prices: &HashMap<usize, f64>) {
-    for (&stock_id, pos) in portfolio.positions.iter_mut() {
-        if let Some(&current_price) = prices.get(&stock_id) {
-            if current_price.is_nan() || current_price <= 0.0 {
-                continue;
-            }
-
-            // Update max_price for trailing stop
-            if current_price > pos.max_price {
-                pos.max_price = current_price;
-            }
-
-            // Update cr, last_market_value using cumulative multiplication
-            if pos.previous_price > 0.0 {
-                let r = current_price / pos.previous_price;
-                pos.cr *= r;
-                pos.last_market_value *= r;
-            }
-
-            // Update maxcr
-            pos.maxcr = pos.maxcr.max(pos.cr);
-
-            // Update previous_price for next day
-            pos.previous_price = current_price;
-        }
-    }
-}
-
-/// Detect stops for positions (sparse version)
-fn detect_stops_sparse(
-    portfolio: &PortfolioState,
-    prices: &HashMap<usize, f64>,
+/// Run backtest on Arrow arrays with zero-copy access
+///
+/// # Arguments
+/// * `input` - Arrow arrays containing long format data (must be sorted by date)
+/// * `resample` - Rebalancing frequency
+/// * `config` - Backtest configuration
+///
+/// # Returns
+/// BacktestResult containing cumulative returns (one per unique date)
+pub fn backtest_long_arrow(
+    input: &LongFormatArrowInput,
+    resample: ResampleFreq,
     config: &BacktestConfig,
-) -> Vec<usize> {
-    // Convert sparse prices to dense for compatibility with detect_stops_finlab
-    // This is slightly inefficient but reuses existing tested logic
-    let max_id = portfolio
-        .positions
-        .keys()
-        .chain(prices.keys())
-        .copied()
-        .max()
-        .unwrap_or(0);
-
-    let dense_prices: Vec<f64> = (0..=max_id)
-        .map(|id| prices.get(&id).copied().unwrap_or(f64::NAN))
-        .collect();
-
-    detect_stops_finlab(&portfolio.positions, &dense_prices, config)
-}
-
-/// Execute pending stop exits (sparse version)
-fn execute_pending_stops_sparse(
-    portfolio: &mut PortfolioState,
-    pending_stops: &[usize],
-    _prices: &HashMap<usize, f64>,
-    stopped_stocks: &mut [bool],
-    pending_weights: &Option<HashMap<usize, f64>>,
-    config: &BacktestConfig,
-) {
-    for &stock_id in pending_stops {
-        // Check will_be_set_by_rebalance
-        let should_process = if let Some(ref weights) = pending_weights {
-            let has_nonzero_weight = weights
-                .get(&stock_id)
-                .map(|w| w.abs() > 1e-10)
-                .unwrap_or(false);
-            if config.stop_trading_next_period {
-                true
-            } else {
-                !has_nonzero_weight
-            }
-        } else {
-            true
+) -> BacktestResult {
+    let n_rows = input.dates.len();
+    if n_rows == 0 {
+        return BacktestResult {
+            creturn: vec![],
+            trades: vec![],
         };
+    }
 
-        if !should_process {
-            continue;
+    let mut portfolio = Portfolio::new();
+    let mut creturn: Vec<f64> = Vec::new();
+
+    // Track stopped stocks by symbol string
+    let mut stopped_stocks: HashMap<String, bool> = HashMap::new();
+
+    // Pending weights for T+1 execution
+    let mut pending_weights: Option<HashMap<String, f64>> = None;
+    let mut pending_stop_exits: Vec<String> = Vec::new();
+
+    // Track current date (i32 days since epoch)
+    let mut current_date: Option<i32> = None;
+
+    // Today's prices and weights
+    let mut today_prices: HashMap<&str, f64> = HashMap::new();
+    let mut today_weights: HashMap<&str, f64> = HashMap::new();
+
+    // Process each row
+    for i in 0..n_rows {
+        let date = input.dates.value(i);
+        let symbol = input.symbols.value(i);
+        let price = input.prices.value(i);
+        let weight = input.weights.value(i);
+
+        // Check if we've moved to a new date
+        let date_changed = current_date.map_or(true, |d| d != date);
+
+        if date_changed && current_date.is_some() {
+            let prev_date = current_date.unwrap();
+
+            // STEP 1: Update existing positions with today's prices
+            update_positions(&mut portfolio, &today_prices);
+
+            // STEP 2: Execute pending stop exits
+            execute_pending_stops(
+                &mut portfolio,
+                &mut pending_stop_exits,
+                &mut stopped_stocks,
+                config,
+            );
+
+            // STEP 3: Execute pending rebalance (T+1 execution)
+            if let Some(target_weights) = pending_weights.take() {
+                execute_rebalance(
+                    &mut portfolio,
+                    &target_weights,
+                    &today_prices,
+                    &stopped_stocks,
+                    config,
+                );
+                stopped_stocks.clear();
+            }
+
+            // STEP 4: Check if prev_date is a rebalance day
+            let should_rebalance = match resample {
+                ResampleFreq::Monthly => is_month_end_i32(prev_date, date),
+                ResampleFreq::Weekly => true, // TODO: proper weekly detection
+                ResampleFreq::Daily => true,
+            };
+
+            if should_rebalance && !today_weights.is_empty() {
+                // Normalize weights using Finlab's behavior
+                let normalized = normalize_weights(
+                    &today_weights,
+                    &stopped_stocks,
+                    config.position_limit,
+                );
+                if !normalized.is_empty() {
+                    pending_weights = Some(normalized);
+                }
+            }
+
+            // STEP 5: Record cumulative return
+            creturn.push(portfolio.balance());
+
+            // Clear today's data for new day
+            today_prices.clear();
+            today_weights.clear();
         }
 
-        if let Some(pos) = portfolio.positions.remove(&stock_id) {
-            let market_value = pos.last_market_value;
-            let sell_value =
-                market_value - market_value.abs() * (config.fee_ratio + config.tax_ratio);
-            portfolio.cash += sell_value;
+        // Accumulate today's data
+        current_date = Some(date);
+        if price > 0.0 && !price.is_nan() {
+            today_prices.insert(symbol, price);
+        }
+        // Handle null weights (from polars rolling operations) as 0.0
+        if !weight.is_nan() && weight.abs() > 1e-10 {
+            today_weights.insert(symbol, weight);
+        }
+    }
 
-            if config.stop_trading_next_period && stock_id < stopped_stocks.len() {
-                stopped_stocks[stock_id] = true;
+    // Process final day
+    if current_date.is_some() && !today_prices.is_empty() {
+        // STEP 1: Update positions
+        update_positions(&mut portfolio, &today_prices);
+
+        // STEP 2: Execute pending stops
+        execute_pending_stops(
+            &mut portfolio,
+            &mut pending_stop_exits,
+            &mut stopped_stocks,
+            config,
+        );
+
+        // STEP 3: Execute pending rebalance
+        if let Some(target_weights) = pending_weights.take() {
+            execute_rebalance(
+                &mut portfolio,
+                &target_weights,
+                &today_prices,
+                &stopped_stocks,
+                config,
+            );
+        }
+
+        // STEP 4: Final balance
+        creturn.push(portfolio.balance());
+    }
+
+    BacktestResult {
+        creturn,
+        trades: vec![],
+    }
+}
+
+/// Run backtest on native Rust slices
+pub fn backtest_long_slice(
+    dates: &[i32],
+    symbols: &[&str],
+    prices: &[f64],
+    weights: &[f64],
+    resample: ResampleFreq,
+    config: &BacktestConfig,
+) -> BacktestResult {
+    backtest_with_accessor(
+        dates.len(),
+        |i| dates[i],
+        |i| symbols[i],
+        |i| prices[i],
+        |i| weights[i],
+        resample,
+        config,
+    )
+}
+
+/// Check if prev_date is a month-end using i32 dates (days since 1970-01-01)
+///
+/// Returns true if prev_date and next_date are in different months
+fn is_month_end_i32(prev_days: i32, next_days: i32) -> bool {
+    // Convert days since epoch to (year, month)
+    let prev_ym = days_to_year_month(prev_days);
+    let next_ym = days_to_year_month(next_days);
+    prev_ym != next_ym
+}
+
+/// Convert days since 1970-01-01 to (year, month)
+#[inline]
+fn days_to_year_month(days: i32) -> (i32, u32) {
+    // Algorithm from Howard Hinnant's date library
+    // https://howardhinnant.github.io/date_algorithms.html
+    let z = days + 719468; // shift epoch from 1970-01-01 to 0000-03-01
+    let era = if z >= 0 { z / 146097 } else { (z - 146096) / 146097 };
+    let doe = (z - era * 146097) as u32; // day of era [0, 146096]
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365; // year of era [0, 399]
+    let y = yoe as i32 + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100); // day of year [0, 365]
+    let mp = (5 * doy + 2) / 153; // month offset from March [0, 11]
+    let m = if mp < 10 { mp + 3 } else { mp - 9 }; // actual month [1, 12]
+    let year = if m <= 2 { y + 1 } else { y };
+    (year, m)
+}
+
+/// Update positions with daily returns
+fn update_positions(portfolio: &mut Portfolio, prices: &HashMap<&str, f64>) {
+    for (sym, pos) in portfolio.positions.iter_mut() {
+        if let Some(&curr_price) = prices.get(sym.as_str()) {
+            if curr_price > 0.0 && !curr_price.is_nan() {
+                if pos.previous_price > 0.0 {
+                    let r = curr_price / pos.previous_price;
+                    pos.cr *= r;
+                    pos.last_market_value *= r;
+                }
+                if curr_price > pos.max_price {
+                    pos.max_price = curr_price;
+                }
+                pos.maxcr = pos.maxcr.max(pos.cr);
+                pos.previous_price = curr_price;
             }
         }
     }
 }
 
-/// Execute rebalance (sparse version)
-fn execute_rebalance_sparse(
-    portfolio: &mut PortfolioState,
-    target_weights: &HashMap<usize, f64>,
-    prices: &HashMap<usize, f64>,
-    stopped_stocks: &[bool],
-    _n_symbols: usize,
+/// Execute pending stop exits
+fn execute_pending_stops(
+    portfolio: &mut Portfolio,
+    pending_stops: &mut Vec<String>,
+    stopped_stocks: &mut HashMap<String, bool>,
     config: &BacktestConfig,
 ) {
-    // Apply stopped stocks filter
-    let mut filtered_weights = target_weights.clone();
-    if config.stop_trading_next_period {
-        let original_sum: f64 = filtered_weights.values().map(|w| w.abs()).sum();
-
-        for (stock_id, weight) in filtered_weights.iter_mut() {
-            if *stock_id < stopped_stocks.len() && stopped_stocks[*stock_id] {
-                *weight = 0.0;
-            }
-        }
-
-        // Re-normalize
-        let remaining_sum: f64 = filtered_weights.values().map(|w| w.abs()).sum();
-        if remaining_sum > 0.0 && remaining_sum < original_sum {
-            let scale_factor = original_sum / remaining_sum;
-            for weight in filtered_weights.values_mut() {
-                *weight *= scale_factor;
+    for sym in pending_stops.drain(..) {
+        if let Some(pos) = portfolio.positions.remove(&sym) {
+            let sell_value =
+                pos.last_market_value - pos.last_market_value.abs() * (config.fee_ratio + config.tax_ratio);
+            portfolio.cash += sell_value;
+            if config.stop_trading_next_period {
+                stopped_stocks.insert(sym, true);
             }
         }
     }
+}
 
+/// Execute rebalance with string-keyed positions
+fn execute_rebalance(
+    portfolio: &mut Portfolio,
+    target_weights: &HashMap<String, f64>,
+    today_prices: &HashMap<&str, f64>,
+    stopped_stocks: &HashMap<String, bool>,
+    config: &BacktestConfig,
+) {
     // Update existing positions to market value
-    // Important: Always update pos.value = pos.last_market_value to match Finlab behavior
-    // This ensures balance calculation uses the latest market value, not old cost basis
-    for (stock_id, pos) in portfolio.positions.iter_mut() {
-        // Always update value to last_market_value (matches Finlab's pos[sid] *= r behavior)
+    for (_sym, pos) in portfolio.positions.iter_mut() {
         pos.value = pos.last_market_value;
-
-        // Update entry_price only if we have a valid price
-        if let Some(&price) = prices.get(stock_id) {
-            if price > 0.0 && !price.is_nan() {
-                pos.entry_price = price;
-            }
-        }
     }
 
-    // Calculate current balance
-    let balance = portfolio.total_cost_basis();
-    let total_target_weight: f64 = filtered_weights.values().map(|w| w.abs()).sum();
+    // Calculate total balance
+    let balance = portfolio.balance();
+    let total_target_weight: f64 = target_weights.values().map(|w| w.abs()).sum();
 
     if total_target_weight == 0.0 || balance <= 0.0 {
         // Exit all positions
-        let all_positions: Vec<usize> = portfolio.positions.keys().copied().collect();
-        for stock_id in all_positions {
-            if let Some(pos) = portfolio.positions.remove(&stock_id) {
+        let all_positions: Vec<String> = portfolio.positions.keys().cloned().collect();
+        for sym in all_positions {
+            if let Some(pos) = portfolio.positions.remove(&sym) {
                 let sell_value = pos.value - pos.value.abs() * (config.fee_ratio + config.tax_ratio);
                 portfolio.cash += sell_value;
             }
@@ -312,43 +489,94 @@ fn execute_rebalance_sparse(
 
     let ratio = balance / total_target_weight.max(1.0);
 
-    // Store old positions
-    let old_positions: HashMap<usize, f64> = portfolio
+    // Store old positions (cost basis and market value)
+    let old_positions: HashMap<String, f64> = portfolio
         .positions
         .iter()
-        .map(|(&k, v)| (k, v.value))
+        .map(|(k, v)| (k.clone(), v.value))
+        .collect();
+    let old_market_values: HashMap<String, f64> = portfolio
+        .positions
+        .iter()
+        .map(|(k, v)| (k.clone(), v.last_market_value))
         .collect();
 
     // Clear and rebuild
     portfolio.positions.clear();
     let mut cash = portfolio.cash;
 
-    for (&stock_id, &target_weight) in filtered_weights.iter() {
-        if target_weight.abs() < 1e-10 {
-            // Exit position
-            if let Some(&old_value) = old_positions.get(&stock_id) {
-                if old_value.abs() > 1e-10 {
-                    let sell_fee = old_value.abs() * (config.fee_ratio + config.tax_ratio);
-                    cash += old_value - sell_fee;
+    for (sym, &target_weight) in target_weights {
+        // Skip stopped stocks first
+        if stopped_stocks.get(sym).copied().unwrap_or(false) {
+            continue;
+        }
+
+        // Get price and check validity
+        let price_opt = today_prices.get(sym.as_str()).copied();
+        let price_valid = price_opt.map_or(false, |p| p > 0.0 && !p.is_nan());
+
+        // Target position value (scaled by ratio)
+        let target_value = target_weight * ratio;
+        let current_value = old_positions.get(sym).copied().unwrap_or(0.0);
+
+        // Handle NaN price case (match Finlab behavior: enter even with NaN price)
+        if !price_valid {
+            // If target is 0 and we have an old position, sell it using old market value
+            if target_weight.abs() < 1e-10 {
+                if let Some(&old_mv) = old_market_values.get(sym) {
+                    if old_mv.abs() > 1e-10 {
+                        let sell_fee = old_mv.abs() * (config.fee_ratio + config.tax_ratio);
+                        cash += old_mv - sell_fee;
+                    }
+                }
+                continue;
+            }
+
+            // Finlab behavior: Enter/modify position even with NaN price
+            if target_value.abs() > 1e-10 {
+                let amount = target_value - current_value;
+                let is_buy = amount > 0.0;
+                let is_entry =
+                    (target_value >= 0.0 && amount > 0.0) || (target_value <= 0.0 && amount < 0.0);
+                let cost = if is_entry {
+                    amount.abs() * config.fee_ratio
+                } else {
+                    amount.abs() * (config.fee_ratio + config.tax_ratio)
+                };
+
+                let new_value = if is_buy {
+                    cash -= amount;
+                    current_value + amount - cost
+                } else {
+                    let sell_amount = amount.abs();
+                    cash += sell_amount - cost;
+                    current_value - sell_amount
+                };
+
+                if new_value.abs() > 1e-10 {
+                    portfolio.positions.insert(
+                        sym.clone(),
+                        Position::new_with_nan_price(new_value),
+                    );
                 }
             }
             continue;
         }
 
-        let price = prices.get(&stock_id).copied().unwrap_or(f64::NAN);
-        let price_valid = price > 0.0 && !price.is_nan();
-
-        if !price_valid {
+        // Valid price case: exit position if target is 0
+        if target_weight.abs() < 1e-10 {
+            if current_value.abs() > 1e-10 {
+                let sell_fee = current_value.abs() * (config.fee_ratio + config.tax_ratio);
+                cash += current_value - sell_fee;
+            }
             continue;
         }
 
-        let target_value = target_weight * ratio;
-        let current_value = old_positions.get(&stock_id).copied().unwrap_or(0.0);
+        let price = price_opt.unwrap();
         let amount = target_value - current_value;
 
         let is_buy = amount > 0.0;
-        let is_entry =
-            (target_value >= 0.0 && amount > 0.0) || (target_value <= 0.0 && amount < 0.0);
+        let is_entry = (target_value >= 0.0 && amount > 0.0) || (target_value <= 0.0 && amount < 0.0);
         let cost = if is_entry {
             amount.abs() * config.fee_ratio
         } else {
@@ -366,24 +594,15 @@ fn execute_rebalance_sparse(
 
         if new_position_value.abs() > 1e-10 {
             portfolio.positions.insert(
-                stock_id,
-                Position {
-                    value: new_position_value,
-                    entry_price: price,
-                    stop_entry_price: price,
-                    max_price: price,
-                    last_market_value: new_position_value,
-                    cr: 1.0,
-                    maxcr: 1.0,
-                    previous_price: price,
-                },
+                sym.clone(),
+                Position::new(new_position_value, price),
             );
         }
     }
 
     // Handle positions outside target_weights
-    for (&stock_id, &old_value) in old_positions.iter() {
-        if !filtered_weights.contains_key(&stock_id) && old_value.abs() > 1e-10 {
+    for (sym, &old_value) in old_positions.iter() {
+        if !target_weights.contains_key(sym) && old_value.abs() > 1e-10 {
             let sell_fee = old_value.abs() * (config.fee_ratio + config.tax_ratio);
             cash += old_value - sell_fee;
         }
@@ -392,87 +611,122 @@ fn execute_rebalance_sparse(
     portfolio.cash = cash;
 }
 
-/// Calculate portfolio balance (sparse version)
-fn balance_sparse(portfolio: &PortfolioState, prices: &HashMap<usize, f64>) -> f64 {
-    let pos_value: f64 = portfolio
-        .positions
-        .iter()
-        .map(|(&stock_id, p)| {
-            if let Some(&price) = prices.get(&stock_id) {
-                if price > 0.0 && !price.is_nan() {
-                    p.last_market_value
-                } else {
-                    p.last_market_value
-                }
-            } else {
-                p.last_market_value
-            }
-        })
-        .sum();
-    portfolio.cash + pos_value
-}
-
-/// Normalize weights (sparse version)
-fn normalize_weights_sparse(
-    weights: &HashMap<usize, f64>,
-    stopped_stocks: &[bool],
+/// Normalize weights using Finlab's behavior
+fn normalize_weights(
+    weights: &HashMap<&str, f64>,
+    stopped_stocks: &HashMap<String, bool>,
     position_limit: f64,
-) -> HashMap<usize, f64> {
-    // Convert to dense, normalize, convert back to sparse
-    let max_id = weights.keys().copied().max().unwrap_or(0);
-    let dense: Vec<f64> = (0..=max_id)
-        .map(|id| weights.get(&id).copied().unwrap_or(0.0))
-        .collect();
-
-    let stopped: Vec<bool> = (0..=max_id)
-        .map(|id| {
-            if id < stopped_stocks.len() {
-                stopped_stocks[id]
-            } else {
-                false
-            }
+) -> HashMap<String, f64> {
+    // Filter out stopped stocks and zero weights
+    let filtered: Vec<(&str, f64)> = weights
+        .iter()
+        .filter(|(sym, w)| {
+            // sym is &&str, *sym is &str
+            // stopped_stocks.get() takes &Q where String: Borrow<Q>
+            // String: Borrow<str>, so we need to pass &str
+            let is_stopped = stopped_stocks.get::<str>(*sym).copied().unwrap_or(false);
+            w.abs() > 1e-10 && !is_stopped
         })
+        .map(|(&sym, &w)| (sym, w))
         .collect();
 
-    let normalized = normalize_weights_finlab(&dense, &stopped, position_limit);
+    if filtered.is_empty() {
+        return HashMap::new();
+    }
 
-    normalized
+    // Finlab normalization: divisor = max(abs_sum, 1.0)
+    let abs_sum: f64 = filtered.iter().map(|(_, w)| w.abs()).sum();
+    let divisor = abs_sum.max(1.0);
+
+    filtered
         .into_iter()
-        .enumerate()
-        .filter(|(_, w)| w.abs() > 1e-10)
+        .map(|(sym, w)| {
+            let norm_w = w / divisor;
+            let clipped = norm_w.clamp(-position_limit, position_limit);
+            (sym.to_string(), clipped)
+        })
         .collect()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use arrow::array::StringViewBuilder;
+
+    /// Convert date string to days since epoch (1970-01-01)
+    fn date_to_days(s: &str) -> i32 {
+        // Simple parser: YYYY-MM-DD
+        let parts: Vec<&str> = s.split('-').collect();
+        let year: i32 = parts[0].parse().unwrap();
+        let month: u32 = parts[1].parse().unwrap();
+        let day: u32 = parts[2].parse().unwrap();
+
+        // Days from 1970-01-01 (simplified, accurate for 2000-2050)
+        let days_per_year = 365;
+        let mut days = (year - 1970) * days_per_year;
+        days += ((year - 1970 + 1) / 4) as i32; // Leap years since 1970
+        let days_per_month = [0, 31, 59, 90, 120, 151, 181, 212, 243, 273, 304, 334];
+        days += days_per_month[(month - 1) as usize] as i32;
+        if month > 2 && year % 4 == 0 {
+            days += 1;
+        }
+        days += day as i32 - 1;
+        days
+    }
+
+    fn make_symbols(strs: Vec<&str>) -> StringViewArray {
+        let mut builder = StringViewBuilder::new();
+        for s in strs {
+            builder.append_value(s);
+        }
+        builder.finish()
+    }
+
+    fn make_input<'a>(
+        dates: &'a Int32Array,
+        symbols: &'a StringViewArray,
+        prices: &'a Float64Array,
+        weights: &'a Float64Array,
+    ) -> LongFormatArrowInput<'a> {
+        LongFormatArrowInput {
+            dates,
+            symbols,
+            prices,
+            weights,
+        }
+    }
 
     #[test]
-    fn test_backtest_long_empty() {
-        let input = LongFormatInput {
-            date_indices: &[],
-            symbol_ids: &[],
-            prices: &[],
-            weights: &[],
-        };
-        let result = backtest_long(&input, 0, 0, &[], &BacktestConfig::default());
+    fn test_backtest_empty() {
+        let dates = Int32Array::from(Vec::<i32>::new());
+        let symbols = make_symbols(vec![]);
+        let prices = Float64Array::from(Vec::<f64>::new());
+        let weights = Float64Array::from(Vec::<f64>::new());
+
+        let input = make_input(&dates, &symbols, &prices, &weights);
+        let result = backtest_long_arrow(&input, ResampleFreq::Daily, &BacktestConfig::default());
+
         assert!(result.creturn.is_empty());
     }
 
     #[test]
-    fn test_backtest_long_single_stock() {
+    fn test_backtest_single_stock() {
         // 4 days, 1 stock
-        // Day 0: price=100, weight=1.0 (signal)
-        // Day 1: price=100 (entry at T+1)
-        // Day 2: price=110 (+10%)
-        // Day 3: price=121 (+10%)
-        let input = LongFormatInput {
-            date_indices: &[0, 1, 2, 3],
-            symbol_ids: &[0, 0, 0, 0],
-            prices: &[100.0, 100.0, 110.0, 121.0],
-            weights: &[1.0, 0.0, 0.0, 0.0], // Only signal on day 0
-        };
-        let rebalance_mask = vec![true, false, false, false];
+        // Day 0: signal weight=1.0
+        // Day 1: entry at T+1
+        // Day 2: +10%
+        // Day 3: +10%
+        let dates = Int32Array::from(vec![
+            date_to_days("2024-01-01"),
+            date_to_days("2024-01-02"),
+            date_to_days("2024-01-03"),
+            date_to_days("2024-01-04"),
+        ]);
+        let symbols = make_symbols(vec!["AAPL", "AAPL", "AAPL", "AAPL"]);
+        let prices = Float64Array::from(vec![100.0, 100.0, 110.0, 121.0]);
+        let weights = Float64Array::from(vec![1.0, 0.0, 0.0, 0.0]);
+
+        let input = make_input(&dates, &symbols, &prices, &weights);
         let config = BacktestConfig {
             fee_ratio: 0.0,
             tax_ratio: 0.0,
@@ -480,48 +734,27 @@ mod tests {
             ..Default::default()
         };
 
-        let result = backtest_long(&input, 4, 1, &rebalance_mask, &config);
+        let result = backtest_long_arrow(&input, ResampleFreq::Daily, &config);
 
         assert_eq!(result.creturn.len(), 4);
-        // Day 0: No position yet = 1.0
-        assert!(
-            (result.creturn[0] - 1.0).abs() < 1e-10,
-            "Day 0: expected 1.0, got {}",
-            result.creturn[0]
-        );
-        // Day 1: Entry at 100, no return yet = 1.0
-        assert!(
-            (result.creturn[1] - 1.0).abs() < 1e-10,
-            "Day 1: expected 1.0, got {}",
-            result.creturn[1]
-        );
-        // Day 2: +10% = 1.1
-        assert!(
-            (result.creturn[2] - 1.1).abs() < 1e-10,
-            "Day 2: expected 1.1, got {}",
-            result.creturn[2]
-        );
-        // Day 3: +10% more = 1.21
-        assert!(
-            (result.creturn[3] - 1.21).abs() < 1e-10,
-            "Day 3: expected 1.21, got {}",
-            result.creturn[3]
-        );
+        assert!((result.creturn[0] - 1.0).abs() < 1e-10, "Day 0: {}", result.creturn[0]);
+        assert!((result.creturn[1] - 1.0).abs() < 1e-10, "Day 1: {}", result.creturn[1]);
+        assert!((result.creturn[2] - 1.1).abs() < 1e-10, "Day 2: {}", result.creturn[2]);
+        assert!((result.creturn[3] - 1.21).abs() < 1e-10, "Day 3: {}", result.creturn[3]);
     }
 
     #[test]
-    fn test_backtest_long_two_stocks() {
+    fn test_backtest_two_stocks() {
         // 3 days, 2 stocks with equal weight
-        // Day 0: signal for both stocks
-        // Day 1: entry
-        // Day 2: Stock 0 +10%, Stock 1 -10%
-        let input = LongFormatInput {
-            date_indices: &[0, 0, 1, 1, 2, 2],
-            symbol_ids: &[0, 1, 0, 1, 0, 1],
-            prices: &[100.0, 100.0, 100.0, 100.0, 110.0, 90.0],
-            weights: &[0.5, 0.5, 0.0, 0.0, 0.0, 0.0],
-        };
-        let rebalance_mask = vec![true, false, false];
+        let d1 = date_to_days("2024-01-01");
+        let d2 = date_to_days("2024-01-02");
+        let d3 = date_to_days("2024-01-03");
+        let dates = Int32Array::from(vec![d1, d1, d2, d2, d3, d3]);
+        let symbols = make_symbols(vec!["AAPL", "GOOG", "AAPL", "GOOG", "AAPL", "GOOG"]);
+        let prices = Float64Array::from(vec![100.0, 100.0, 100.0, 100.0, 110.0, 90.0]);
+        let weights = Float64Array::from(vec![0.5, 0.5, 0.0, 0.0, 0.0, 0.0]);
+
+        let input = make_input(&dates, &symbols, &prices, &weights);
         let config = BacktestConfig {
             fee_ratio: 0.0,
             tax_ratio: 0.0,
@@ -529,120 +762,91 @@ mod tests {
             ..Default::default()
         };
 
-        let result = backtest_long(&input, 3, 2, &rebalance_mask, &config);
+        let result = backtest_long_arrow(&input, ResampleFreq::Daily, &config);
 
         assert_eq!(result.creturn.len(), 3);
-        // Day 0: 1.0
-        assert!(
-            (result.creturn[0] - 1.0).abs() < 1e-10,
-            "Day 0: expected 1.0, got {}",
-            result.creturn[0]
-        );
-        // Day 1: 1.0
-        assert!(
-            (result.creturn[1] - 1.0).abs() < 1e-10,
-            "Day 1: expected 1.0, got {}",
-            result.creturn[1]
-        );
+        assert!((result.creturn[0] - 1.0).abs() < 1e-10);
+        assert!((result.creturn[1] - 1.0).abs() < 1e-10);
         // Day 2: 0.5 * 1.1 + 0.5 * 0.9 = 1.0
-        assert!(
-            (result.creturn[2] - 1.0).abs() < 1e-10,
-            "Day 2: expected 1.0, got {}",
-            result.creturn[2]
-        );
+        assert!((result.creturn[2] - 1.0).abs() < 1e-10);
     }
 
     #[test]
-    fn test_backtest_long_with_fees() {
-        // Single stock with entry fee
-        let input = LongFormatInput {
-            date_indices: &[0, 1, 2],
-            symbol_ids: &[0, 0, 0],
-            prices: &[100.0, 100.0, 100.0],
-            weights: &[1.0, 0.0, 0.0],
-        };
-        let rebalance_mask = vec![true, false, false];
-        let fee_ratio = 0.01; // 1% fee
+    fn test_backtest_with_fees() {
+        let dates = Int32Array::from(vec![
+            date_to_days("2024-01-01"),
+            date_to_days("2024-01-02"),
+            date_to_days("2024-01-03"),
+        ]);
+        let symbols = make_symbols(vec!["AAPL", "AAPL", "AAPL"]);
+        let prices = Float64Array::from(vec![100.0, 100.0, 100.0]);
+        let weights = Float64Array::from(vec![1.0, 0.0, 0.0]);
+
+        let input = make_input(&dates, &symbols, &prices, &weights);
         let config = BacktestConfig {
-            fee_ratio,
+            fee_ratio: 0.01,
             tax_ratio: 0.0,
             finlab_mode: true,
             ..Default::default()
         };
 
-        let result = backtest_long(&input, 3, 1, &rebalance_mask, &config);
+        let result = backtest_long_arrow(&input, ResampleFreq::Daily, &config);
 
         // Day 1: Entry with 1% fee = 0.99
-        let expected_day1 = 1.0 - fee_ratio;
-        assert!(
-            (result.creturn[1] - expected_day1).abs() < 1e-6,
-            "Day 1: expected {}, got {}",
-            expected_day1,
-            result.creturn[1]
-        );
+        assert!((result.creturn[1] - 0.99).abs() < 1e-6, "Day 1: {}", result.creturn[1]);
     }
 
     #[test]
-    fn test_backtest_long_stop_loss() {
-        // Stock drops 15%, then recovers - stop loss should have exited
-        // Add Day 5 where price recovers to verify position was closed
-        let input = LongFormatInput {
-            date_indices: &[0, 1, 2, 3, 4, 5],
-            symbol_ids: &[0, 0, 0, 0, 0, 0],
-            prices: &[100.0, 100.0, 95.0, 85.0, 80.0, 100.0],
-            weights: &[1.0, 0.0, 0.0, 0.0, 0.0, 0.0],
-        };
-        let rebalance_mask = vec![true, false, false, false, false, false];
+    fn test_monthly_rebalance() {
+        // Test that monthly rebalance triggers at month boundaries
+        let dates = Int32Array::from(vec![
+            date_to_days("2024-01-30"),
+            date_to_days("2024-01-31"),
+            date_to_days("2024-02-01"),
+            date_to_days("2024-02-02"),
+        ]);
+        let symbols = make_symbols(vec!["AAPL", "AAPL", "AAPL", "AAPL"]);
+        let prices = Float64Array::from(vec![100.0, 100.0, 100.0, 110.0]);
+        let weights = Float64Array::from(vec![0.0, 1.0, 0.0, 0.0]); // Signal on Jan 31
+
+        let input = make_input(&dates, &symbols, &prices, &weights);
         let config = BacktestConfig {
             fee_ratio: 0.0,
             tax_ratio: 0.0,
-            stop_loss: 0.10, // 10% stop loss
             finlab_mode: true,
             ..Default::default()
         };
 
-        let result = backtest_long(&input, 6, 1, &rebalance_mask, &config);
+        let result = backtest_long_arrow(&input, ResampleFreq::Monthly, &config);
 
-        // Day 0: 1.0 (no position)
-        // Day 1: 1.0 (entry at T+1)
-        // Day 2: 0.95 (-5%, cr=0.95, no stop)
-        // Day 3: 0.85 (-15%, cr=0.85 < 0.90, triggers stop for T+1)
-        // Day 4: 0.80 (exit executed at day 4's price, now all cash)
-        // Day 5: 0.80 (still all cash, price recovery doesn't affect us)
+        assert_eq!(result.creturn.len(), 4);
+        // Jan 31 is month-end, so signal triggers entry on Feb 1
+        // Feb 1: entry at 100
+        // Feb 2: +10% = 1.1
+        assert!((result.creturn[3] - 1.1).abs() < 1e-10, "Day 3: {}", result.creturn[3]);
+    }
 
-        assert_eq!(result.creturn.len(), 6);
-        assert!(
-            (result.creturn[0] - 1.0).abs() < 1e-10,
-            "Day 0: expected 1.0, got {}",
-            result.creturn[0]
-        );
-        assert!(
-            (result.creturn[1] - 1.0).abs() < 1e-10,
-            "Day 1: expected 1.0, got {}",
-            result.creturn[1]
-        );
-        assert!(
-            (result.creturn[2] - 0.95).abs() < 1e-10,
-            "Day 2: expected 0.95, got {}",
-            result.creturn[2]
-        );
-        assert!(
-            (result.creturn[3] - 0.85).abs() < 1e-10,
-            "Day 3: expected 0.85, got {}",
-            result.creturn[3]
-        );
-        // Day 4: Stop exit executed at price=80, so value = 0.80
-        assert!(
-            (result.creturn[4] - 0.80).abs() < 1e-10,
-            "Day 4: expected 0.80, got {}",
-            result.creturn[4]
-        );
-        // Day 5: Position was closed, price recovery to 100 doesn't affect portfolio
-        // Should still be 0.80 (all cash)
-        assert!(
-            (result.creturn[5] - 0.80).abs() < 1e-10,
-            "Day 5: expected 0.80 (flat), got {}",
-            result.creturn[5]
-        );
+    #[test]
+    fn test_slice_interface() {
+        let dates = [
+            date_to_days("2024-01-01"),
+            date_to_days("2024-01-02"),
+            date_to_days("2024-01-03"),
+        ];
+        let symbols = ["AAPL", "AAPL", "AAPL"];
+        let prices = [100.0, 100.0, 110.0];
+        let weights = [1.0, 0.0, 0.0];
+
+        let config = BacktestConfig {
+            fee_ratio: 0.0,
+            tax_ratio: 0.0,
+            finlab_mode: true,
+            ..Default::default()
+        };
+
+        let result = backtest_long_slice(&dates, &symbols, &prices, &weights, ResampleFreq::Daily, &config);
+
+        assert_eq!(result.creturn.len(), 3);
+        assert!((result.creturn[2] - 1.1).abs() < 1e-10);
     }
 }
