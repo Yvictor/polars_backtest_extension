@@ -396,7 +396,6 @@ dependencies = [
  "arrow",
  "chrono",
  "criterion",
- "polars-arrow",
  "rayon",
  "serde",
  "speedate",
@@ -2345,6 +2344,7 @@ dependencies = [
 name = "polars_backtest"
 version = "0.1.0"
 dependencies = [
+ "arrow",
  "btcore",
  "chrono",
  "polars",

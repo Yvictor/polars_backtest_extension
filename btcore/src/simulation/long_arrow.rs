@@ -13,8 +13,7 @@
 
 use std::collections::HashMap;
 
-use arrow::array::{Array, Float64Array, StringArray};
-use polars_arrow::array::{PrimitiveArray, StaticArray, Utf8ViewArray};
+use arrow::array::{Float64Array, Int32Array, StringViewArray};
 
 use crate::config::BacktestConfig;
 use crate::tracker::BacktestResult;
@@ -81,11 +80,13 @@ impl Default for StringPortfolio {
 /// Arrow-based long format backtest input
 ///
 /// All arrays must have the same length and be sorted by date.
+/// Uses i32 for dates (days since epoch) to match Polars Date type.
+/// Uses StringViewArray for symbols to match Polars string type (zero-copy from polars-arrow).
 pub struct LongFormatArrowInput<'a> {
-    /// Date strings (sorted ascending)
-    pub dates: &'a StringArray,
-    /// Symbol strings
-    pub symbols: &'a StringArray,
+    /// Date as i32 (days since epoch, sorted ascending)
+    pub dates: &'a Int32Array,
+    /// Symbol strings (StringViewArray for zero-copy from polars)
+    pub symbols: &'a StringViewArray,
     /// Close prices
     pub prices: &'a Float64Array,
     /// Target weights
@@ -234,27 +235,34 @@ where
     }
 }
 
-/// Run backtest with polars-arrow arrays using Date (i32) and Utf8ViewArray
+/// Run backtest with closure-based data access using i32 dates (days since epoch)
 ///
-/// This accepts polars-arrow arrays directly from Polars DataFrames.
-/// No data copying or conversion required.
+/// This allows the caller to provide data accessors without copying data.
+/// Uses i32 dates for efficient month-end detection without string parsing.
 ///
 /// # Arguments
-/// * `dates` - PrimitiveArray<i32> of dates (days since epoch, Date32 format)
-/// * `symbols` - Utf8ViewArray of symbol strings
-/// * `prices` - PrimitiveArray<f64> of close prices
-/// * `weights` - PrimitiveArray<f64> of target weights (None = no signal)
+/// * `n_rows` - Total number of rows
+/// * `get_date` - Closure to get date (days since epoch) at index
+/// * `get_symbol` - Closure to get symbol string at index
+/// * `get_price` - Closure to get price at index
+/// * `get_weight` - Closure to get weight at index (NaN = no signal)
 /// * `resample` - Rebalancing frequency
 /// * `config` - Backtest configuration
-pub fn backtest_long_polars_arrow(
-    dates: &PrimitiveArray<i32>,
-    symbols: &Utf8ViewArray,
-    prices: &PrimitiveArray<f64>,
-    weights: &PrimitiveArray<f64>,
+pub fn backtest_long_with_accessor_i32<'a, FD, FS, FP, FW>(
+    n_rows: usize,
+    get_date: FD,
+    get_symbol: FS,
+    get_price: FP,
+    get_weight: FW,
     resample: ResampleFreq,
     config: &BacktestConfig,
-) -> BacktestResult {
-    let n_rows = dates.len();
+) -> BacktestResult
+where
+    FD: Fn(usize) -> i32,
+    FS: Fn(usize) -> &'a str,
+    FP: Fn(usize) -> f64,
+    FW: Fn(usize) -> f64,
+{
     if n_rows == 0 {
         return BacktestResult {
             creturn: vec![],
@@ -272,11 +280,10 @@ pub fn backtest_long_polars_arrow(
     let mut today_weights: HashMap<&str, f64> = HashMap::new();
 
     for i in 0..n_rows {
-        // Zero-copy access to polars-arrow arrays
-        let date = dates.get(i).unwrap_or(0);
-        let symbol = symbols.value(i);
-        let price = prices.get(i).unwrap_or(f64::NAN);
-        let weight = weights.get(i).unwrap_or(f64::NAN);
+        let date = get_date(i);
+        let symbol = get_symbol(i);
+        let price = get_price(i);
+        let weight = get_weight(i);
 
         let date_changed = current_date.map_or(true, |d| d != date);
 
@@ -424,8 +431,8 @@ pub fn backtest_long_arrow(
     let mut pending_weights: Option<HashMap<String, f64>> = None;
     let mut pending_stop_exits: Vec<String> = Vec::new();
 
-    // Track current date
-    let mut current_date: Option<&str> = None;
+    // Track current date (i32 days since epoch)
+    let mut current_date: Option<i32> = None;
 
     // Today's prices and weights
     let mut today_prices: HashMap<&str, f64> = HashMap::new();
@@ -469,7 +476,7 @@ pub fn backtest_long_arrow(
 
             // STEP 4: Check if prev_date is a rebalance day
             let should_rebalance = match resample {
-                ResampleFreq::Monthly => is_month_end(prev_date, date),
+                ResampleFreq::Monthly => is_month_end_i32(prev_date, date),
                 ResampleFreq::Weekly => true, // TODO: proper weekly detection
                 ResampleFreq::Daily => true,
             };
@@ -819,10 +826,40 @@ fn normalize_weights(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use arrow::array::StringViewBuilder;
+
+    /// Convert date string to days since epoch (1970-01-01)
+    fn date_to_days(s: &str) -> i32 {
+        // Simple parser: YYYY-MM-DD
+        let parts: Vec<&str> = s.split('-').collect();
+        let year: i32 = parts[0].parse().unwrap();
+        let month: u32 = parts[1].parse().unwrap();
+        let day: u32 = parts[2].parse().unwrap();
+
+        // Days from 1970-01-01 (simplified, accurate for 2000-2050)
+        let days_per_year = 365;
+        let mut days = (year - 1970) * days_per_year;
+        days += ((year - 1970 + 1) / 4) as i32; // Leap years since 1970
+        let days_per_month = [0, 31, 59, 90, 120, 151, 181, 212, 243, 273, 304, 334];
+        days += days_per_month[(month - 1) as usize] as i32;
+        if month > 2 && year % 4 == 0 {
+            days += 1;
+        }
+        days += day as i32 - 1;
+        days
+    }
+
+    fn make_symbols(strs: Vec<&str>) -> StringViewArray {
+        let mut builder = StringViewBuilder::new();
+        for s in strs {
+            builder.append_value(s);
+        }
+        builder.finish()
+    }
 
     fn make_input<'a>(
-        dates: &'a StringArray,
-        symbols: &'a StringArray,
+        dates: &'a Int32Array,
+        symbols: &'a StringViewArray,
         prices: &'a Float64Array,
         weights: &'a Float64Array,
     ) -> LongFormatArrowInput<'a> {
@@ -836,8 +873,8 @@ mod tests {
 
     #[test]
     fn test_backtest_empty() {
-        let dates = StringArray::from(Vec::<&str>::new());
-        let symbols = StringArray::from(Vec::<&str>::new());
+        let dates = Int32Array::from(Vec::<i32>::new());
+        let symbols = make_symbols(vec![]);
         let prices = Float64Array::from(Vec::<f64>::new());
         let weights = Float64Array::from(Vec::<f64>::new());
 
@@ -854,13 +891,13 @@ mod tests {
         // Day 1: entry at T+1
         // Day 2: +10%
         // Day 3: +10%
-        let dates = StringArray::from(vec![
-            "2024-01-01",
-            "2024-01-02",
-            "2024-01-03",
-            "2024-01-04",
+        let dates = Int32Array::from(vec![
+            date_to_days("2024-01-01"),
+            date_to_days("2024-01-02"),
+            date_to_days("2024-01-03"),
+            date_to_days("2024-01-04"),
         ]);
-        let symbols = StringArray::from(vec!["AAPL", "AAPL", "AAPL", "AAPL"]);
+        let symbols = make_symbols(vec!["AAPL", "AAPL", "AAPL", "AAPL"]);
         let prices = Float64Array::from(vec![100.0, 100.0, 110.0, 121.0]);
         let weights = Float64Array::from(vec![1.0, 0.0, 0.0, 0.0]);
 
@@ -884,26 +921,13 @@ mod tests {
     #[test]
     fn test_backtest_two_stocks() {
         // 3 days, 2 stocks with equal weight
-        let dates = StringArray::from(vec![
-            "2024-01-01", "2024-01-01",
-            "2024-01-02", "2024-01-02",
-            "2024-01-03", "2024-01-03",
-        ]);
-        let symbols = StringArray::from(vec![
-            "AAPL", "GOOG",
-            "AAPL", "GOOG",
-            "AAPL", "GOOG",
-        ]);
-        let prices = Float64Array::from(vec![
-            100.0, 100.0,
-            100.0, 100.0,
-            110.0, 90.0,
-        ]);
-        let weights = Float64Array::from(vec![
-            0.5, 0.5,
-            0.0, 0.0,
-            0.0, 0.0,
-        ]);
+        let d1 = date_to_days("2024-01-01");
+        let d2 = date_to_days("2024-01-02");
+        let d3 = date_to_days("2024-01-03");
+        let dates = Int32Array::from(vec![d1, d1, d2, d2, d3, d3]);
+        let symbols = make_symbols(vec!["AAPL", "GOOG", "AAPL", "GOOG", "AAPL", "GOOG"]);
+        let prices = Float64Array::from(vec![100.0, 100.0, 100.0, 100.0, 110.0, 90.0]);
+        let weights = Float64Array::from(vec![0.5, 0.5, 0.0, 0.0, 0.0, 0.0]);
 
         let input = make_input(&dates, &symbols, &prices, &weights);
         let config = BacktestConfig {
@@ -924,8 +948,12 @@ mod tests {
 
     #[test]
     fn test_backtest_with_fees() {
-        let dates = StringArray::from(vec!["2024-01-01", "2024-01-02", "2024-01-03"]);
-        let symbols = StringArray::from(vec!["AAPL", "AAPL", "AAPL"]);
+        let dates = Int32Array::from(vec![
+            date_to_days("2024-01-01"),
+            date_to_days("2024-01-02"),
+            date_to_days("2024-01-03"),
+        ]);
+        let symbols = make_symbols(vec!["AAPL", "AAPL", "AAPL"]);
         let prices = Float64Array::from(vec![100.0, 100.0, 100.0]);
         let weights = Float64Array::from(vec![1.0, 0.0, 0.0]);
 
@@ -946,10 +974,13 @@ mod tests {
     #[test]
     fn test_monthly_rebalance() {
         // Test that monthly rebalance triggers at month boundaries
-        let dates = StringArray::from(vec![
-            "2024-01-30", "2024-01-31", "2024-02-01", "2024-02-02",
+        let dates = Int32Array::from(vec![
+            date_to_days("2024-01-30"),
+            date_to_days("2024-01-31"),
+            date_to_days("2024-02-01"),
+            date_to_days("2024-02-02"),
         ]);
-        let symbols = StringArray::from(vec!["AAPL", "AAPL", "AAPL", "AAPL"]);
+        let symbols = make_symbols(vec!["AAPL", "AAPL", "AAPL", "AAPL"]);
         let prices = Float64Array::from(vec![100.0, 100.0, 100.0, 110.0]);
         let weights = Float64Array::from(vec![0.0, 1.0, 0.0, 0.0]); // Signal on Jan 31
 

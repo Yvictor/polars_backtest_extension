@@ -5,6 +5,7 @@
 //! via PyO3 and pyo3-polars.
 
 mod expressions;
+mod ffi_convert;
 
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
@@ -17,7 +18,7 @@ use polars_ops::pivot;
 use btcore::{
     run_backtest, run_backtest_with_trades, BacktestConfig, BacktestResult, PriceData,
     SimTradeRecord,
-    simulation::{backtest_long, backtest_long_with_accessor, backtest_long_polars_arrow, LongFormatInput, ResampleFreq},
+    simulation::{backtest_long, backtest_long_arrow, LongFormatInput, LongFormatArrowInput, ResampleFreq},
 };
 
 /// Python wrapper for BacktestConfig
@@ -998,7 +999,20 @@ fn backtest_long_from_df(
         .downcast_ref::<PrimitiveArray<f64>>()
         .ok_or_else(|| PyValueError::new_err("Failed to downcast weight array to PrimitiveArray<f64>"))?;
 
-    eprintln!("[PROFILE] Get arrow arrays: {:?}", step_start.elapsed());
+    eprintln!("[PROFILE] Get polars-arrow arrays: {:?}", step_start.elapsed());
+    step_start = Instant::now();
+
+    // Convert polars-arrow arrays to arrow-rs arrays using FFI (zero-copy)
+    let dates_rs = ffi_convert::polars_i32_to_arrow(dates_arrow)
+        .map_err(|e| PyValueError::new_err(format!("FFI date conversion failed: {}", e)))?;
+    let symbols_rs = ffi_convert::polars_utf8view_to_arrow(symbols_arrow)
+        .map_err(|e| PyValueError::new_err(format!("FFI symbol conversion failed: {}", e)))?;
+    let prices_rs = ffi_convert::polars_f64_to_arrow(prices_arrow)
+        .map_err(|e| PyValueError::new_err(format!("FFI price conversion failed: {}", e)))?;
+    let weights_rs = ffi_convert::polars_f64_to_arrow(weights_arrow)
+        .map_err(|e| PyValueError::new_err(format!("FFI weight conversion failed: {}", e)))?;
+
+    eprintln!("[PROFILE] FFI conversion (polars-arrow -> arrow-rs): {:?}", step_start.elapsed());
     step_start = Instant::now();
 
     // Get config
@@ -1012,17 +1026,18 @@ fn backtest_long_from_df(
     // Parse resample frequency
     let resample_freq = ResampleFreq::from_str(resample);
 
-    // Run backtest using btcore with polars-arrow arrays (true zero-copy)
-    let result = backtest_long_polars_arrow(
-        dates_arrow,
-        symbols_arrow,
-        prices_arrow,
-        weights_arrow,
-        resample_freq,
-        &cfg,
-    );
+    // Build arrow input for btcore
+    let input = LongFormatArrowInput {
+        dates: &dates_rs,
+        symbols: &symbols_rs,
+        prices: &prices_rs,
+        weights: &weights_rs,
+    };
 
-    eprintln!("[PROFILE] Backtest (btcore polars-arrow): {:?}", step_start.elapsed());
+    // Run backtest using btcore with arrow-rs arrays (zero-copy via FFI)
+    let result = backtest_long_arrow(&input, resample_freq, &cfg);
+
+    eprintln!("[PROFILE] Backtest (btcore arrow): {:?}", step_start.elapsed());
     eprintln!("[PROFILE] TOTAL: {:?}", total_start.elapsed());
 
     Ok(PyBacktestResult {
@@ -1232,6 +1247,42 @@ fn backtest_long_format(
     Ok(result.creturn)
 }
 
+/// Check FFI struct sizes for polars-arrow / arrow-rs compatibility
+#[pyfunction]
+fn check_ffi_compatibility() -> PyResult<(usize, usize, usize, usize)> {
+    Ok(ffi_convert::check_ffi_struct_sizes())
+}
+
+/// Test FFI conversion from polars-arrow to arrow-rs
+#[pyfunction]
+fn test_ffi_conversion() -> PyResult<String> {
+    use polars_arrow::array::PrimitiveArray;
+
+    // Verify sizes first
+    ffi_convert::verify_ffi_compatibility()
+        .map_err(|e| PyValueError::new_err(e))?;
+
+    // Test i32 conversion
+    let pa_i32 = PrimitiveArray::<i32>::from_vec(vec![1, 2, 3, 4, 5]);
+    let ar_i32 = ffi_convert::polars_i32_to_arrow(&pa_i32)
+        .map_err(|e| PyValueError::new_err(format!("i32 conversion failed: {}", e)))?;
+
+    if ar_i32.len() != 5 || ar_i32.value(0) != 1 || ar_i32.value(4) != 5 {
+        return Err(PyValueError::new_err("i32 conversion data mismatch"));
+    }
+
+    // Test f64 conversion
+    let pa_f64 = PrimitiveArray::<f64>::from_vec(vec![1.0, 2.5, 3.14]);
+    let ar_f64 = ffi_convert::polars_f64_to_arrow(&pa_f64)
+        .map_err(|e| PyValueError::new_err(format!("f64 conversion failed: {}", e)))?;
+
+    if ar_f64.len() != 3 || (ar_f64.value(0) - 1.0).abs() > 1e-10 {
+        return Err(PyValueError::new_err("f64 conversion data mismatch"));
+    }
+
+    Ok("FFI conversion test passed: polars-arrow -> arrow-rs is zero-copy compatible".to_string())
+}
+
 /// Initialize the Python module
 #[pymodule]
 fn _polars_backtest(m: &Bound<'_, PyModule>) -> PyResult<()> {
@@ -1247,5 +1298,7 @@ fn _polars_backtest(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(backtest_with_trades, m)?)?;
     m.add_function(wrap_pyfunction!(backtest_long_format, m)?)?;
     m.add_function(wrap_pyfunction!(backtest_long_from_df, m)?)?;
+    m.add_function(wrap_pyfunction!(check_ffi_compatibility, m)?)?;
+    m.add_function(wrap_pyfunction!(test_ffi_conversion, m)?)?;
     Ok(())
 }

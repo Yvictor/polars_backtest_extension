@@ -18,7 +18,6 @@ thiserror.workspace = true
 rayon.workspace = true
 serde.workspace = true
 arrow.workspace = true
-polars-arrow.workspace = true
 
 [dev-dependencies]
 criterion = "0.5"
