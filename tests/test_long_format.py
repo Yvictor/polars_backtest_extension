@@ -43,6 +43,7 @@ def test_long_format_polars_signals(price_data, resample):
     close, adj_close = price_data
 
     # Prepare wide format data using pandas signals (baseline)
+    # Note: backtest_with_report_wide expects String date for internal joins
     position_pandas = close >= close.rolling(300).max()
     df_adj = pl.from_pandas(adj_close.reset_index()).with_columns(
         pl.col("date").cast(pl.Date).cast(pl.Utf8)
@@ -53,30 +54,34 @@ def test_long_format_polars_signals(price_data, resample):
     wide_report = backtest_with_report_wide(df_adj, df_pos, resample=resample)
 
     # Prepare long format data with polars-calculated signals (like notebook)
+    # Use Date type directly (no Utf8 conversion) for zero-copy performance
     df_long = (
         pl.from_pandas(close.unstack().reset_index())
         .select(
             pl.col("symbol"),
-            pl.col("date").cast(pl.Date).cast(pl.Utf8),
+            pl.col("date").cast(pl.Date),
             pl.col("0").alias("close"),
         )
         .join(
             pl.from_pandas(adj_close.unstack().reset_index())
             .select(
                 pl.col("symbol"),
-                pl.col("date").cast(pl.Date).cast(pl.Utf8),
+                pl.col("date").cast(pl.Date),
                 pl.col("0").alias("adj_close"),
             ),
             on=["symbol", "date"],
             how="left",
         )
-        .sort(["symbol", "date"])
+        .sort(["symbol", "date"])  # Sort by symbol first for correct rolling calculation
     )
 
     # Calculate weight using polars (this produces null values, not False)
     df_long = df_long.with_columns(
         (pl.col("close") >= pl.col("close").rolling_max(300).over("symbol")).alias("weight")
     )
+
+    # Sort by date for backtest (enables skip-sort optimization in Rust)
+    df_long = df_long.sort("date")
 
     # Check that we have null values (not False) - this is the root cause
     null_count = df_long.select(pl.col("weight").null_count()).item()
@@ -92,9 +97,11 @@ def test_long_format_polars_signals(price_data, resample):
         resample=resample
     )
 
-    # Compare Long vs Wide
-    df_cmp = wide_report.creturn.join(
-        long_result.rename({"creturn": "creturn_long"}),
+    # Compare Long vs Wide (ensure date types match)
+    wide_creturn = wide_report.creturn.with_columns(pl.col("date").cast(pl.Date))
+    long_creturn = long_result.rename({"creturn": "creturn_long"}).with_columns(pl.col("date").cast(pl.Date))
+    df_cmp = wide_creturn.join(
+        long_creturn,
         on="date",
         how="inner"
     )

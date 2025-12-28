@@ -19,6 +19,8 @@ rayon = "1.10"
 serde = { version = "1", features = ["derive"] }
 # Arrow for zero-copy data access in btcore
 arrow = { version = "54", default-features = false, features = ["ffi"] }
+# polars-arrow for zero-copy from Polars
+polars-arrow = "0.52"
 
 # Polars (only for extension)
 polars = { version = "0.52", default-features = false, features = ["pivot", "rows", "partition_by", "dtype-date", "dtype-datetime", "dtype-struct", "strings"] }

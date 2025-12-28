@@ -16,6 +16,7 @@ crate-type = ["cdylib"]
 btcore = { path = "../btcore" }
 polars.workspace = true
 polars-ops.workspace = true
+polars-arrow.workspace = true
 pyo3.workspace = true
 pyo3-polars.workspace = true
 chrono.workspace = true

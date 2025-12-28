@@ -27,7 +27,7 @@ pub use long::{backtest_long, LongFormatInput};
 
 // Re-export public API from long_arrow module
 pub use long_arrow::{
-    backtest_long_arrow, backtest_long_with_accessor,
+    backtest_long_arrow, backtest_long_polars_arrow, backtest_long_with_accessor,
     LongFormatArrowInput, ResampleFreq, StringPortfolio, StringPosition,
 };
 

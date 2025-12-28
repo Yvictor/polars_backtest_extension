@@ -14,6 +14,7 @@
 use std::collections::HashMap;
 
 use arrow::array::{Array, Float64Array, StringArray};
+use polars_arrow::array::{PrimitiveArray, StaticArray, Utf8Array, Utf8ViewArray};
 
 use crate::config::BacktestConfig;
 use crate::tracker::BacktestResult;
@@ -172,6 +173,142 @@ where
             // STEP 4: Check rebalance
             let should_rebalance = match resample {
                 ResampleFreq::Monthly => is_month_end(prev_date, date),
+                ResampleFreq::Weekly => true,
+                ResampleFreq::Daily => true,
+            };
+
+            if should_rebalance && !today_weights.is_empty() {
+                let normalized = normalize_weights(
+                    &today_weights,
+                    &stopped_stocks,
+                    config.position_limit,
+                );
+                if !normalized.is_empty() {
+                    pending_weights = Some(normalized);
+                }
+            }
+
+            // STEP 5: Record creturn
+            creturn.push(portfolio.balance());
+
+            today_prices.clear();
+            today_weights.clear();
+        }
+
+        current_date = Some(date);
+        if price > 0.0 && !price.is_nan() {
+            today_prices.insert(symbol, price);
+        }
+        if !weight.is_nan() && weight.abs() > 1e-10 {
+            today_weights.insert(symbol, weight);
+        }
+    }
+
+    // Final day
+    if current_date.is_some() && !today_prices.is_empty() {
+        update_positions(&mut portfolio, &today_prices);
+
+        execute_pending_stops(
+            &mut portfolio,
+            &mut pending_stop_exits,
+            &mut stopped_stocks,
+            config,
+        );
+
+        if let Some(target_weights) = pending_weights.take() {
+            execute_rebalance(
+                &mut portfolio,
+                &target_weights,
+                &today_prices,
+                &stopped_stocks,
+                config,
+            );
+        }
+
+        creturn.push(portfolio.balance());
+    }
+
+    BacktestResult {
+        creturn,
+        trades: vec![],
+    }
+}
+
+/// Run backtest with polars-arrow arrays using Date (i32) and Utf8ViewArray
+///
+/// This accepts polars-arrow arrays directly from Polars DataFrames.
+/// No data copying or conversion required.
+///
+/// # Arguments
+/// * `dates` - PrimitiveArray<i32> of dates (days since epoch, Date32 format)
+/// * `symbols` - Utf8ViewArray of symbol strings
+/// * `prices` - PrimitiveArray<f64> of close prices
+/// * `weights` - PrimitiveArray<f64> of target weights (None = no signal)
+/// * `resample` - Rebalancing frequency
+/// * `config` - Backtest configuration
+pub fn backtest_long_polars_arrow(
+    dates: &PrimitiveArray<i32>,
+    symbols: &Utf8ViewArray,
+    prices: &PrimitiveArray<f64>,
+    weights: &PrimitiveArray<f64>,
+    resample: ResampleFreq,
+    config: &BacktestConfig,
+) -> BacktestResult {
+    let n_rows = dates.len();
+    if n_rows == 0 {
+        return BacktestResult {
+            creturn: vec![],
+            trades: vec![],
+        };
+    }
+
+    let mut portfolio = StringPortfolio::new();
+    let mut creturn: Vec<f64> = Vec::new();
+    let mut stopped_stocks: HashMap<String, bool> = HashMap::new();
+    let mut pending_weights: Option<HashMap<String, f64>> = None;
+    let mut pending_stop_exits: Vec<String> = Vec::new();
+    let mut current_date: Option<i32> = None;
+    let mut today_prices: HashMap<&str, f64> = HashMap::new();
+    let mut today_weights: HashMap<&str, f64> = HashMap::new();
+
+    for i in 0..n_rows {
+        // Zero-copy access to polars-arrow arrays
+        let date = dates.get(i).unwrap_or(0);
+        let symbol = symbols.value(i);
+        let price = prices.get(i).unwrap_or(f64::NAN);
+        let weight = weights.get(i).unwrap_or(f64::NAN);
+
+        let date_changed = current_date.map_or(true, |d| d != date);
+
+        if date_changed && current_date.is_some() {
+            let prev_date = current_date.unwrap();
+
+            // STEP 1: Update positions
+            update_positions(&mut portfolio, &today_prices);
+
+            // STEP 2: Execute pending stops
+            execute_pending_stops(
+                &mut portfolio,
+                &mut pending_stop_exits,
+                &mut stopped_stocks,
+                config,
+            );
+
+            // STEP 3: Execute pending rebalance
+            if let Some(target_weights) = pending_weights.take() {
+                execute_rebalance(
+                    &mut portfolio,
+                    &target_weights,
+                    &today_prices,
+                    &stopped_stocks,
+                    config,
+                );
+                stopped_stocks.clear();
+            }
+
+            // STEP 4: Check rebalance
+            let should_rebalance = match resample {
+                ResampleFreq::Monthly => is_month_end_i32(prev_date, date),
                 ResampleFreq::Weekly => true,
                 ResampleFreq::Daily => true,
             };
@@ -405,6 +542,33 @@ pub fn backtest_long_arrow(
 /// Check if prev_date is a month-end (next date is in a different month)
 fn is_month_end(prev_date: &str, next_date: &str) -> bool {
     prev_date.get(..7) != next_date.get(..7)
+}
+
+/// Check if prev_date is a month-end using i32 dates (days since 1970-01-01)
+///
+/// Returns true if prev_date and next_date are in different months
+fn is_month_end_i32(prev_days: i32, next_days: i32) -> bool {
+    // Convert days since epoch to (year, month)
+    let prev_ym = days_to_year_month(prev_days);
+    let next_ym = days_to_year_month(next_days);
+    prev_ym != next_ym
+}
+
+/// Convert days since 1970-01-01 to (year, month)
+#[inline]
+fn days_to_year_month(days: i32) -> (i32, u32) {
+    // Algorithm from Howard Hinnant's date library
+    // https://howardhinnant.github.io/date_algorithms.html
+    let z = days + 719468; // shift epoch from 1970-01-01 to 0000-03-01
+    let era = if z >= 0 { z / 146097 } else { (z - 146096) / 146097 };
+    let doe = (z - era * 146097) as u32; // day of era [0, 146096]
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365; // year of era [0, 399]
+    let y = yoe as i32 + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100); // day of year [0, 365]
+    let mp = (5 * doy + 2) / 153; // month offset from March [0, 11]
+    let m = if mp < 10 { mp + 3 } else { mp - 9 }; // actual month [1, 12]
+    let year = if m <= 2 { y + 1 } else { y };
+    (year, m)
 }
 
 /// Update positions with daily returns
