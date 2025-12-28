@@ -14,7 +14,7 @@
 use std::collections::HashMap;
 
 use arrow::array::{Array, Float64Array, StringArray};
-use polars_arrow::array::{PrimitiveArray, StaticArray, Utf8Array, Utf8ViewArray};
+use polars_arrow::array::{PrimitiveArray, StaticArray, Utf8ViewArray};
 
 use crate::config::BacktestConfig;
 use crate::tracker::BacktestResult;
@@ -641,11 +641,16 @@ fn execute_rebalance(
 
     let ratio = balance / total_target_weight.max(1.0);
 
-    // Store old positions
+    // Store old positions (cost basis and market value)
     let old_positions: HashMap<String, f64> = portfolio
         .positions
         .iter()
         .map(|(k, v)| (k.clone(), v.value))
+        .collect();
+    let old_market_values: HashMap<String, f64> = portfolio
+        .positions
+        .iter()
+        .map(|(k, v)| (k.clone(), v.last_market_value))
         .collect();
 
     // Clear and rebuild
@@ -653,29 +658,81 @@ fn execute_rebalance(
     let mut cash = portfolio.cash;
 
     for (sym, &target_weight) in target_weights {
-        if target_weight.abs() < 1e-10 {
-            // Exit position
-            if let Some(&old_value) = old_positions.get(sym) {
-                if old_value.abs() > 1e-10 {
-                    let sell_fee = old_value.abs() * (config.fee_ratio + config.tax_ratio);
-                    cash += old_value - sell_fee;
+        // Skip stopped stocks first
+        if stopped_stocks.get(sym).copied().unwrap_or(false) {
+            continue;
+        }
+
+        // Get price and check validity
+        let price_opt = today_prices.get(sym.as_str()).copied();
+        let price_valid = price_opt.map_or(false, |p| p > 0.0 && !p.is_nan());
+
+        // Target position value (scaled by ratio)
+        let target_value = target_weight * ratio;
+        let current_value = old_positions.get(sym).copied().unwrap_or(0.0);
+
+        // Handle NaN price case (match Finlab behavior: enter even with NaN price)
+        if !price_valid {
+            // If target is 0 and we have an old position, sell it using old market value
+            if target_weight.abs() < 1e-10 {
+                if let Some(&old_mv) = old_market_values.get(sym) {
+                    if old_mv.abs() > 1e-10 {
+                        let sell_fee = old_mv.abs() * (config.fee_ratio + config.tax_ratio);
+                        cash += old_mv - sell_fee;
+                    }
+                }
+                continue;
+            }
+
+            // Finlab behavior: Enter/modify position even with NaN price
+            if target_value.abs() > 1e-10 {
+                let amount = target_value - current_value;
+                let is_buy = amount > 0.0;
+                let is_entry =
+                    (target_value >= 0.0 && amount > 0.0) || (target_value <= 0.0 && amount < 0.0);
+                let cost = if is_entry {
+                    amount.abs() * config.fee_ratio
+                } else {
+                    amount.abs() * (config.fee_ratio + config.tax_ratio)
+                };
+
+                let new_value = if is_buy {
+                    cash -= amount;
+                    current_value + amount - cost
+                } else {
+                    let sell_amount = amount.abs();
+                    cash += sell_amount - cost;
+                    current_value - sell_amount
+                };
+
+                if new_value.abs() > 1e-10 {
+                    portfolio.positions.insert(
+                        sym.clone(),
+                        StringPosition {
+                            value: new_value,
+                            entry_price: 0.0, // Signal that price was NaN at entry
+                            max_price: 0.0,
+                            last_market_value: new_value, // Use position value as market value
+                            cr: 1.0,
+                            maxcr: 1.0,
+                            previous_price: 0.0,
+                        },
+                    );
                 }
             }
             continue;
         }
 
-        // Skip stopped stocks
-        if stopped_stocks.get(sym).copied().unwrap_or(false) {
+        // Valid price case: exit position if target is 0
+        if target_weight.abs() < 1e-10 {
+            if current_value.abs() > 1e-10 {
+                let sell_fee = current_value.abs() * (config.fee_ratio + config.tax_ratio);
+                cash += current_value - sell_fee;
+            }
             continue;
         }
 
-        let price = match today_prices.get(sym.as_str()) {
-            Some(&p) if p > 0.0 && !p.is_nan() => p,
-            _ => continue,
-        };
-
-        let target_value = target_weight * ratio;
-        let current_value = old_positions.get(sym).copied().unwrap_or(0.0);
+        let price = price_opt.unwrap();
         let amount = target_value - current_value;
 
         let is_buy = amount > 0.0;
