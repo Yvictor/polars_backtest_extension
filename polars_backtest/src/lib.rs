@@ -626,42 +626,40 @@ fn backtest(
 
     eprintln!("[PROFILE] Backtest (btcore arrow): {:?}", step_start.elapsed());
 
-    // Get unique dates for creturn DataFrame
+    // Get unique dates efficiently - data is already sorted, use unique_stable()
+    // This avoids the expensive sort after unique
     let unique_dates = df.column(date)
         .map_err(|e| PyValueError::new_err(format!("Failed to get date column: {}", e)))?
-        .unique()
-        .map_err(|e| PyValueError::new_err(format!("Failed to get unique dates: {}", e)))?
-        .sort(Default::default())
-        .map_err(|e| PyValueError::new_err(format!("Failed to sort dates: {}", e)))?;
+        .unique_stable()
+        .map_err(|e| PyValueError::new_err(format!("Failed to get unique dates: {}", e)))?;
 
     // Find first index where creturn != 1.0 (first actual return change)
-    // This correctly handles resample: with monthly resample, signal may exist before
-    // the rebalance date, but creturn only changes after rebalance.
-    // We go back one day to include the signal/entry day (where creturn is still 1.0)
+    // Go back one day to include the signal/entry day (where creturn is still 1.0)
     let first_change_idx = result.creturn.iter()
         .position(|&v| (v - 1.0).abs() > 1e-10)
         .unwrap_or(0);
-
-    // Start one day before first change (the signal day), but not less than 0
     let first_active_idx = if first_change_idx > 0 { first_change_idx - 1 } else { 0 };
+    let len = result.creturn.len() - first_active_idx;
 
-    // Slice creturn and dates from first active index
-    let sliced_creturn: Vec<f64> = result.creturn[first_active_idx..].to_vec();
-    let sliced_dates = unique_dates.slice(first_active_idx as i64, sliced_creturn.len());
+    // Slice dates using Polars slice (zero-copy for contiguous data)
+    let sliced_dates = unique_dates.slice(first_active_idx as i64, len);
 
-    // Normalize creturn to start at 1.0 (divide by first value)
-    let normalized_creturn: Vec<f64> = if !sliced_creturn.is_empty() && sliced_creturn[0] != 0.0 {
-        let normalizer = sliced_creturn[0];
-        sliced_creturn.iter().map(|&v| v / normalizer).collect()
+    // Create creturn Series directly from slice and normalize using Polars ops
+    let creturn_slice = &result.creturn[first_active_idx..];
+    let first_value = creturn_slice.first().copied().unwrap_or(1.0);
+
+    let creturn_col = if first_value != 0.0 && (first_value - 1.0).abs() > 1e-10 {
+        // Use Polars Series division for vectorized normalization
+        let raw_series = Series::new("creturn".into(), creturn_slice);
+        (raw_series / first_value).into_column()
     } else {
-        sliced_creturn
+        Column::new("creturn".into(), creturn_slice.to_vec())
     };
 
-    // Build creturn DataFrame with date and creturn columns
-    let creturn_series = Column::new("creturn".into(), normalized_creturn);
+    // Build creturn DataFrame
     let creturn_df = DataFrame::new(vec![
         sliced_dates.into_column(),
-        creturn_series,
+        creturn_col,
     ]).map_err(|e| PyValueError::new_err(format!("Failed to create creturn DataFrame: {}", e)))?;
 
     eprintln!("[PROFILE] TOTAL: {:?}", total_start.elapsed());
@@ -1128,43 +1126,37 @@ fn backtest_with_report(
     let trades_df = trades_to_dataframe(&result.trades)
         .map_err(|e| PyValueError::new_err(format!("Failed to create trades DataFrame: {}", e)))?;
 
-    // Get unique dates for creturn DataFrame
-    // The dates are already sorted (either by input or by our sort)
+    // Get unique dates efficiently - data is already sorted, use unique_stable()
     let unique_dates = df.column(date)
         .map_err(|e| PyValueError::new_err(format!("Failed to get date column: {}", e)))?
-        .unique()
-        .map_err(|e| PyValueError::new_err(format!("Failed to get unique dates: {}", e)))?
-        .sort(Default::default())
-        .map_err(|e| PyValueError::new_err(format!("Failed to sort dates: {}", e)))?;
+        .unique_stable()
+        .map_err(|e| PyValueError::new_err(format!("Failed to get unique dates: {}", e)))?;
 
-    // Find first index where creturn != 1.0 (first actual return change)
-    // This correctly handles resample: with monthly resample, signal may exist before
-    // the rebalance date, but creturn only changes after rebalance.
-    // We go back one day to include the signal/entry day (where creturn is still 1.0)
+    // Find first index where creturn != 1.0, go back one day for signal day
     let first_change_idx = result.creturn.iter()
         .position(|&v| (v - 1.0).abs() > 1e-10)
         .unwrap_or(0);
-
-    // Start one day before first change (the signal day), but not less than 0
     let first_active_idx = if first_change_idx > 0 { first_change_idx - 1 } else { 0 };
+    let len = result.creturn.len() - first_active_idx;
 
-    // Slice creturn and dates from first active index
-    let sliced_creturn: Vec<f64> = result.creturn[first_active_idx..].to_vec();
-    let sliced_dates = unique_dates.slice(first_active_idx as i64, sliced_creturn.len());
+    // Slice dates using Polars slice (zero-copy)
+    let sliced_dates = unique_dates.slice(first_active_idx as i64, len);
 
-    // Normalize creturn to start at 1.0 (divide by first value)
-    let normalized_creturn: Vec<f64> = if !sliced_creturn.is_empty() && sliced_creturn[0] != 0.0 {
-        let normalizer = sliced_creturn[0];
-        sliced_creturn.iter().map(|&v| v / normalizer).collect()
+    // Create creturn Series and normalize using Polars ops
+    let creturn_slice = &result.creturn[first_active_idx..];
+    let first_value = creturn_slice.first().copied().unwrap_or(1.0);
+
+    let creturn_col = if first_value != 0.0 && (first_value - 1.0).abs() > 1e-10 {
+        let raw_series = Series::new("creturn".into(), creturn_slice);
+        (raw_series / first_value).into_column()
     } else {
-        sliced_creturn
+        Column::new("creturn".into(), creturn_slice.to_vec())
     };
 
-    // Build creturn DataFrame with date and creturn columns
-    let creturn_series = Column::new("creturn".into(), normalized_creturn);
+    // Build creturn DataFrame
     let creturn_df = DataFrame::new(vec![
         sliced_dates.into_column(),
-        creturn_series,
+        creturn_col,
     ]).map_err(|e| PyValueError::new_err(format!("Failed to create creturn DataFrame: {}", e)))?;
 
     eprintln!("[PROFILE] backtest_with_report: {} rows, {} trades", n_rows, result.trades.len());
