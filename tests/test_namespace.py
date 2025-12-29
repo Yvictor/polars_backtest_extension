@@ -70,7 +70,7 @@ def test_namespace_exists(sample_data):
 
 def test_namespace_basic(sample_data):
     """Test basic backtest via namespace."""
-    result = sample_data.bt.backtest(price="close", weight="weight", resample="D")
+    result = sample_data.bt.backtest(trade_at_price="close", position="weight", resample="D")
 
     assert isinstance(result, pl.DataFrame)
     assert "date" in result.columns
@@ -80,11 +80,10 @@ def test_namespace_basic(sample_data):
 
 def test_namespace_with_report(sample_data):
     """Test backtest_with_report via namespace."""
-    report = sample_data.bt.backtest_with_report(price="close", weight="weight")
+    report = sample_data.bt.backtest_with_report(trade_at_price="close", position="weight")
 
     assert hasattr(report, "creturn")
     assert hasattr(report, "trades")
-    assert hasattr(report, "position")
 
 
 # =============================================================================
@@ -93,7 +92,7 @@ def test_namespace_with_report(sample_data):
 
 def test_function_basic(sample_data):
     """Test basic backtest via standalone function."""
-    result = pl_bt.backtest(sample_data, price="close", weight="weight", resample="D")
+    result = pl_bt.backtest(sample_data, trade_at_price="close", position="weight", resample="D")
 
     assert isinstance(result, pl.DataFrame)
     assert "date" in result.columns
@@ -103,17 +102,16 @@ def test_function_basic(sample_data):
 
 def test_function_with_report(sample_data):
     """Test backtest_with_report via standalone function."""
-    report = pl_bt.backtest_with_report(sample_data, price="close", weight="weight")
+    report = pl_bt.backtest_with_report(sample_data, trade_at_price="close", position="weight")
 
     assert hasattr(report, "creturn")
     assert hasattr(report, "trades")
-    assert hasattr(report, "position")
 
 
 def test_function_equals_namespace(sample_data):
     """Verify standalone function and namespace produce same results."""
-    result_ns = sample_data.bt.backtest(price="close", weight="weight", resample="D")
-    result_fn = pl_bt.backtest(sample_data, price="close", weight="weight", resample="D")
+    result_ns = sample_data.bt.backtest(trade_at_price="close", position="weight", resample="D")
+    result_fn = pl_bt.backtest(sample_data, trade_at_price="close", position="weight", resample="D")
 
     assert result_ns["creturn"].to_list() == result_fn["creturn"].to_list()
 
@@ -125,11 +123,11 @@ def test_function_equals_namespace(sample_data):
 def test_with_fees(sample_data):
     """Test backtest with transaction fees."""
     result_no_fee = pl_bt.backtest(
-        sample_data, price="close", weight="weight",
+        sample_data, trade_at_price="close", position="weight",
         fee_ratio=0.0, tax_ratio=0.0,
     )
     result_with_fee = pl_bt.backtest(
-        sample_data, price="close", weight="weight",
+        sample_data, trade_at_price="close", position="weight",
         fee_ratio=0.001425, tax_ratio=0.003,
     )
 
@@ -138,7 +136,7 @@ def test_with_fees(sample_data):
 
 def test_with_stop_loss(sample_data):
     """Test backtest with stop loss."""
-    result = pl_bt.backtest(sample_data, price="close", weight="weight", stop_loss=0.05)
+    result = pl_bt.backtest(sample_data, trade_at_price="close", position="weight", stop_loss=0.05)
 
     assert isinstance(result, pl.DataFrame)
     assert len(result) == 5
@@ -147,7 +145,7 @@ def test_with_stop_loss(sample_data):
 def test_missing_columns(sample_data):
     """Test that missing columns raise error."""
     with pytest.raises(ValueError, match="Missing required columns"):
-        pl_bt.backtest(sample_data, price="nonexistent", weight="weight")
+        pl_bt.backtest(sample_data, trade_at_price="nonexistent", position="weight")
 
 
 def test_bool_signals():
@@ -159,7 +157,7 @@ def test_bool_signals():
         "signal": [True, True, True, False],
     })
 
-    result = pl_bt.backtest(df, price="close", weight="signal")
+    result = pl_bt.backtest(df, trade_at_price="close", position="signal")
     assert isinstance(result, pl.DataFrame)
     assert "creturn" in result.columns
 
@@ -170,7 +168,7 @@ def test_bool_signals():
 
 def test_monthly_resample(monthly_data):
     """Test monthly rebalancing."""
-    result = pl_bt.backtest(monthly_data, price="close", weight="weight", resample="M")
+    result = pl_bt.backtest(monthly_data, trade_at_price="close", position="weight", resample="M")
 
     assert isinstance(result, pl.DataFrame)
     assert "creturn" in result.columns
@@ -180,7 +178,7 @@ def test_monthly_resample(monthly_data):
 
 def test_weekly_resample(monthly_data):
     """Test weekly rebalancing."""
-    result = pl_bt.backtest(monthly_data, price="close", weight="weight", resample="W")
+    result = pl_bt.backtest(monthly_data, trade_at_price="close", position="weight", resample="W")
 
     assert isinstance(result, pl.DataFrame)
 
@@ -198,7 +196,7 @@ def test_single_stock():
         "weight": [1.0, 1.0, 1.0],
     })
 
-    result = pl_bt.backtest(df, price="close", weight="weight")
+    result = pl_bt.backtest(df, trade_at_price="close", position="weight")
     assert len(result) == 3
 
 
@@ -211,7 +209,7 @@ def test_single_date():
         "weight": [0.5, 0.5],
     })
 
-    result = pl_bt.backtest(df, price="close", weight="weight")
+    result = pl_bt.backtest(df, trade_at_price="close", position="weight")
     assert len(result) == 1
 
 
@@ -224,7 +222,7 @@ def test_zero_weights():
         "weight": [0.0, 0.0, 0.0, 0.0],
     })
 
-    result = pl_bt.backtest(df, price="close", weight="weight")
+    result = pl_bt.backtest(df, trade_at_price="close", position="weight")
     assert all(r == pytest.approx(1.0) for r in result["creturn"].to_list())
 
 
@@ -237,7 +235,7 @@ def test_negative_weights_short():
         "weight": [-0.5, -0.5, -0.5, -0.5],
     })
 
-    result = pl_bt.backtest(df, price="close", weight="weight")
+    result = pl_bt.backtest(df, trade_at_price="close", position="weight")
     assert isinstance(result, pl.DataFrame)
 
 

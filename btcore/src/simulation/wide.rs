@@ -14,7 +14,7 @@ use crate::config::BacktestConfig;
 use crate::portfolio::PortfolioState;
 use crate::position::Position;
 use crate::stops::{detect_stops, detect_stops_finlab, detect_touched_exit};
-use crate::tracker::{WideBacktestResult, LegacyNoopTracker as NoopTracker, LegacyRealTracker as RealTracker, LegacyTradeTracker as TradeTracker};
+use crate::tracker::{WideBacktestResult, NoopIndexTracker, IndexTracker, TradeTracker};
 use crate::weights::{normalize_weights_finlab, IntoWeights};
 
 // ============================================================================
@@ -33,7 +33,7 @@ struct OhlcPrices<'a> {
 /// This is the unified internal implementation that both `run_backtest`
 /// and `run_backtest_with_trades` use. The `TradeTracker` trait allows
 /// for zero-cost abstraction when trade tracking is not needed.
-fn simulate_backtest<T: TradeTracker>(
+fn simulate_backtest<T: TradeTracker<Key = usize, Date = usize>>(
     close_prices: &[Vec<f64>],
     trade_prices: &[Vec<f64>],
     weights: &[Vec<f64>],
@@ -137,7 +137,7 @@ fn simulate_backtest<T: TradeTracker>(
                                     1.0
                                 };
                                 tracker.close_trade(
-                                    touched.stock_id,
+                                    &touched.stock_id,
                                     t,
                                     Some(t), // exit_sig_index = t (same day for touched_exit)
                                     exit_price,
@@ -208,7 +208,7 @@ fn simulate_backtest<T: TradeTracker>(
                                 1.0
                             };
                             tracker.close_trade(
-                                stock_id,
+                                &stock_id,
                                 t,
                                 None,
                                 exit_price,
@@ -269,7 +269,7 @@ fn simulate_backtest<T: TradeTracker>(
                             1.0
                         };
                         tracker.close_trade(
-                            stock_id,
+                            &stock_id,
                             t,
                             Some(signal_index),
                             exit_price,
@@ -333,7 +333,7 @@ fn simulate_backtest<T: TradeTracker>(
                                 1.0
                             };
                             tracker.close_trade(
-                                stock_id,
+                                &stock_id,
                                 t,
                                 Some(signal_index),
                                 exit_price,
@@ -356,7 +356,7 @@ fn simulate_backtest<T: TradeTracker>(
                     for (stock_id, &target_weight) in target_weights.iter().enumerate() {
                         if target_weight != 0.0
                             && portfolio.positions.contains_key(&stock_id)
-                            && !tracker.has_open_trade(stock_id)
+                            && !tracker.has_open_trade(&stock_id)
                         {
                             let entry_price = if stock_id < trade_prices[t].len() {
                                 trade_prices[t][stock_id]
@@ -391,7 +391,7 @@ fn simulate_backtest<T: TradeTracker>(
                                 1.0
                             };
                             tracker.close_trade(
-                                stock_id,
+                                &stock_id,
                                 t,
                                 None,
                                 exit_price,
@@ -487,8 +487,8 @@ pub fn run_backtest<S: IntoWeights>(
         .map(|s| s.into_weights(&[], config.position_limit))
         .collect();
 
-    // Use NoopTracker for zero-overhead simulation
-    let mut tracker = NoopTracker::new();
+    // Use NoopIndexTracker for zero-overhead simulation
+    let mut tracker = NoopIndexTracker::new();
     simulate_backtest(
         prices,
         prices,
@@ -1373,8 +1373,8 @@ pub fn run_backtest_with_trades<S: IntoWeights>(
         _ => None,
     };
 
-    // Use RealTracker for full trade tracking
-    let mut tracker = RealTracker::new();
+    // Use IndexTracker for full trade tracking
+    let mut tracker = IndexTracker::new();
     let creturn = simulate_backtest(
         prices.close,
         prices.trade,
@@ -1386,17 +1386,7 @@ pub fn run_backtest_with_trades<S: IntoWeights>(
     );
 
     // Finalize trades (close any remaining open positions)
-    let last_trade_prices = if !prices.trade.is_empty() {
-        &prices.trade[prices.trade.len() - 1]
-    } else {
-        &vec![]
-    };
-    let trades = tracker.finalize(
-        prices.close.len().saturating_sub(1),
-        last_trade_prices,
-        config.fee_ratio,
-        config.tax_ratio,
-    );
+    let trades = tracker.finalize(config.fee_ratio, config.tax_ratio);
 
     WideBacktestResult { creturn, trades }
 }
