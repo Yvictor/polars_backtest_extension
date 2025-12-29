@@ -118,6 +118,21 @@ impl Position {
         self.maxcr = 1.0;
         self.previous_price = price;
     }
+
+    /// Create a new position preserving stop tracking from old position
+    /// Used when retain_cost_when_rebalance=True and continuing same direction
+    pub fn new_with_preserved_tracking(new_value: f64, current_price: f64, old_pos: &Position) -> Self {
+        Self {
+            value: new_value,
+            entry_price: current_price,  // Entry price uses current price
+            stop_entry_price: old_pos.stop_entry_price,  // Preserve stop tracking
+            max_price: old_pos.max_price,
+            last_market_value: new_value,
+            cr: old_pos.cr,
+            maxcr: old_pos.maxcr,
+            previous_price: old_pos.previous_price,
+        }
+    }
 }
 
 impl Default for Position {

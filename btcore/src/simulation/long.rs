@@ -343,9 +343,9 @@ where
             );
 
             // STEP 2.5: Detect new stops (schedule for tomorrow's execution)
-            if config.stop_loss < 1.0
-                || config.take_profit < f64::INFINITY
-                || config.trail_stop < f64::INFINITY
+            // Note: Always detect stops even with default config (stop_loss=1.0)
+            // because for SHORT positions, stop_loss=1.0 means cr >= 2.0 triggers stop
+            // (100% loss = price doubled for shorts)
             {
                 let new_stops = detect_stops_string(&portfolio, &today_prices, config);
                 pending_stop_exits.extend(new_stops);
@@ -563,9 +563,9 @@ pub fn backtest_long_arrow(
             );
 
             // STEP 2.5: Detect new stops (schedule for tomorrow's execution)
-            if config.stop_loss < 1.0
-                || config.take_profit < f64::INFINITY
-                || config.trail_stop < f64::INFINITY
+            // Note: Always detect stops even with default config (stop_loss=1.0)
+            // because for SHORT positions, stop_loss=1.0 means cr >= 2.0 triggers stop
+            // (100% loss = price doubled for shorts)
             {
                 let new_stops = detect_stops_string(&portfolio, &today_prices, config);
                 pending_stop_exits.extend(new_stops);
@@ -964,7 +964,7 @@ fn execute_rebalance(
 
     let ratio = balance / total_target_weight.max(1.0);
 
-    // Store old positions (cost basis and market value)
+    // Store old positions (cost basis, market value, and full Position for retain_cost)
     let old_positions: HashMap<String, f64> = portfolio
         .positions
         .iter()
@@ -974,6 +974,12 @@ fn execute_rebalance(
         .positions
         .iter()
         .map(|(k, v)| (k.clone(), v.last_market_value))
+        .collect();
+    // Store full Position for retain_cost_when_rebalance
+    let old_full_positions: HashMap<String, Position> = portfolio
+        .positions
+        .iter()
+        .map(|(k, v)| (k.clone(), v.clone()))
         .collect();
 
     // Clear and rebuild
@@ -1066,10 +1072,23 @@ fn execute_rebalance(
         };
 
         if new_position_value.abs() > 1e-10 {
-            portfolio.positions.insert(
-                sym.clone(),
-                Position::new(new_position_value, price),
-            );
+            // Determine if this is a continuing same-direction position
+            let old_value = old_positions.get(sym).copied().unwrap_or(0.0);
+            let is_continuing = old_value.abs() > 1e-10 && old_value * target_weight > 0.0;
+
+            let new_pos = if config.retain_cost_when_rebalance && is_continuing {
+                // Preserve stop tracking for continuing same-direction positions
+                if let Some(old_pos) = old_full_positions.get(sym) {
+                    Position::new_with_preserved_tracking(new_position_value, price, old_pos)
+                } else {
+                    Position::new(new_position_value, price)
+                }
+            } else {
+                // New position or direction change or retain_cost=False: reset all
+                Position::new(new_position_value, price)
+            };
+
+            portfolio.positions.insert(sym.clone(), new_pos);
         }
     }
 
@@ -1225,7 +1244,7 @@ fn execute_rebalance_with_tracker<T: StringTradeTracker>(
 
     let ratio = balance / total_target_weight.max(1.0);
 
-    // Store old positions (cost basis and market value)
+    // Store old positions (cost basis, market value, and full Position for retain_cost)
     let old_positions: HashMap<String, f64> = portfolio
         .positions
         .iter()
@@ -1235,6 +1254,12 @@ fn execute_rebalance_with_tracker<T: StringTradeTracker>(
         .positions
         .iter()
         .map(|(k, v)| (k.clone(), v.last_market_value))
+        .collect();
+    // Store full Position for retain_cost_when_rebalance
+    let old_full_positions: HashMap<String, Position> = portfolio
+        .positions
+        .iter()
+        .map(|(k, v)| (k.clone(), v.clone()))
         .collect();
 
     // Clear and rebuild
@@ -1359,10 +1384,23 @@ fn execute_rebalance_with_tracker<T: StringTradeTracker>(
             if !had_position {
                 tracker.open_trade(sym, current_date, signal_date, price, target_weight);
             }
-            portfolio.positions.insert(
-                sym.clone(),
-                Position::new(new_position_value, price),
-            );
+
+            // Determine if this is a continuing same-direction position
+            let is_continuing = had_position && current_value * target_weight > 0.0;
+
+            let new_pos = if config.retain_cost_when_rebalance && is_continuing {
+                // Preserve stop tracking for continuing same-direction positions
+                if let Some(old_pos) = old_full_positions.get(sym) {
+                    Position::new_with_preserved_tracking(new_position_value, price, old_pos)
+                } else {
+                    Position::new(new_position_value, price)
+                }
+            } else {
+                // New position or direction change or retain_cost=False: reset all
+                Position::new(new_position_value, price)
+            };
+
+            portfolio.positions.insert(sym.clone(), new_pos);
         }
     }
 
@@ -1486,9 +1524,9 @@ pub fn backtest_with_trades_long_arrow(
             );
 
             // STEP 2.5: Detect new stops (schedule for tomorrow's execution)
-            if config.stop_loss < 1.0
-                || config.take_profit < f64::INFINITY
-                || config.trail_stop < f64::INFINITY
+            // Note: Always detect stops even with default config (stop_loss=1.0)
+            // because for SHORT positions, stop_loss=1.0 means cr >= 2.0 triggers stop
+            // (100% loss = price doubled for shorts)
             {
                 let new_stops = detect_stops_string(&portfolio, &today_prices, config);
                 pending_stop_exits.extend(new_stops);
