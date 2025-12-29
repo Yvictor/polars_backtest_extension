@@ -14,7 +14,7 @@ use crate::config::BacktestConfig;
 use crate::portfolio::PortfolioState;
 use crate::position::Position;
 use crate::stops::{detect_stops, detect_stops_finlab, detect_touched_exit};
-use crate::tracker::{BacktestResult, NoopTracker, RealTracker, TradeTracker};
+use crate::tracker::{BacktestResult, LegacyNoopTracker as NoopTracker, LegacyRealTracker as RealTracker, LegacyTradeTracker as TradeTracker};
 use crate::weights::{normalize_weights_finlab, IntoWeights};
 
 // ============================================================================

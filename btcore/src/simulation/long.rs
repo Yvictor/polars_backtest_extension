@@ -87,10 +87,13 @@ impl ResampleFreq {
     }
 }
 
-/// Run backtest with closure-based data access using i32 dates (days since epoch)
+/// Core backtest implementation with closure-based data access and generic tracker
 ///
-/// This allows the caller to provide data accessors without copying data.
+/// This is the unified core that all backtest functions use.
 /// Uses i32 dates for efficient month-end detection without string parsing.
+///
+/// # Type Parameters
+/// * `T` - TradeTracker implementation (NoopSymbolTracker for no tracking, SymbolTracker for trade tracking)
 ///
 /// # Arguments
 /// * `n_rows` - Total number of rows
@@ -100,7 +103,8 @@ impl ResampleFreq {
 /// * `get_weight` - Closure to get weight at index (NaN = no signal)
 /// * `resample` - Rebalancing frequency
 /// * `config` - Backtest configuration
-pub fn backtest_with_accessor<'a, FD, FS, FP, FW>(
+/// * `tracker` - Trade tracker (use NoopSymbolTracker::default() for no tracking)
+fn backtest_impl<'a, FD, FS, FP, FW, T>(
     n_rows: usize,
     get_date: FD,
     get_symbol: FS,
@@ -108,28 +112,28 @@ pub fn backtest_with_accessor<'a, FD, FS, FP, FW>(
     get_weight: FW,
     resample: ResampleFreq,
     config: &BacktestConfig,
-) -> BacktestResult
+    tracker: &mut T,
+) -> Vec<f64>
 where
     FD: Fn(usize) -> i32,
     FS: Fn(usize) -> &'a str,
     FP: Fn(usize) -> f64,
     FW: Fn(usize) -> f64,
+    T: TradeTracker<Key = String, Date = i32, Record = LongTradeRecord>,
 {
     if n_rows == 0 {
-        return BacktestResult {
-            creturn: vec![],
-            trades: vec![],
-        };
+        return vec![];
     }
 
     let mut portfolio = Portfolio::new();
     let mut creturn: Vec<f64> = Vec::new();
     let mut stopped_stocks: HashMap<String, bool> = HashMap::new();
     let mut pending_weights: Option<HashMap<String, f64>> = None;
+    let mut pending_signal_date: Option<i32> = None;
     let mut pending_stop_exits: Vec<String> = Vec::new();
     let mut active_weights: HashMap<String, f64> = HashMap::new();
     let mut has_first_signal = false;
-    let mut position_changed = false; // For PositionChange resample mode
+    let mut position_changed = false;
     let mut current_date: Option<i32> = None;
     let mut today_prices: HashMap<&str, f64> = HashMap::new();
     let mut today_weights: HashMap<&str, f64> = HashMap::new();
@@ -149,23 +153,17 @@ where
             update_positions(&mut portfolio, &today_prices);
 
             // STEP 2: Execute pending stops (from yesterday's detection)
-            {
-                let mut noop_tracker = NoopSymbolTracker::default();
-                execute_pending_stops_impl(
-                    &mut portfolio,
-                    &mut pending_stop_exits,
-                    &mut stopped_stocks,
-                    &today_prices,
-                    config,
-                    prev_date,
-                    &mut noop_tracker,
-                );
-            }
+            execute_pending_stops_impl(
+                &mut portfolio,
+                &mut pending_stop_exits,
+                &mut stopped_stocks,
+                &today_prices,
+                config,
+                prev_date,
+                tracker,
+            );
 
             // STEP 2.5: Detect new stops (schedule for tomorrow's execution)
-            // Note: Always detect stops even with default config (stop_loss=1.0)
-            // because for SHORT positions, stop_loss=1.0 means cr >= 2.0 triggers stop
-            // (100% loss = price doubled for shorts)
             {
                 let new_stops = detect_stops_string(&portfolio, &today_prices, config);
                 pending_stop_exits.extend(new_stops);
@@ -173,7 +171,7 @@ where
 
             // STEP 3: Execute pending rebalance
             if let Some(target_weights) = pending_weights.take() {
-                let mut noop_tracker = NoopSymbolTracker::default();
+                let sig_date = pending_signal_date.take().unwrap_or(prev_date);
                 execute_rebalance_impl(
                     &mut portfolio,
                     &target_weights,
@@ -181,17 +179,13 @@ where
                     &stopped_stocks,
                     config,
                     prev_date,
-                    prev_date, // signal_date not tracked
-                    &mut noop_tracker,
+                    sig_date,
+                    tracker,
                 );
                 stopped_stocks.clear();
             }
 
             // STEP 4: Update active weights based on today's signals
-            // Behavior varies by resample frequency to match Wide format (Finlab):
-            // - Daily: always update (empty signals = exit all)
-            // - Weekly: forward-fill within week, apply on week-end
-            // - Monthly: ONLY use signals from month-end day (no forward-fill)
             let normalized = normalize_weights(
                 &today_weights,
                 &stopped_stocks,
@@ -204,7 +198,6 @@ where
 
             match resample {
                 ResampleFreq::Daily => {
-                    // Daily: always update, empty signals means exit all
                     if !normalized.is_empty() {
                         has_first_signal = true;
                     }
@@ -213,40 +206,28 @@ where
                     }
                 }
                 ResampleFreq::Weekly => {
-                    // Weekly: ONLY use signals from week-end day
-                    // This matches Wide format which resamples position to week-ends
                     if is_week_end {
-                        // On week-end, use today's signals directly (could be empty)
                         let has_signals = !normalized.is_empty();
                         active_weights = normalized;
                         if has_signals {
                             has_first_signal = true;
                         }
                     }
-                    // On non-week-end days, ignore today_weights entirely
                 }
                 ResampleFreq::Monthly => {
-                    // Monthly: ONLY use signals from month-end day
-                    // This matches Wide format which resamples position to month-ends
                     if is_month_end {
-                        // On month-end, use today's signals directly (could be empty)
                         let has_signals = !normalized.is_empty();
                         active_weights = normalized;
                         if has_signals {
                             has_first_signal = true;
                         }
                     }
-                    // On non-month-end days, ignore today_weights entirely
                 }
                 ResampleFreq::PositionChange => {
-                    // PositionChange: only rebalance when weights differ from previous active_weights
-                    // This matches Finlab's resample=None behavior (diff().abs().sum() != 0)
                     if !normalized.is_empty() {
                         has_first_signal = true;
                     }
-                    // Compare BEFORE updating active_weights, save result for STEP 5
                     position_changed = weights_differ(&active_weights, &normalized);
-                    // Always update active_weights to today's normalized weights
                     active_weights = normalized;
                 }
             }
@@ -260,10 +241,9 @@ where
                     ResampleFreq::PositionChange => position_changed,
                 };
 
-                // Set pending weights for T+1 execution using active_weights
-                // For Daily: include empty to trigger exit
                 if should_rebalance {
                     pending_weights = Some(active_weights.clone());
+                    pending_signal_date = Some(prev_date);
                 }
             }
 
@@ -288,21 +268,18 @@ where
         if !today_prices.is_empty() {
             update_positions(&mut portfolio, &today_prices);
 
-            {
-                let mut noop_tracker = NoopSymbolTracker::default();
-                execute_pending_stops_impl(
-                    &mut portfolio,
-                    &mut pending_stop_exits,
-                    &mut stopped_stocks,
-                    &today_prices,
-                    config,
-                    last_date,
-                    &mut noop_tracker,
-                );
-            }
+            execute_pending_stops_impl(
+                &mut portfolio,
+                &mut pending_stop_exits,
+                &mut stopped_stocks,
+                &today_prices,
+                config,
+                last_date,
+                tracker,
+            );
 
             if let Some(target_weights) = pending_weights.take() {
-                let mut noop_tracker = NoopSymbolTracker::default();
+                let sig_date = pending_signal_date.take().unwrap_or(last_date);
                 execute_rebalance_impl(
                     &mut portfolio,
                     &target_weights,
@@ -310,8 +287,8 @@ where
                     &stopped_stocks,
                     config,
                     last_date,
-                    last_date, // signal_date not tracked
-                    &mut noop_tracker,
+                    sig_date,
+                    tracker,
                 );
             }
 
@@ -319,6 +296,45 @@ where
         }
     }
 
+    creturn
+}
+
+/// Run backtest with closure-based data access (public API, no trade tracking)
+///
+/// # Arguments
+/// * `n_rows` - Total number of rows
+/// * `get_date` - Closure to get date (days since epoch) at index
+/// * `get_symbol` - Closure to get symbol string at index
+/// * `get_price` - Closure to get price at index
+/// * `get_weight` - Closure to get weight at index (NaN = no signal)
+/// * `resample` - Rebalancing frequency
+/// * `config` - Backtest configuration
+pub fn backtest_with_accessor<'a, FD, FS, FP, FW>(
+    n_rows: usize,
+    get_date: FD,
+    get_symbol: FS,
+    get_price: FP,
+    get_weight: FW,
+    resample: ResampleFreq,
+    config: &BacktestConfig,
+) -> BacktestResult
+where
+    FD: Fn(usize) -> i32,
+    FS: Fn(usize) -> &'a str,
+    FP: Fn(usize) -> f64,
+    FW: Fn(usize) -> f64,
+{
+    let mut tracker = NoopSymbolTracker::default();
+    let creturn = backtest_impl(
+        n_rows,
+        get_date,
+        get_symbol,
+        get_price,
+        get_weight,
+        resample,
+        config,
+        &mut tracker,
+    );
     BacktestResult {
         creturn,
         trades: vec![],
@@ -326,6 +342,8 @@ where
 }
 
 /// Run backtest on Arrow arrays with zero-copy access
+///
+/// Delegates to `backtest_with_accessor` using Arrow array closures.
 ///
 /// # Arguments
 /// * `input` - Arrow arrays containing long format data (must be sorted by date)
@@ -339,240 +357,15 @@ pub fn backtest_long_arrow(
     resample: ResampleFreq,
     config: &BacktestConfig,
 ) -> BacktestResult {
-    let n_rows = input.dates.len();
-    if n_rows == 0 {
-        return BacktestResult {
-            creturn: vec![],
-            trades: vec![],
-        };
-    }
-
-    let mut portfolio = Portfolio::new();
-    let mut creturn: Vec<f64> = Vec::new();
-
-    // Track stopped stocks by symbol string
-    let mut stopped_stocks: HashMap<String, bool> = HashMap::new();
-
-    // Pending weights for T+1 execution
-    let mut pending_weights: Option<HashMap<String, f64>> = None;
-    let mut pending_signal_date: Option<i32> = None;
-    let mut pending_stop_exits: Vec<String> = Vec::new();
-
-    // Active weights (forward-filled) for Daily/Weekly rebalance
-    // These persist across days until new signals arrive
-    let mut active_weights: HashMap<String, f64> = HashMap::new();
-
-    // Flag to track if we've seen the first signal
-    // Only start rebalancing after this is true
-    let mut has_first_signal = false;
-    let mut position_changed = false; // For PositionChange resample mode
-
-    // Track current date (i32 days since epoch)
-    let mut current_date: Option<i32> = None;
-
-    // Today's prices and weights
-    let mut today_prices: HashMap<&str, f64> = HashMap::new();
-    let mut today_weights: HashMap<&str, f64> = HashMap::new();
-
-    // Process each row
-    for i in 0..n_rows {
-        let date = input.dates.value(i);
-        let symbol = input.symbols.value(i);
-        let price = input.prices.value(i);
-        let weight = input.weights.value(i);
-
-        // Check if we've moved to a new date
-        let date_changed = current_date.map_or(true, |d| d != date);
-
-        if date_changed && current_date.is_some() {
-            let prev_date = current_date.unwrap();
-
-            // STEP 1: Update existing positions with today's prices
-            update_positions(&mut portfolio, &today_prices);
-
-            // STEP 2: Execute pending stop exits (from yesterday's detection)
-            {
-                let mut noop_tracker = NoopSymbolTracker::default();
-                execute_pending_stops_impl(
-                    &mut portfolio,
-                    &mut pending_stop_exits,
-                    &mut stopped_stocks,
-                    &today_prices,
-                    config,
-                    prev_date,
-                    &mut noop_tracker,
-                );
-            }
-
-            // STEP 2.5: Detect new stops (schedule for tomorrow's execution)
-            // Note: Always detect stops even with default config (stop_loss=1.0)
-            // because for SHORT positions, stop_loss=1.0 means cr >= 2.0 triggers stop
-            // (100% loss = price doubled for shorts)
-            {
-                let new_stops = detect_stops_string(&portfolio, &today_prices, config);
-                pending_stop_exits.extend(new_stops);
-            }
-
-            // STEP 3: Execute pending rebalance (T+1 execution)
-            if let Some(target_weights) = pending_weights.take() {
-                let mut noop_tracker = NoopSymbolTracker::default();
-                execute_rebalance_impl(
-                    &mut portfolio,
-                    &target_weights,
-                    &today_prices,
-                    &stopped_stocks,
-                    config,
-                    prev_date,
-                    prev_date, // signal_date not tracked
-                    &mut noop_tracker,
-                );
-                stopped_stocks.clear();
-            }
-
-            // STEP 4: Update active weights based on today's signals
-            // Behavior varies by resample frequency to match Wide format (Finlab):
-            // - Daily: always update (empty signals = exit all)
-            // - Weekly: forward-fill within week, apply on week-end
-            // - Monthly: ONLY use signals from month-end day (no forward-fill)
-            let normalized = normalize_weights(
-                &today_weights,
-                &stopped_stocks,
-                config.position_limit,
-            );
-
-            // Check if prev_date is a rebalance boundary
-            let is_month_end = is_month_end_i32(prev_date, date);
-            let is_week_end = is_week_end_i32(prev_date, date);
-
-            match resample {
-                ResampleFreq::Daily => {
-                    // Daily: always update, empty signals means exit all
-                    if !normalized.is_empty() {
-                        has_first_signal = true;
-                    }
-                    if has_first_signal {
-                        active_weights = normalized;
-                    }
-                }
-                ResampleFreq::Weekly => {
-                    // Weekly: ONLY use signals from week-end day
-                    // This matches Wide format which resamples position to week-ends
-                    if is_week_end {
-                        // On week-end, use today's signals directly (could be empty)
-                        let has_signals = !normalized.is_empty();
-                        active_weights = normalized;
-                        if has_signals {
-                            has_first_signal = true;
-                        }
-                    }
-                    // On non-week-end days, ignore today_weights entirely
-                }
-                ResampleFreq::Monthly => {
-                    // Monthly: ONLY use signals from month-end day
-                    // This matches Wide format which resamples position to month-ends
-                    if is_month_end {
-                        // On month-end, use today's signals directly (could be empty)
-                        let has_signals = !normalized.is_empty();
-                        active_weights = normalized;
-                        if has_signals {
-                            has_first_signal = true;
-                        }
-                    }
-                    // On non-month-end days, ignore today_weights entirely
-                }
-                ResampleFreq::PositionChange => {
-                    // PositionChange: only rebalance when weights differ from active_weights
-                    if !normalized.is_empty() {
-                        has_first_signal = true;
-                    }
-                    // Compare BEFORE updating active_weights, save result for STEP 5
-                    position_changed = weights_differ(&active_weights, &normalized);
-                    // Always update active_weights to today's normalized weights
-                    active_weights = normalized;
-                }
-            }
-
-            // STEP 5: Check if prev_date is a rebalance day
-            // Only rebalance after we've seen the first signal
-            if has_first_signal {
-                let should_rebalance = match resample {
-                    ResampleFreq::Monthly => is_month_end,
-                    ResampleFreq::Weekly => is_week_end,
-                    ResampleFreq::Daily => true,
-                    ResampleFreq::PositionChange => position_changed,
-                };
-
-                // Set pending weights for T+1 execution
-                // For Daily: include empty to trigger exit
-                if should_rebalance {
-                    pending_weights = Some(active_weights.clone());
-                    pending_signal_date = Some(prev_date);
-                }
-            }
-
-            // STEP 6: Record cumulative return
-            creturn.push(portfolio.balance());
-
-            // Clear today's data for new day
-            today_prices.clear();
-            today_weights.clear();
-        }
-
-        // Accumulate today's data
-        current_date = Some(date);
-        if price > 0.0 && !price.is_nan() {
-            today_prices.insert(symbol, price);
-        }
-        // Handle null weights (from polars rolling operations) as 0.0
-        if !weight.is_nan() && weight.abs() > 1e-10 {
-            today_weights.insert(symbol, weight);
-        }
-    }
-
-    // Process final day
-    if let Some(date) = current_date {
-        if !today_prices.is_empty() {
-            // STEP 1: Update positions
-            update_positions(&mut portfolio, &today_prices);
-
-            // STEP 2: Execute pending stops
-            {
-                let mut noop_tracker = NoopSymbolTracker::default();
-                execute_pending_stops_impl(
-                    &mut portfolio,
-                    &mut pending_stop_exits,
-                    &mut stopped_stocks,
-                    &today_prices,
-                    config,
-                    date,
-                    &mut noop_tracker,
-                );
-            }
-
-            // STEP 3: Execute pending rebalance
-            if let Some(target_weights) = pending_weights.take() {
-                let mut noop_tracker = NoopSymbolTracker::default();
-                execute_rebalance_impl(
-                    &mut portfolio,
-                    &target_weights,
-                    &today_prices,
-                    &stopped_stocks,
-                    config,
-                    date,
-                    date, // signal_date not tracked
-                    &mut noop_tracker,
-                );
-            }
-
-            // STEP 4: Final balance
-            creturn.push(portfolio.balance());
-        }
-    }
-
-    BacktestResult {
-        creturn,
-        trades: vec![],
-    }
+    backtest_with_accessor(
+        input.dates.len(),
+        |i| input.dates.value(i),
+        |i| input.symbols.value(i),
+        |i| input.prices.value(i),
+        |i| input.weights.value(i),
+        resample,
+        config,
+    )
 }
 
 /// Run backtest on native Rust slices
@@ -1111,231 +904,24 @@ fn normalize_weights(
 
 /// Run backtest on Arrow arrays with trade tracking
 ///
+/// Delegates to `backtest_impl` with `SymbolTracker` for trade tracking.
 /// Same as `backtest_long_arrow` but returns trade records as well.
 pub fn backtest_with_trades_long_arrow(
     input: &LongFormatArrowInput,
     resample: ResampleFreq,
     config: &BacktestConfig,
 ) -> LongBacktestResult {
-    let n_rows = input.dates.len();
-    if n_rows == 0 {
-        return LongBacktestResult {
-            creturn: vec![],
-            trades: vec![],
-        };
-    }
-
-    let mut portfolio = Portfolio::new();
-    let mut creturn: Vec<f64> = Vec::new();
     let mut tracker = SymbolTracker::new();
-
-    // Track stopped stocks by symbol string
-    let mut stopped_stocks: HashMap<String, bool> = HashMap::new();
-
-    // Pending weights for T+1 execution
-    let mut pending_weights: Option<HashMap<String, f64>> = None;
-    let mut pending_signal_date: Option<i32> = None;
-    let mut pending_stop_exits: Vec<String> = Vec::new();
-
-    // Active weights (forward-filled) for Daily/Weekly rebalance
-    let mut active_weights: HashMap<String, f64> = HashMap::new();
-    let mut has_first_signal = false;
-    let mut position_changed = false; // For PositionChange resample mode
-
-    // Track current date (i32 days since epoch)
-    let mut current_date: Option<i32> = None;
-
-    // Today's prices and weights
-    let mut today_prices: HashMap<&str, f64> = HashMap::new();
-    let mut today_weights: HashMap<&str, f64> = HashMap::new();
-
-    // Process each row
-    for i in 0..n_rows {
-        let date = input.dates.value(i);
-        let symbol = input.symbols.value(i);
-        let price = input.prices.value(i);
-        let weight = input.weights.value(i);
-
-        // Check if we've moved to a new date
-        let date_changed = current_date.map_or(true, |d| d != date);
-
-        if date_changed && current_date.is_some() {
-            let prev_date = current_date.unwrap();
-
-            // STEP 1: Update existing positions with today's prices
-            update_positions(&mut portfolio, &today_prices);
-
-            // STEP 2: Execute pending stop exits (from yesterday's detection)
-            execute_pending_stops_impl(
-                &mut portfolio,
-                &mut pending_stop_exits,
-                &mut stopped_stocks,
-                &today_prices,
-                config,
-                prev_date,
-                &mut tracker,
-            );
-
-            // STEP 2.5: Detect new stops (schedule for tomorrow's execution)
-            // Note: Always detect stops even with default config (stop_loss=1.0)
-            // because for SHORT positions, stop_loss=1.0 means cr >= 2.0 triggers stop
-            // (100% loss = price doubled for shorts)
-            {
-                let new_stops = detect_stops_string(&portfolio, &today_prices, config);
-                pending_stop_exits.extend(new_stops);
-            }
-
-            // STEP 3: Execute pending rebalance (T+1 execution)
-            if let Some(target_weights) = pending_weights.take() {
-                let sig_date = pending_signal_date.take().unwrap_or(prev_date);
-                execute_rebalance_impl(
-                    &mut portfolio,
-                    &target_weights,
-                    &today_prices,
-                    &stopped_stocks,
-                    config,
-                    prev_date,
-                    sig_date,
-                    &mut tracker,
-                );
-                stopped_stocks.clear();
-            }
-
-            // STEP 4: Update active weights based on today's signals
-            // Behavior varies by resample frequency to match Wide format (Finlab):
-            // - Daily: always update (empty signals = exit all)
-            // - Weekly: forward-fill within week, apply on week-end
-            // - Monthly: ONLY use signals from month-end day (no forward-fill)
-            let normalized = normalize_weights(
-                &today_weights,
-                &stopped_stocks,
-                config.position_limit,
-            );
-
-            // Check if prev_date is a rebalance boundary
-            let is_month_end = is_month_end_i32(prev_date, date);
-            let is_week_end = is_week_end_i32(prev_date, date);
-
-            match resample {
-                ResampleFreq::Daily => {
-                    // Daily: always update, empty signals means exit all
-                    if !normalized.is_empty() {
-                        has_first_signal = true;
-                    }
-                    if has_first_signal {
-                        active_weights = normalized;
-                    }
-                }
-                ResampleFreq::Weekly => {
-                    // Weekly: ONLY use signals from week-end day
-                    // This matches Wide format which resamples position to week-ends
-                    if is_week_end {
-                        // On week-end, use today's signals directly (could be empty)
-                        let has_signals = !normalized.is_empty();
-                        active_weights = normalized;
-                        if has_signals {
-                            has_first_signal = true;
-                        }
-                    }
-                    // On non-week-end days, ignore today_weights entirely
-                }
-                ResampleFreq::Monthly => {
-                    // Monthly: ONLY use signals from month-end day
-                    // This matches Wide format which resamples position to month-ends
-                    if is_month_end {
-                        // On month-end, use today's signals directly (could be empty)
-                        let has_signals = !normalized.is_empty();
-                        active_weights = normalized;
-                        if has_signals {
-                            has_first_signal = true;
-                        }
-                    }
-                    // On non-month-end days, ignore today_weights entirely
-                }
-                ResampleFreq::PositionChange => {
-                    // PositionChange: only rebalance when weights differ from active_weights
-                    if !normalized.is_empty() {
-                        has_first_signal = true;
-                    }
-                    // Compare BEFORE updating active_weights, save result for STEP 5
-                    position_changed = weights_differ(&active_weights, &normalized);
-                    // Always update active_weights to today's normalized weights
-                    active_weights = normalized;
-                }
-            }
-
-            // STEP 5: Check if prev_date is a rebalance day (only after first signal)
-            if has_first_signal {
-                let should_rebalance = match resample {
-                    ResampleFreq::Monthly => is_month_end,
-                    ResampleFreq::Weekly => is_week_end,
-                    ResampleFreq::Daily => true,
-                    ResampleFreq::PositionChange => position_changed,
-                };
-
-                // Set pending weights for T+1 execution
-                // For Daily: include empty to trigger exit
-                if should_rebalance {
-                    pending_weights = Some(active_weights.clone());
-                    pending_signal_date = Some(prev_date);
-                }
-            }
-
-            // STEP 6: Record cumulative return
-            creturn.push(portfolio.balance());
-
-            // Clear today's data for new day
-            today_prices.clear();
-            today_weights.clear();
-        }
-
-        // Accumulate today's data
-        current_date = Some(date);
-        if price > 0.0 && !price.is_nan() {
-            today_prices.insert(symbol, price);
-        }
-        // Handle null weights (from polars rolling operations) as 0.0
-        if !weight.is_nan() && weight.abs() > 1e-10 {
-            today_weights.insert(symbol, weight);
-        }
-    }
-
-    // Process final day
-    if let Some(last_date) = current_date {
-        if !today_prices.is_empty() {
-            // STEP 1: Update positions
-            update_positions(&mut portfolio, &today_prices);
-
-            // STEP 2: Execute pending stops
-            execute_pending_stops_impl(
-                &mut portfolio,
-                &mut pending_stop_exits,
-                &mut stopped_stocks,
-                &today_prices,
-                config,
-                last_date,
-                &mut tracker,
-            );
-
-            // STEP 3: Execute pending rebalance
-            if let Some(target_weights) = pending_weights.take() {
-                let sig_date = pending_signal_date.take().unwrap_or(last_date);
-                execute_rebalance_impl(
-                    &mut portfolio,
-                    &target_weights,
-                    &today_prices,
-                    &stopped_stocks,
-                    config,
-                    last_date,
-                    sig_date,
-                    &mut tracker,
-                );
-            }
-
-            // STEP 4: Final balance
-            creturn.push(portfolio.balance());
-        }
-    }
+    let creturn = backtest_impl(
+        input.dates.len(),
+        |i| input.dates.value(i),
+        |i| input.symbols.value(i),
+        |i| input.prices.value(i),
+        |i| input.weights.value(i),
+        resample,
+        config,
+        &mut tracker,
+    );
 
     // Finalize trades (include open positions)
     let trades = tracker.finalize(config.fee_ratio, config.tax_ratio);
