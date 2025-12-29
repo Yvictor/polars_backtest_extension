@@ -274,6 +274,12 @@ df.select(
 FINLAB_API_TOKEN=your_token_here
 ```
 
+### Profiling
+
+```bash
+POLARS_BACKTEST_PROFILE=1 python your_script.py
+```
+
 ## License
 
 MIT

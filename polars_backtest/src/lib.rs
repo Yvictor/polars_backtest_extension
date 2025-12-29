@@ -9,9 +9,27 @@
 //! - `backtest()` - Main API for long format data (zero-copy, fastest)
 //! - `backtest_wide()` - Wide format API (for validation/compatibility)
 //! - `backtest_with_trades_wide()` - Wide format with trade tracking
+//!
+//! # Profiling
+//!
+//! Set environment variable `POLARS_BACKTEST_PROFILE=1` to enable profiling output.
 
 mod expressions;
 mod ffi_convert;
+
+/// Check if profiling is enabled via environment variable
+fn is_profile_enabled() -> bool {
+    std::env::var("POLARS_BACKTEST_PROFILE").map(|v| v == "1" || v.to_lowercase() == "true").unwrap_or(false)
+}
+
+/// Profile macro - only prints when POLARS_BACKTEST_PROFILE=1
+macro_rules! profile {
+    ($($arg:tt)*) => {
+        if is_profile_enabled() {
+            eprintln!($($arg)*);
+        }
+    };
+}
 
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
@@ -449,7 +467,7 @@ fn backtest(
     config: Option<PyBacktestConfig>,
     skip_sort: bool,
 ) -> PyResult<PyBacktestResult> {
-    use std::time::Instant;
+    use fastant::Instant;
     use polars_arrow::array::{PrimitiveArray, Utf8ViewArray};
 
     let total_start = Instant::now();
@@ -469,13 +487,13 @@ fn backtest(
 
     // Sort by date if needed
     let df = if skip_sort {
-        eprintln!("[PROFILE] Sort: SKIPPED (skip_sort=true, rows={})", n_rows);
+        profile!("[PROFILE] Sort: SKIPPED (skip_sort=true, rows={})", n_rows);
         df
     } else {
         let sorted = df
             .sort([date], SortMultipleOptions::default())
             .map_err(|e| PyValueError::new_err(format!("Failed to sort: {}", e)))?;
-        eprintln!("[PROFILE] Sort: {:?} (rows={})", step_start.elapsed(), n_rows);
+        profile!("[PROFILE] Sort: {:?} (rows={})", step_start.elapsed(), n_rows);
         sorted
     };
     step_start = Instant::now();
@@ -552,7 +570,7 @@ fn backtest(
         position_f64
     };
 
-    eprintln!("[PROFILE] Get ChunkedArrays (chunks: d={}, s={}, p={}, pos={}): {:?}",
+    profile!("[PROFILE] Get ChunkedArrays (chunks: d={}, s={}, p={}, pos={}): {:?}",
               date_nc, sym_nc, price_nc, position_nc, step_start.elapsed());
     step_start = Instant::now();
 
@@ -583,7 +601,7 @@ fn backtest(
         .downcast_ref::<PrimitiveArray<f64>>()
         .ok_or_else(|| PyValueError::new_err("Failed to downcast position array"))?;
 
-    eprintln!("[PROFILE] Get polars-arrow arrays: {:?}", step_start.elapsed());
+    profile!("[PROFILE] Get polars-arrow arrays: {:?}", step_start.elapsed());
     step_start = Instant::now();
 
     // Convert polars-arrow arrays to arrow-rs arrays using FFI (zero-copy)
@@ -596,7 +614,7 @@ fn backtest(
     let positions_rs = ffi_convert::polars_f64_to_arrow(positions_arrow)
         .map_err(|e| PyValueError::new_err(format!("FFI position conversion failed: {}", e)))?;
 
-    eprintln!("[PROFILE] FFI conversion (polars-arrow -> arrow-rs): {:?}", step_start.elapsed());
+    profile!("[PROFILE] FFI conversion (polars-arrow -> arrow-rs): {:?}", step_start.elapsed());
     step_start = Instant::now();
 
     // Get config (default to finlab_mode=true for long format)
@@ -624,36 +642,44 @@ fn backtest(
     // Run backtest using btcore with arrow-rs arrays
     let result = backtest_long_arrow(&input, resample_freq, &cfg);
 
-    eprintln!("[PROFILE] Backtest (btcore arrow): {:?}", step_start.elapsed());
+    profile!("[PROFILE] Backtest (btcore): {:?}", step_start.elapsed());
+    step_start = Instant::now();
 
-    // Get unique dates efficiently - data is already sorted, use unique_stable()
-    // This avoids the expensive sort after unique
-    let unique_dates = df.column(date)
-        .map_err(|e| PyValueError::new_err(format!("Failed to get date column: {}", e)))?
-        .unique_stable()
-        .map_err(|e| PyValueError::new_err(format!("Failed to get unique dates: {}", e)))?;
+    // Create unique_dates Series directly from btcore result (zero overhead)
+    let unique_dates = Series::new(date.into(), &result.dates)
+        .cast(&DataType::Date)
+        .map_err(|e| PyValueError::new_err(format!("Failed to cast to Date: {}", e)))?;
 
-    // Find first index where creturn != 1.0 (first actual return change)
-    // Go back one day to include the signal/entry day (where creturn is still 1.0)
-    let first_change_idx = result.creturn.iter()
-        .position(|&v| (v - 1.0).abs() > 1e-10)
+    // Create creturn Series and find first index where != 1.0 using Polars boolean mask
+    let creturn_series = Series::new("creturn".into(), &result.creturn);
+    let mask = creturn_series
+        .f64()
+        .map_err(|e| PyValueError::new_err(format!("creturn must be f64: {}", e)))?
+        .not_equal(1.0);
+
+    // Find first true index from boolean ChunkedArray
+    let first_change_idx = mask.into_iter()
+        .position(|opt| opt == Some(true))
         .unwrap_or(0);
+
+    // Go back one day to include the signal/entry day
     let first_active_idx = if first_change_idx > 0 { first_change_idx - 1 } else { 0 };
     let len = result.creturn.len() - first_active_idx;
 
-    // Slice dates using Polars slice (zero-copy for contiguous data)
+    // Slice dates and creturn using Polars slice (zero-copy)
     let sliced_dates = unique_dates.slice(first_active_idx as i64, len);
+    let sliced_creturn = creturn_series.slice(first_active_idx as i64, len);
 
-    // Create creturn Series directly from slice and normalize using Polars ops
-    let creturn_slice = &result.creturn[first_active_idx..];
-    let first_value = creturn_slice.first().copied().unwrap_or(1.0);
+    // Normalize: divide by first value using Polars ops
+    let first_value = sliced_creturn.f64()
+        .map_err(|e| PyValueError::new_err(format!("slice f64 failed: {}", e)))?
+        .first()
+        .unwrap_or(1.0);
 
     let creturn_col = if first_value != 0.0 && (first_value - 1.0).abs() > 1e-10 {
-        // Use Polars Series division for vectorized normalization
-        let raw_series = Series::new("creturn".into(), creturn_slice);
-        (raw_series / first_value).into_column()
+        (sliced_creturn / first_value).into_column()
     } else {
-        Column::new("creturn".into(), creturn_slice.to_vec())
+        sliced_creturn.into_column()
     };
 
     // Build creturn DataFrame
@@ -662,7 +688,8 @@ fn backtest(
         creturn_col,
     ]).map_err(|e| PyValueError::new_err(format!("Failed to create creturn DataFrame: {}", e)))?;
 
-    eprintln!("[PROFILE] TOTAL: {:?}", total_start.elapsed());
+    profile!("[PROFILE] Build result: {:?}", step_start.elapsed());
+    profile!("[PROFILE] TOTAL: {:?}", total_start.elapsed());
 
     Ok(PyBacktestResult {
         creturn_df,
@@ -863,7 +890,7 @@ fn backtest_with_trades(
     // Run backtest with trades using btcore
     let result = backtest_with_trades_long_arrow(&input, resample_freq, &cfg);
 
-    eprintln!("[PROFILE] backtest_with_trades: {} rows, {} trades", n_rows, result.trades.len());
+    profile!("[PROFILE] backtest_with_trades: {} rows, {} trades", n_rows, result.trades.len());
 
     Ok(result.into())
 }
@@ -1126,31 +1153,41 @@ fn backtest_with_report(
     let trades_df = trades_to_dataframe(&result.trades)
         .map_err(|e| PyValueError::new_err(format!("Failed to create trades DataFrame: {}", e)))?;
 
-    // Get unique dates efficiently - data is already sorted, use unique_stable()
-    let unique_dates = df.column(date)
-        .map_err(|e| PyValueError::new_err(format!("Failed to get date column: {}", e)))?
-        .unique_stable()
-        .map_err(|e| PyValueError::new_err(format!("Failed to get unique dates: {}", e)))?;
+    // Create unique_dates Series directly from btcore result (zero overhead)
+    let unique_dates = Series::new(date.into(), &result.dates)
+        .cast(&DataType::Date)
+        .map_err(|e| PyValueError::new_err(format!("Failed to cast to Date: {}", e)))?;
 
-    // Find first index where creturn != 1.0, go back one day for signal day
-    let first_change_idx = result.creturn.iter()
-        .position(|&v| (v - 1.0).abs() > 1e-10)
+    // Find first index where creturn != 1.0 using Polars boolean mask
+    let creturn_series = Series::new("creturn".into(), &result.creturn);
+    let mask = creturn_series
+        .f64()
+        .map_err(|e| PyValueError::new_err(format!("creturn must be f64: {}", e)))?
+        .not_equal(1.0);
+
+    // Find first true index from boolean ChunkedArray
+    let first_change_idx = mask.into_iter()
+        .position(|opt| opt == Some(true))
         .unwrap_or(0);
+
+    // Go back one day to include the signal/entry day
     let first_active_idx = if first_change_idx > 0 { first_change_idx - 1 } else { 0 };
     let len = result.creturn.len() - first_active_idx;
 
-    // Slice dates using Polars slice (zero-copy)
+    // Slice dates and creturn using Polars slice (zero-copy)
     let sliced_dates = unique_dates.slice(first_active_idx as i64, len);
+    let sliced_creturn = creturn_series.slice(first_active_idx as i64, len);
 
-    // Create creturn Series and normalize using Polars ops
-    let creturn_slice = &result.creturn[first_active_idx..];
-    let first_value = creturn_slice.first().copied().unwrap_or(1.0);
+    // Normalize: divide by first value using Polars ops
+    let first_value = sliced_creturn.f64()
+        .map_err(|e| PyValueError::new_err(format!("slice f64 failed: {}", e)))?
+        .first()
+        .unwrap_or(1.0);
 
     let creturn_col = if first_value != 0.0 && (first_value - 1.0).abs() > 1e-10 {
-        let raw_series = Series::new("creturn".into(), creturn_slice);
-        (raw_series / first_value).into_column()
+        (sliced_creturn / first_value).into_column()
     } else {
-        Column::new("creturn".into(), creturn_slice.to_vec())
+        sliced_creturn.into_column()
     };
 
     // Build creturn DataFrame
@@ -1159,7 +1196,7 @@ fn backtest_with_report(
         creturn_col,
     ]).map_err(|e| PyValueError::new_err(format!("Failed to create creturn DataFrame: {}", e)))?;
 
-    eprintln!("[PROFILE] backtest_with_report: {} rows, {} trades", n_rows, result.trades.len());
+    profile!("[PROFILE] backtest_with_report: {} rows, {} trades", n_rows, result.trades.len());
 
     Ok(PyBacktestReport {
         creturn_df,

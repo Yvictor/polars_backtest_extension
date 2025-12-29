@@ -23,6 +23,7 @@ pyo3-polars.workspace = true
 chrono.workspace = true
 serde.workspace = true
 rayon.workspace = true
+fastant = "0.1"
 
 [features]
 default = []

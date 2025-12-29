@@ -124,6 +124,8 @@ pub struct BacktestResult {
 /// Result of a long format backtest with trades
 #[derive(Debug, Clone)]
 pub struct LongBacktestResult {
+    /// Unique dates (i32 days since epoch) - same length as creturn
+    pub dates: Vec<i32>,
     /// Cumulative returns at each time step (one per unique date)
     pub creturn: Vec<f64>,
     /// List of completed trades with string symbols

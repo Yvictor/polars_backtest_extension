@@ -133,7 +133,7 @@ fn backtest_impl<'a, FD, FS, FP, FW, T, FO, FH, FL>(
     config: &BacktestConfig,
     tracker: &mut T,
     ohlc: Option<OhlcGetters<FO, FH, FL>>,
-) -> Vec<f64>
+) -> (Vec<i32>, Vec<f64>)
 where
     FD: Fn(usize) -> i32,
     FS: Fn(usize) -> &'a str,
@@ -145,10 +145,11 @@ where
     T: TradeTracker<Key = String, Date = i32, Record = LongTradeRecord>,
 {
     if n_rows == 0 {
-        return vec![];
+        return (vec![], vec![]);
     }
 
     let mut portfolio = Portfolio::new();
+    let mut dates: Vec<i32> = Vec::new();
     let mut creturn: Vec<f64> = Vec::new();
     let mut stopped_stocks: HashMap<String, bool> = HashMap::new();
     let mut pending_weights: Option<HashMap<String, f64>> = None;
@@ -305,7 +306,8 @@ where
                 }
             }
 
-            // STEP 6: Record creturn
+            // STEP 6: Record date and creturn
+            dates.push(prev_date);
             creturn.push(portfolio.balance());
 
             today_prices.clear();
@@ -382,11 +384,12 @@ where
                 );
             }
 
+            dates.push(last_date);
             creturn.push(portfolio.balance());
         }
     }
 
-    creturn
+    (dates, creturn)
 }
 
 /// Run backtest with closure-based data access (public API, no trade tracking)
@@ -416,7 +419,7 @@ where
 {
     let mut tracker = NoopSymbolTracker::default();
     let ohlc: Option<OhlcGetters<fn(usize) -> f64, fn(usize) -> f64, fn(usize) -> f64>> = None;
-    let creturn = backtest_impl(
+    let (_dates, creturn) = backtest_impl(
         n_rows,
         get_date,
         get_symbol,
@@ -443,13 +446,15 @@ where
 /// * `config` - Backtest configuration
 ///
 /// # Returns
-/// BacktestResult containing cumulative returns (one per unique date)
+/// LongBacktestResult containing dates, cumulative returns, and empty trades
 pub fn backtest_long_arrow(
     input: &LongFormatArrowInput,
     resample: ResampleFreq,
     config: &BacktestConfig,
-) -> BacktestResult {
-    backtest_with_accessor(
+) -> LongBacktestResult {
+    let mut tracker = NoopSymbolTracker::default();
+    let ohlc: Option<OhlcGetters<fn(usize) -> f64, fn(usize) -> f64, fn(usize) -> f64>> = None;
+    let (dates, creturn) = backtest_impl(
         input.dates.len(),
         |i| input.dates.value(i),
         |i| input.symbols.value(i),
@@ -457,7 +462,14 @@ pub fn backtest_long_arrow(
         |i| input.weights.value(i),
         resample,
         config,
-    )
+        &mut tracker,
+        ohlc,
+    );
+    LongBacktestResult {
+        dates,
+        creturn,
+        trades: vec![],
+    }
 }
 
 /// Run backtest on native Rust slices
@@ -468,8 +480,10 @@ pub fn backtest_long_slice(
     weights: &[f64],
     resample: ResampleFreq,
     config: &BacktestConfig,
-) -> BacktestResult {
-    backtest_with_accessor(
+) -> LongBacktestResult {
+    let mut tracker = NoopSymbolTracker::default();
+    let ohlc: Option<OhlcGetters<fn(usize) -> f64, fn(usize) -> f64, fn(usize) -> f64>> = None;
+    let (result_dates, creturn) = backtest_impl(
         dates.len(),
         |i| dates[i],
         |i| symbols[i],
@@ -477,7 +491,14 @@ pub fn backtest_long_slice(
         |i| weights[i],
         resample,
         config,
-    )
+        &mut tracker,
+        ohlc,
+    );
+    LongBacktestResult {
+        dates: result_dates,
+        creturn,
+        trades: vec![],
+    }
 }
 
 /// Check if prev_date is a month-end using i32 dates (days since 1970-01-01)
@@ -1085,7 +1106,7 @@ pub fn backtest_with_trades_long_arrow(
     let mut tracker = SymbolTracker::new();
 
     // Build OHLC getters if data is available and touched_exit is enabled
-    let creturn = if config.touched_exit
+    let (dates, creturn) = if config.touched_exit
         && input.open_prices.is_some()
         && input.high_prices.is_some()
         && input.low_prices.is_some()
@@ -1129,7 +1150,7 @@ pub fn backtest_with_trades_long_arrow(
     // Finalize trades (include open positions)
     let trades = tracker.finalize(config.fee_ratio, config.tax_ratio);
 
-    LongBacktestResult { creturn, trades }
+    LongBacktestResult { dates, creturn, trades }
 }
 
 #[cfg(test)]
