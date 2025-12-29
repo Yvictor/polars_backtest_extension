@@ -513,23 +513,20 @@ class BacktestNamespace:
             touched_exit=touched_exit,
         )
 
-        # touched_exit requires OHLC support in Rust (not implemented yet)
-        if touched_exit:
-            raise NotImplementedError(
-                "touched_exit=True is not yet supported in long format. "
-                "This feature requires OHLC support in the Rust backend."
-            )
-
         # Check if already sorted
         skip_sort = df.get_column(date_col).is_sorted()
 
         # Use Rust backtest_with_report directly (returns BacktestReport with trades DataFrame)
+        # OHLC columns are only used when touched_exit=True
         return _rust_backtest_with_report(
             df,
             date_col,
             symbol_col,
             price_col,
             position_col,
+            open_col if open_col else "open",
+            high_col if high_col else "high",
+            low_col if low_col else "low",
             resample,
             config,
             skip_sort,
@@ -647,7 +644,6 @@ def backtest_with_report(
         retain_cost_when_rebalance: Retain costs when rebalancing
         stop_trading_next_period: Stop trading after stop triggered
         touched_exit: Use OHLC for intraday stop detection (requires open/high/low)
-                     NOTE: Not yet implemented, will raise NotImplementedError.
 
     Returns:
         BacktestReport object with creturn (list) and trades (DataFrame)

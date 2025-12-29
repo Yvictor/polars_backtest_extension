@@ -726,6 +726,250 @@ def test_trades_with_stops(wide_format_df, long_format_df, position_bool):
 
 
 # =============================================================================
+# Touched Exit Tests
+# =============================================================================
+
+
+@pytest.fixture(scope="module")
+def ohlc_data():
+    """Load adjusted OHLC price data for touched_exit tests."""
+    import finlab
+    from finlab import data as finlab_data
+
+    finlab.login(os.getenv("FINLAB_API_TOKEN"))
+    adj_open = finlab_data.get('etl:adj_open')
+    adj_high = finlab_data.get('etl:adj_high')
+    adj_low = finlab_data.get('etl:adj_low')
+
+    return adj_open, adj_high, adj_low
+
+
+@pytest.fixture(scope="module")
+def long_format_with_ohlc(long_format_df, ohlc_data):
+    """Long format DataFrame with OHLC columns for touched_exit tests."""
+    os.makedirs(CACHE_DIR, exist_ok=True)
+    cache_path = os.path.join(CACHE_DIR, "long_format_ohlc.parquet")
+
+    if os.path.exists(cache_path):
+        return pl.read_parquet(cache_path)
+
+    adj_open, adj_high, adj_low = ohlc_data
+
+    # Get base long format
+    df_long = long_format_df
+
+    # Add OHLC columns
+    ohlc_long = (
+        pl.from_pandas(adj_open.unstack().reset_index())
+        .select(
+            pl.col("symbol"),
+            pl.col("date").cast(pl.Date),
+            pl.col("0").alias("open"),
+        )
+        .join(
+            pl.from_pandas(adj_high.unstack().reset_index()).select(
+                pl.col("symbol"),
+                pl.col("date").cast(pl.Date),
+                pl.col("0").alias("high"),
+            ),
+            on=["symbol", "date"],
+            how="left",
+        )
+        .join(
+            pl.from_pandas(adj_low.unstack().reset_index()).select(
+                pl.col("symbol"),
+                pl.col("date").cast(pl.Date),
+                pl.col("0").alias("low"),
+            ),
+            on=["symbol", "date"],
+            how="left",
+        )
+    )
+
+    df_with_ohlc = df_long.join(ohlc_long, on=["symbol", "date"], how="left")
+    df_with_ohlc.write_parquet(cache_path)
+
+    return df_with_ohlc
+
+
+@pytest.fixture(scope="module")
+def wide_ohlc_dfs(ohlc_data):
+    """Convert OHLC data to wide format polars DataFrames."""
+    adj_open, adj_high, adj_low = ohlc_data
+
+    df_open = pl.from_pandas(adj_open.reset_index()).with_columns(
+        pl.col("date").cast(pl.Date).cast(pl.Utf8)
+    )
+    df_high = pl.from_pandas(adj_high.reset_index()).with_columns(
+        pl.col("date").cast(pl.Date).cast(pl.Utf8)
+    )
+    df_low = pl.from_pandas(adj_low.reset_index()).with_columns(
+        pl.col("date").cast(pl.Date).cast(pl.Utf8)
+    )
+
+    return df_open, df_high, df_low
+
+
+def run_touched_exit_comparison(
+    df_long: pl.DataFrame,
+    df_adj: pl.DataFrame,
+    df_position: pl.DataFrame,
+    df_open: pl.DataFrame,
+    df_high: pl.DataFrame,
+    df_low: pl.DataFrame,
+    test_name: str,
+    **kwargs,
+):
+    """Run comparison between long format and wide format backtest with touched_exit."""
+    # Run wide format backtest (reference)
+    wide_report = backtest_with_report_wide(
+        df_adj, df_position,
+        open=df_open, high=df_high, low=df_low,
+        touched_exit=True,
+        **kwargs,
+    )
+
+    # Parse resample for long format
+    resample = kwargs.get("resample", "D")
+    resample_long = None if resample == "D" else resample
+
+    # Run long format backtest with touched_exit
+    long_report = pl_bt.backtest_with_report(
+        df_long,
+        trade_at_price="adj_close",
+        position="weight",
+        open="open",
+        high="high",
+        low="low",
+        resample=resample_long,
+        fee_ratio=kwargs.get("fee_ratio", 0.001425),
+        tax_ratio=kwargs.get("tax_ratio", 0.003),
+        stop_loss=kwargs.get("stop_loss", 1.0),
+        take_profit=kwargs.get("take_profit", float("inf")),
+        trail_stop=kwargs.get("trail_stop", float("inf")),
+        position_limit=kwargs.get("position_limit", 1.0),
+        retain_cost_when_rebalance=kwargs.get("retain_cost_when_rebalance", False),
+        stop_trading_next_period=kwargs.get("stop_trading_next_period", True),
+        touched_exit=True,
+    )
+
+    # Compare creturn
+    wide_creturn = wide_report.creturn.with_columns(pl.col("date").cast(pl.Date))
+    long_creturn_list = long_report.creturn
+
+    # Get dates from long format result
+    dates = (
+        df_long.select("date")
+        .unique()
+        .sort("date")
+        .get_column("date")
+    )
+
+    # Build long creturn DataFrame
+    long_creturn = pl.DataFrame({
+        "date": dates[:len(long_creturn_list)],
+        "creturn_long": long_creturn_list,
+    })
+
+    df_cmp = wide_creturn.join(long_creturn, on="date", how="inner")
+
+    max_diff = df_cmp.select(
+        ((pl.col("creturn") - pl.col("creturn_long")).abs().max()).alias("max_diff")
+    ).get_column("max_diff")[0]
+
+    df_ne = df_cmp.filter(pl.col("creturn").round(6) != pl.col("creturn_long").round(6))
+
+    print(f"\n=== {test_name} ===")
+    print(f"Wide final: {wide_creturn.get_column('creturn')[-1]:.6f}")
+    print(f"Long final: {long_creturn.get_column('creturn_long')[-1]:.6f}")
+    print(f"Max diff: {max_diff:.2e}")
+    print(f"Wide trades: {len(wide_report.trades)}")
+    print(f"Long trades: {len(long_report.trades)}")
+    if not df_ne.is_empty():
+        print(f"Differences:\n{df_ne.head(5)}")
+
+    assert df_ne.is_empty(), f"Found {len(df_ne)} differences in creturn"
+    assert max_diff < CRETURN_RTOL, f"Max diff {max_diff} exceeds tolerance"
+
+    return long_report, wide_report
+
+
+@pytest.mark.parametrize("stop_loss", [0.05, 0.1])
+def test_touched_exit_stop_loss(
+    wide_format_df, long_format_with_ohlc, wide_ohlc_dfs, position_bool, stop_loss
+):
+    """Test touched_exit with stop_loss - compare long vs wide format."""
+    df_adj, _ = wide_format_df
+    df_long = long_format_with_ohlc
+    df_open, df_high, df_low = wide_ohlc_dfs
+
+    df_position = wide_position_to_pl(position_bool)
+    df_long_with_weight = add_weight_to_long(df_long)
+
+    run_touched_exit_comparison(
+        df_long_with_weight,
+        df_adj,
+        df_position,
+        df_open,
+        df_high,
+        df_low,
+        f"touched_exit+stop_loss={stop_loss}",
+        resample="M",
+        stop_loss=stop_loss,
+    )
+
+
+@pytest.mark.parametrize("take_profit", [0.1, 0.2])
+def test_touched_exit_take_profit(
+    wide_format_df, long_format_with_ohlc, wide_ohlc_dfs, position_bool, take_profit
+):
+    """Test touched_exit with take_profit - compare long vs wide format."""
+    df_adj, _ = wide_format_df
+    df_long = long_format_with_ohlc
+    df_open, df_high, df_low = wide_ohlc_dfs
+
+    df_position = wide_position_to_pl(position_bool)
+    df_long_with_weight = add_weight_to_long(df_long)
+
+    run_touched_exit_comparison(
+        df_long_with_weight,
+        df_adj,
+        df_position,
+        df_open,
+        df_high,
+        df_low,
+        f"touched_exit+take_profit={take_profit}",
+        resample="M",
+        take_profit=take_profit,
+    )
+
+
+def test_touched_exit_combined(
+    wide_format_df, long_format_with_ohlc, wide_ohlc_dfs, position_bool
+):
+    """Test touched_exit with both stop_loss and take_profit."""
+    df_adj, _ = wide_format_df
+    df_long = long_format_with_ohlc
+    df_open, df_high, df_low = wide_ohlc_dfs
+
+    df_position = wide_position_to_pl(position_bool)
+    df_long_with_weight = add_weight_to_long(df_long)
+
+    run_touched_exit_comparison(
+        df_long_with_weight,
+        df_adj,
+        df_position,
+        df_open,
+        df_high,
+        df_low,
+        "touched_exit+combined",
+        resample="M",
+        stop_loss=0.1,
+        take_profit=0.2,
+    )
+
+
+# =============================================================================
 # Null Handling Tests
 # =============================================================================
 
@@ -753,11 +997,7 @@ def test_polars_rolling_null(long_format_df):
     assert null_count > 0, "Expected null values from polars rolling_max"
 
     # Backtest should handle null weights by treating them as 0
-    # (Our add_weight_to_long fills nulls with 0.0 for this reason)
-    df_with_weight = df_with_null_weight.with_columns(
-        pl.col("weight").fill_null(0.0)
-    )
-
+    # (namespace.py fills nulls with 0.0 internally)
     # Should complete without error
     result = pl_bt.backtest(
         df_with_null_weight,

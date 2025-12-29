@@ -586,6 +586,9 @@ fn backtest(
         symbols: &symbols_rs,
         prices: &prices_rs,
         weights: &positions_rs,
+        open_prices: None,
+        high_prices: None,
+        low_prices: None,
     };
 
     // Run backtest using btcore with arrow-rs arrays
@@ -785,6 +788,9 @@ fn backtest_with_trades(
         symbols: &symbols_rs,
         prices: &prices_rs,
         weights: &positions_rs,
+        open_prices: None,
+        high_prices: None,
+        low_prices: None,
     };
 
     // Run backtest with trades using btcore
@@ -806,6 +812,9 @@ fn backtest_with_trades(
 ///     symbol: Name of symbol column (default: "symbol")
 ///     trade_at_price: Name of price column (default: "close")
 ///     position: Name of position/weight column (default: "weight")
+///     open: Name of open price column (default: "open", for touched_exit)
+///     high: Name of high price column (default: "high", for touched_exit)
+///     low: Name of low price column (default: "low", for touched_exit)
 ///     resample: Rebalancing frequency ("D", "W", "M", or None for daily)
 ///     config: BacktestConfig (optional)
 ///     skip_sort: Skip sorting if data is already sorted by date (default: false)
@@ -819,6 +828,9 @@ fn backtest_with_trades(
     symbol="symbol",
     trade_at_price="close",
     position="weight",
+    open="open",
+    high="high",
+    low="low",
     resample=None,
     config=None,
     skip_sort=false
@@ -829,6 +841,9 @@ fn backtest_with_report(
     symbol: &str,
     trade_at_price: &str,
     position: &str,
+    open: &str,
+    high: &str,
+    low: &str,
     resample: Option<&str>,
     config: Option<PyBacktestConfig>,
     skip_sort: bool,
@@ -838,12 +853,32 @@ fn backtest_with_report(
     let df = df.0;
     let n_rows = df.height();
 
+    // Get config first to check if touched_exit is enabled
+    let cfg = config.map(|c| c.inner).unwrap_or_else(|| {
+        BacktestConfig {
+            finlab_mode: true,
+            ..Default::default()
+        }
+    });
+    let touched_exit = cfg.touched_exit;
+
     // Validate required columns exist
     for col_name in [date, symbol, trade_at_price, position] {
         if df.column(col_name).is_err() {
             return Err(PyValueError::new_err(format!(
                 "Missing required column: '{}'", col_name
             )));
+        }
+    }
+
+    // Validate OHLC columns if touched_exit is enabled
+    if touched_exit {
+        for col_name in [open, high, low] {
+            if df.column(col_name).is_err() {
+                return Err(PyValueError::new_err(format!(
+                    "touched_exit=True requires column '{}', but it is missing", col_name
+                )));
+            }
         }
     }
 
@@ -964,13 +999,44 @@ fn backtest_with_report(
     let positions_rs = ffi_convert::polars_f64_to_arrow(positions_arrow)
         .map_err(|e| PyValueError::new_err(format!("FFI position conversion failed: {}", e)))?;
 
-    // Get config (default to finlab_mode=true for long format)
-    let cfg = config.map(|c| c.inner).unwrap_or_else(|| {
-        BacktestConfig {
-            finlab_mode: true,
-            ..Default::default()
-        }
-    });
+    // Process OHLC columns if touched_exit is enabled
+    let (open_rs, high_rs, low_rs) = if touched_exit {
+        // Helper to process a float column
+        let process_float_col = |col_name: &str| -> PyResult<arrow::array::Float64Array> {
+            let col_ref = df.column(col_name)
+                .map_err(|e| PyValueError::new_err(format!("Failed to get {} column: {}", col_name, e)))?;
+            let col_series = if col_ref.dtype() == &DataType::Float64 {
+                col_ref.clone()
+            } else {
+                col_ref.cast(&DataType::Float64)
+                    .map_err(|e| PyValueError::new_err(format!("Failed to cast {}: {}", col_name, e)))?
+            };
+            let col_f64 = col_series.f64()
+                .map_err(|e| PyValueError::new_err(format!("{} must be f64: {}", col_name, e)))?;
+            let col_rechunked;
+            let col_ca: &Float64Chunked = if col_f64.chunks().len() > 1 {
+                col_rechunked = col_f64.rechunk();
+                &col_rechunked
+            } else {
+                col_f64
+            };
+            let col_chunks = col_ca.chunks();
+            let col_arrow = col_chunks[0]
+                .as_any()
+                .downcast_ref::<PrimitiveArray<f64>>()
+                .ok_or_else(|| PyValueError::new_err(format!("Failed to downcast {} array", col_name)))?;
+            ffi_convert::polars_f64_to_arrow(col_arrow)
+                .map_err(|e| PyValueError::new_err(format!("FFI {} conversion failed: {}", col_name, e)))
+        };
+
+        (
+            Some(process_float_col(open)?),
+            Some(process_float_col(high)?),
+            Some(process_float_col(low)?),
+        )
+    } else {
+        (None, None, None)
+    };
 
     // Parse resample frequency
     let resample_freq = ResampleFreq::from_str(resample);
@@ -981,6 +1047,9 @@ fn backtest_with_report(
         symbols: &symbols_rs,
         prices: &prices_rs,
         weights: &positions_rs,
+        open_prices: open_rs.as_ref(),
+        high_prices: high_rs.as_ref(),
+        low_prices: low_rs.as_ref(),
     };
 
     // Run backtest with trades using btcore
