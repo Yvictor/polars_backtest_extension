@@ -226,6 +226,53 @@ def run_comparison(
     return long_result, wide_report
 
 
+def long_trades_to_df(trades_list) -> pl.DataFrame:
+    """Convert list of LongTradeRecord to DataFrame.
+
+    Note: entry_date/exit_date are i32 (days since epoch), convert to Date then string
+    to match wide format.
+    """
+    from datetime import date, timedelta
+
+    def days_to_date_str(days: int | None) -> str | None:
+        if days is None:
+            return None
+        # Convert days since epoch to date string
+        epoch = date(1970, 1, 1)
+        d = epoch + timedelta(days=days)
+        return d.isoformat()
+
+    if not trades_list:
+        return pl.DataFrame({
+            "stock_id": [],
+            "entry_date": [],
+            "exit_date": [],
+            "entry_sig_date": [],
+            "exit_sig_date": [],
+            "position": [],
+            "period": [],
+            "return": [],
+            "entry_price": [],
+            "exit_price": [],
+        })
+
+    records = []
+    for t in trades_list:
+        records.append({
+            "stock_id": t.symbol,
+            "entry_date": days_to_date_str(t.entry_date),
+            "exit_date": days_to_date_str(t.exit_date),
+            "entry_sig_date": days_to_date_str(t.entry_sig_date),
+            "exit_sig_date": days_to_date_str(t.exit_sig_date),
+            "position": t.position_weight,
+            "period": t.holding_days(),
+            "return": t.trade_return,
+            "entry_price": t.entry_price,
+            "exit_price": t.exit_price,
+        })
+    return pl.DataFrame(records)
+
+
 def run_trades_comparison(
     df_long: pl.DataFrame,
     df_adj: pl.DataFrame,
@@ -233,7 +280,7 @@ def run_trades_comparison(
     test_name: str,
     **kwargs,
 ):
-    """Run comparison with trades tracking."""
+    """Run comparison with trades tracking and verify all trade contents match."""
     # Run wide format backtest (reference)
     wide_report = backtest_with_report_wide(df_adj, df_position, **kwargs)
 
@@ -267,15 +314,126 @@ def run_trades_comparison(
     print(f"Wide trades: {len(wide_report.trades)}")
     print(f"Long trades: {len(long_result.trades)}")
 
-    # Trade count comparison (allow some tolerance due to date alignment)
-    wide_trade_count = len(wide_report.trades)
-    long_trade_count = len(long_result.trades)
+    # Convert long trades to DataFrame
+    long_trades_df = long_trades_to_df(long_result.trades)
+    wide_trades_df = wide_report.trades
 
-    if wide_trade_count > 0:
-        diff_ratio = abs(wide_trade_count - long_trade_count) / wide_trade_count
-        assert diff_ratio < 0.1, (
-            f"Trade count differs by >10%: wide={wide_trade_count}, long={long_trade_count}"
-        )
+    # Trade count must match exactly
+    wide_trade_count = len(wide_trades_df)
+    long_trade_count = len(long_trades_df)
+
+    # Filter out pending trades (null entry_date) and open trades (null exit_date)
+    # Wide format tracks pending trades (signaled but never executed due to NaN price),
+    # while Long format only tracks executed trades. This is a known difference.
+    #
+    # For comparison, we only compare COMPLETED trades (both entry_date and exit_date not null)
+    wide_completed = wide_trades_df.filter(
+        pl.col("entry_date").is_not_null() & pl.col("exit_date").is_not_null()
+    )
+    long_completed = long_trades_df.filter(
+        pl.col("entry_date").is_not_null() & pl.col("exit_date").is_not_null()
+    )
+
+    wide_completed_count = len(wide_completed)
+    long_completed_count = len(long_completed)
+
+    print(f"Wide completed trades: {wide_completed_count}")
+    print(f"Long completed trades: {long_completed_count}")
+
+    assert wide_completed_count == long_completed_count, (
+        f"Completed trade count mismatch: wide={wide_completed_count}, long={long_completed_count}"
+    )
+
+    if wide_completed_count == 0:
+        return long_result, wide_report
+
+    # Sort both DataFrames by (stock_id, entry_date, exit_date) for comparison
+    sort_cols = ["stock_id", "entry_date", "exit_date"]
+    wide_sorted = wide_completed.sort(sort_cols)
+    long_sorted = long_completed.sort(sort_cols)
+
+    # Compare key fields
+    # Note: Wide format uses "trade_price@entry_date" and "trade_price@exit_date"
+    # Long format uses "entry_price" and "exit_price"
+
+    # 1. Check stock_id
+    wide_symbols = wide_sorted["stock_id"].to_list()
+    long_symbols = long_sorted["stock_id"].to_list()
+    assert wide_symbols == long_symbols, f"stock_id mismatch at first difference"
+
+    # 2. Check entry_date
+    wide_entry = wide_sorted["entry_date"].to_list()
+    long_entry = long_sorted["entry_date"].to_list()
+    for i, (w, l) in enumerate(zip(wide_entry, long_entry)):
+        if w != l:
+            print(f"entry_date mismatch at index {i}: wide={w}, long={l}")
+            print(f"  wide trade: {wide_sorted.row(i)}")
+            print(f"  long trade: {long_sorted.row(i)}")
+    assert wide_entry == long_entry, "entry_date mismatch"
+
+    # 3. Check exit_date
+    wide_exit = wide_sorted["exit_date"].to_list()
+    long_exit = long_sorted["exit_date"].to_list()
+    for i, (w, l) in enumerate(zip(wide_exit, long_exit)):
+        if w != l:
+            print(f"exit_date mismatch at index {i}: wide={w}, long={l}")
+    assert wide_exit == long_exit, "exit_date mismatch"
+
+    # 4. Check position weight
+    wide_pos = wide_sorted["position"].to_list()
+    long_pos = long_sorted["position"].to_list()
+    for i, (w, l) in enumerate(zip(wide_pos, long_pos)):
+        if w is not None and l is not None and abs(w - l) > 1e-6:
+            print(f"position mismatch at index {i}: wide={w}, long={l}")
+    # Allow small tolerance for floating point
+    for w, l in zip(wide_pos, long_pos):
+        if w is None and l is None:
+            continue
+        assert w is not None and l is not None, "position None mismatch"
+        assert abs(w - l) < 1e-6, f"position mismatch: wide={w}, long={l}"
+
+    import math
+
+    def floats_equal(a, b, tol=1e-4):
+        """Compare floats handling NaN."""
+        if a is None and b is None:
+            return True
+        if a is None or b is None:
+            return False
+        if math.isnan(a) and math.isnan(b):
+            return True
+        if math.isnan(a) or math.isnan(b):
+            return False
+        return abs(a - b) < tol
+
+    # 5. Check entry_price
+    wide_entry_price = wide_sorted["trade_price@entry_date"].to_list()
+    long_entry_price = long_sorted["entry_price"].to_list()
+    for i, (w, lng) in enumerate(zip(wide_entry_price, long_entry_price)):
+        if not floats_equal(w, lng):
+            print(f"entry_price mismatch at index {i}: wide={w}, long={lng}")
+    for w, lng in zip(wide_entry_price, long_entry_price):
+        assert floats_equal(w, lng), f"entry_price mismatch: wide={w}, long={lng}"
+
+    # 6. Check exit_price
+    wide_exit_price = wide_sorted["trade_price@exit_date"].to_list()
+    long_exit_price = long_sorted["exit_price"].to_list()
+    for i, (w, lng) in enumerate(zip(wide_exit_price, long_exit_price)):
+        if not floats_equal(w, lng):
+            print(f"exit_price mismatch at index {i}: wide={w}, long={lng}")
+    for w, lng in zip(wide_exit_price, long_exit_price):
+        assert floats_equal(w, lng), f"exit_price mismatch: wide={w}, long={lng}"
+
+    # 7. Check trade return
+    wide_return = wide_sorted["return"].to_list()
+    long_return = long_sorted["return"].to_list()
+    for i, (w, lng) in enumerate(zip(wide_return, long_return)):
+        if not floats_equal(w, lng, tol=1e-6):
+            print(f"return mismatch at index {i}: wide={w}, long={lng}")
+    for w, lng in zip(wide_return, long_return):
+        assert floats_equal(w, lng, tol=1e-6), f"return mismatch: wide={w}, long={lng}"
+
+    print(f"  All {wide_completed_count} completed trades match exactly!")
 
     return long_result, wide_report
 
