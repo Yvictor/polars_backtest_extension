@@ -1,7 +1,7 @@
 """
 Test long format API vs wide format API with real market data.
 
-Long format: pl_bt.backtest(), backtest_with_trades_long()
+Long format: pl_bt.backtest(), pl_bt.backtest_with_report()
 Wide format: backtest_with_report_wide() (used as reference)
 
 Uses finlab to load real market data, but compares long vs wide format
@@ -15,11 +15,7 @@ import pandas as pd
 import polars_backtest as pl_bt
 
 from dotenv import load_dotenv
-from polars_backtest import (
-    backtest_with_report_wide,
-    backtest_with_trades_long,
-    BacktestConfig,
-)
+from polars_backtest import backtest_with_report_wide
 from polars.testing import assert_frame_equal
 
 load_dotenv()

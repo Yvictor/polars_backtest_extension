@@ -257,7 +257,6 @@ from polars_backtest._polars_backtest import (
     BacktestReport,
     # Main API (long format, zero-copy)
     backtest as backtest_long,
-    backtest_with_trades as backtest_with_trades_long,
     # Wide format API (for validation)
     backtest_wide as _backtest_wide_rust,
     backtest_with_trades_wide as _backtest_with_trades_wide,
@@ -278,7 +277,6 @@ __all__ = [
     # Main API (long format, zero-copy)
     "backtest",
     "backtest_with_report",
-    "backtest_with_trades_long",
     # Wide format API (for validation/finlab compatibility)
     "backtest_wide",
     "backtest_with_report_wide",
