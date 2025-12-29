@@ -17,7 +17,7 @@ use arrow::array::{Float64Array, Int32Array, StringViewArray};
 
 use crate::config::BacktestConfig;
 use crate::position::Position;
-use crate::tracker::{BacktestResult, LongBacktestResult, LongTradeRecord};
+use crate::tracker::{BacktestResult, LongBacktestResult, LongTradeRecord, NoopSymbolTracker, SymbolTracker, TradeTracker};
 
 /// Portfolio with string symbol keys (for zero-copy backtest)
 pub struct Portfolio {
@@ -87,192 +87,6 @@ impl ResampleFreq {
     }
 }
 
-// ============================================================================
-// String Trade Tracker - for long format with string symbols and i32 dates
-// ============================================================================
-
-/// Open trade for string-based tracking
-#[derive(Debug, Clone)]
-struct StringOpenTrade {
-    /// Symbol
-    symbol: String,
-    /// Entry date (days since epoch)
-    entry_date: i32,
-    /// Signal date (days since epoch)
-    entry_sig_date: i32,
-    /// Position weight
-    weight: f64,
-    /// Entry price
-    entry_price: f64,
-}
-
-/// Trait for tracking trades in long format
-pub(crate) trait StringTradeTracker {
-    fn new() -> Self;
-
-    /// Record opening a new trade
-    fn open_trade(
-        &mut self,
-        symbol: &str,
-        entry_date: i32,
-        signal_date: i32,
-        entry_price: f64,
-        weight: f64,
-    );
-
-    /// Record closing a trade
-    fn close_trade(
-        &mut self,
-        symbol: &str,
-        exit_date: i32,
-        exit_sig_date: Option<i32>,
-        exit_price: f64,
-        fee_ratio: f64,
-        tax_ratio: f64,
-    );
-
-    /// Check if a trade is open for a symbol
-    fn has_open_trade(&self, symbol: &str) -> bool;
-
-    /// Add a pending entry (signal given but not yet executed)
-    fn add_pending_entry(&mut self, symbol: &str, signal_date: i32, weight: f64);
-
-    /// Finalize all open trades at the end of simulation
-    fn finalize(self, fee_ratio: f64, tax_ratio: f64) -> Vec<LongTradeRecord>;
-}
-
-/// No-op trade tracker - zero overhead for simple backtest
-pub(crate) struct NoopStringTracker;
-
-impl StringTradeTracker for NoopStringTracker {
-    #[inline]
-    fn new() -> Self {
-        Self
-    }
-
-    #[inline]
-    fn open_trade(&mut self, _: &str, _: i32, _: i32, _: f64, _: f64) {}
-
-    #[inline]
-    fn close_trade(&mut self, _: &str, _: i32, _: Option<i32>, _: f64, _: f64, _: f64) {}
-
-    #[inline]
-    fn has_open_trade(&self, _: &str) -> bool {
-        false
-    }
-
-    #[inline]
-    fn add_pending_entry(&mut self, _: &str, _: i32, _: f64) {}
-
-    #[inline]
-    fn finalize(self, _: f64, _: f64) -> Vec<LongTradeRecord> {
-        vec![]
-    }
-}
-
-/// Real trade tracker for long format
-pub(crate) struct RealStringTracker {
-    open_trades: HashMap<String, StringOpenTrade>,
-    completed_trades: Vec<LongTradeRecord>,
-}
-
-impl StringTradeTracker for RealStringTracker {
-    fn new() -> Self {
-        Self {
-            open_trades: HashMap::new(),
-            completed_trades: Vec::new(),
-        }
-    }
-
-    fn open_trade(
-        &mut self,
-        symbol: &str,
-        entry_date: i32,
-        signal_date: i32,
-        entry_price: f64,
-        weight: f64,
-    ) {
-        self.open_trades.insert(
-            symbol.to_string(),
-            StringOpenTrade {
-                symbol: symbol.to_string(),
-                entry_date,
-                entry_sig_date: signal_date,
-                weight,
-                entry_price,
-            },
-        );
-    }
-
-    fn close_trade(
-        &mut self,
-        symbol: &str,
-        exit_date: i32,
-        exit_sig_date: Option<i32>,
-        exit_price: f64,
-        fee_ratio: f64,
-        tax_ratio: f64,
-    ) {
-        if let Some(open_trade) = self.open_trades.remove(symbol) {
-            let trade = LongTradeRecord {
-                symbol: open_trade.symbol,
-                entry_date: Some(open_trade.entry_date),
-                exit_date: Some(exit_date),
-                entry_sig_date: open_trade.entry_sig_date,
-                exit_sig_date,
-                position_weight: open_trade.weight,
-                entry_price: open_trade.entry_price,
-                exit_price: Some(exit_price),
-                trade_return: None,
-            };
-            let trade_return = trade.calculate_return(fee_ratio, tax_ratio);
-
-            self.completed_trades.push(LongTradeRecord {
-                trade_return,
-                ..trade
-            });
-        }
-    }
-
-    fn has_open_trade(&self, symbol: &str) -> bool {
-        self.open_trades.contains_key(symbol)
-    }
-
-    fn add_pending_entry(&mut self, symbol: &str, signal_date: i32, weight: f64) {
-        // Add a pending entry record (entry_date=None for signals not yet executed)
-        self.completed_trades.push(LongTradeRecord {
-            symbol: symbol.to_string(),
-            entry_date: None,
-            exit_date: None,
-            entry_sig_date: signal_date,
-            exit_sig_date: None,
-            position_weight: weight,
-            entry_price: f64::NAN,
-            exit_price: None,
-            trade_return: None,
-        });
-    }
-
-    fn finalize(mut self, _fee_ratio: f64, _tax_ratio: f64) -> Vec<LongTradeRecord> {
-        // Report open positions as still open (exit_date=None)
-        for (_symbol, open_trade) in self.open_trades.drain() {
-            self.completed_trades.push(LongTradeRecord {
-                symbol: open_trade.symbol,
-                entry_date: Some(open_trade.entry_date),
-                exit_date: None,
-                entry_sig_date: open_trade.entry_sig_date,
-                exit_sig_date: None,
-                position_weight: open_trade.weight,
-                entry_price: open_trade.entry_price,
-                exit_price: None,
-                trade_return: None,
-            });
-        }
-
-        self.completed_trades
-    }
-}
-
 /// Run backtest with closure-based data access using i32 dates (days since epoch)
 ///
 /// This allows the caller to provide data accessors without copying data.
@@ -335,12 +149,18 @@ where
             update_positions(&mut portfolio, &today_prices);
 
             // STEP 2: Execute pending stops (from yesterday's detection)
-            execute_pending_stops(
-                &mut portfolio,
-                &mut pending_stop_exits,
-                &mut stopped_stocks,
-                config,
-            );
+            {
+                let mut noop_tracker = NoopSymbolTracker::default();
+                execute_pending_stops_impl(
+                    &mut portfolio,
+                    &mut pending_stop_exits,
+                    &mut stopped_stocks,
+                    &today_prices,
+                    config,
+                    prev_date,
+                    &mut noop_tracker,
+                );
+            }
 
             // STEP 2.5: Detect new stops (schedule for tomorrow's execution)
             // Note: Always detect stops even with default config (stop_loss=1.0)
@@ -353,12 +173,16 @@ where
 
             // STEP 3: Execute pending rebalance
             if let Some(target_weights) = pending_weights.take() {
-                execute_rebalance(
+                let mut noop_tracker = NoopSymbolTracker::default();
+                execute_rebalance_impl(
                     &mut portfolio,
                     &target_weights,
                     &today_prices,
                     &stopped_stocks,
                     config,
+                    prev_date,
+                    prev_date, // signal_date not tracked
+                    &mut noop_tracker,
                 );
                 stopped_stocks.clear();
             }
@@ -460,27 +284,39 @@ where
     }
 
     // Final day
-    if current_date.is_some() && !today_prices.is_empty() {
-        update_positions(&mut portfolio, &today_prices);
+    if let Some(last_date) = current_date {
+        if !today_prices.is_empty() {
+            update_positions(&mut portfolio, &today_prices);
 
-        execute_pending_stops(
-            &mut portfolio,
-            &mut pending_stop_exits,
-            &mut stopped_stocks,
-            config,
-        );
+            {
+                let mut noop_tracker = NoopSymbolTracker::default();
+                execute_pending_stops_impl(
+                    &mut portfolio,
+                    &mut pending_stop_exits,
+                    &mut stopped_stocks,
+                    &today_prices,
+                    config,
+                    last_date,
+                    &mut noop_tracker,
+                );
+            }
 
-        if let Some(target_weights) = pending_weights.take() {
-            execute_rebalance(
-                &mut portfolio,
-                &target_weights,
-                &today_prices,
-                &stopped_stocks,
-                config,
-            );
+            if let Some(target_weights) = pending_weights.take() {
+                let mut noop_tracker = NoopSymbolTracker::default();
+                execute_rebalance_impl(
+                    &mut portfolio,
+                    &target_weights,
+                    &today_prices,
+                    &stopped_stocks,
+                    config,
+                    last_date,
+                    last_date, // signal_date not tracked
+                    &mut noop_tracker,
+                );
+            }
+
+            creturn.push(portfolio.balance());
         }
-
-        creturn.push(portfolio.balance());
     }
 
     BacktestResult {
@@ -555,12 +391,18 @@ pub fn backtest_long_arrow(
             update_positions(&mut portfolio, &today_prices);
 
             // STEP 2: Execute pending stop exits (from yesterday's detection)
-            execute_pending_stops(
-                &mut portfolio,
-                &mut pending_stop_exits,
-                &mut stopped_stocks,
-                config,
-            );
+            {
+                let mut noop_tracker = NoopSymbolTracker::default();
+                execute_pending_stops_impl(
+                    &mut portfolio,
+                    &mut pending_stop_exits,
+                    &mut stopped_stocks,
+                    &today_prices,
+                    config,
+                    prev_date,
+                    &mut noop_tracker,
+                );
+            }
 
             // STEP 2.5: Detect new stops (schedule for tomorrow's execution)
             // Note: Always detect stops even with default config (stop_loss=1.0)
@@ -573,12 +415,16 @@ pub fn backtest_long_arrow(
 
             // STEP 3: Execute pending rebalance (T+1 execution)
             if let Some(target_weights) = pending_weights.take() {
-                execute_rebalance(
+                let mut noop_tracker = NoopSymbolTracker::default();
+                execute_rebalance_impl(
                     &mut portfolio,
                     &target_weights,
                     &today_prices,
                     &stopped_stocks,
                     config,
+                    prev_date,
+                    prev_date, // signal_date not tracked
+                    &mut noop_tracker,
                 );
                 stopped_stocks.clear();
             }
@@ -684,31 +530,43 @@ pub fn backtest_long_arrow(
     }
 
     // Process final day
-    if current_date.is_some() && !today_prices.is_empty() {
-        // STEP 1: Update positions
-        update_positions(&mut portfolio, &today_prices);
+    if let Some(date) = current_date {
+        if !today_prices.is_empty() {
+            // STEP 1: Update positions
+            update_positions(&mut portfolio, &today_prices);
 
-        // STEP 2: Execute pending stops
-        execute_pending_stops(
-            &mut portfolio,
-            &mut pending_stop_exits,
-            &mut stopped_stocks,
-            config,
-        );
+            // STEP 2: Execute pending stops
+            {
+                let mut noop_tracker = NoopSymbolTracker::default();
+                execute_pending_stops_impl(
+                    &mut portfolio,
+                    &mut pending_stop_exits,
+                    &mut stopped_stocks,
+                    &today_prices,
+                    config,
+                    date,
+                    &mut noop_tracker,
+                );
+            }
 
-        // STEP 3: Execute pending rebalance
-        if let Some(target_weights) = pending_weights.take() {
-            execute_rebalance(
-                &mut portfolio,
-                &target_weights,
-                &today_prices,
-                &stopped_stocks,
-                config,
-            );
+            // STEP 3: Execute pending rebalance
+            if let Some(target_weights) = pending_weights.take() {
+                let mut noop_tracker = NoopSymbolTracker::default();
+                execute_rebalance_impl(
+                    &mut portfolio,
+                    &target_weights,
+                    &today_prices,
+                    &stopped_stocks,
+                    config,
+                    date,
+                    date, // signal_date not tracked
+                    &mut noop_tracker,
+                );
+            }
+
+            // STEP 4: Final balance
+            creturn.push(portfolio.balance());
         }
-
-        // STEP 4: Final balance
-        creturn.push(portfolio.balance());
     }
 
     BacktestResult {
@@ -796,15 +654,34 @@ fn update_positions(portfolio: &mut Portfolio, prices: &HashMap<&str, f64>) {
     }
 }
 
-/// Execute pending stop exits
-fn execute_pending_stops(
+/// Execute pending stop exits with optional trade tracking
+///
+/// This is the unified implementation that supports both:
+/// - No tracking: Use `NoopSymbolTracker`
+/// - Trade tracking: Use `SymbolTracker`
+fn execute_pending_stops_impl<T>(
     portfolio: &mut Portfolio,
     pending_stops: &mut Vec<String>,
     stopped_stocks: &mut HashMap<String, bool>,
+    today_prices: &HashMap<&str, f64>,
     config: &BacktestConfig,
-) {
+    current_date: i32,
+    tracker: &mut T,
+)
+where
+    T: TradeTracker<Key = String, Date = i32, Record = LongTradeRecord>,
+{
     for sym in pending_stops.drain(..) {
         if let Some(pos) = portfolio.positions.remove(&sym) {
+            let exit_price = today_prices.get(sym.as_str()).copied().unwrap_or(pos.previous_price);
+            tracker.close_trade(
+                &sym,
+                current_date,
+                None, // Stop exit, no signal date
+                exit_price,
+                config.fee_ratio,
+                config.tax_ratio,
+            );
             let sell_value =
                 pos.last_market_value - pos.last_market_value.abs() * (config.fee_ratio + config.tax_ratio);
             portfolio.cash += sell_value;
@@ -903,275 +780,12 @@ fn detect_stops_string(
 }
 
 /// Execute rebalance with string-keyed positions
-fn execute_rebalance(
-    portfolio: &mut Portfolio,
-    target_weights: &HashMap<String, f64>,
-    today_prices: &HashMap<&str, f64>,
-    stopped_stocks: &HashMap<String, bool>,
-    config: &BacktestConfig,
-) {
-    // Update existing positions to market value
-    for (_sym, pos) in portfolio.positions.iter_mut() {
-        pos.value = pos.last_market_value;
-    }
-
-    // Calculate total balance
-    let balance = portfolio.balance();
-
-    // Finlab behavior: When stop_trading_next_period is true, exclude stopped stocks
-    // from weight calculation and re-normalize remaining weights (like Wide format)
-    let (effective_weights, total_target_weight) = if config.stop_trading_next_period {
-        // Calculate original sum
-        let original_sum: f64 = target_weights.values().map(|w| w.abs()).sum();
-
-        // Filter out stopped stocks
-        let filtered: HashMap<String, f64> = target_weights
-            .iter()
-            .filter(|(sym, _)| !stopped_stocks.get(*sym).copied().unwrap_or(false))
-            .map(|(k, &v)| (k.clone(), v))
-            .collect();
-
-        // Calculate remaining sum
-        let remaining_sum: f64 = filtered.values().map(|w| w.abs()).sum();
-
-        // Re-normalize: scale up remaining weights to maintain full investment
-        if remaining_sum > 0.0 && remaining_sum < original_sum {
-            let scale_factor = original_sum / remaining_sum;
-            let scaled: HashMap<String, f64> = filtered
-                .into_iter()
-                .map(|(k, v)| (k, v * scale_factor))
-                .collect();
-            let new_sum: f64 = scaled.values().map(|w| w.abs()).sum();
-            (scaled, new_sum)
-        } else {
-            (filtered, remaining_sum)
-        }
-    } else {
-        (target_weights.clone(), target_weights.values().map(|w| w.abs()).sum())
-    };
-
-    if total_target_weight == 0.0 || balance <= 0.0 {
-        // Exit all positions
-        let all_positions: Vec<String> = portfolio.positions.keys().cloned().collect();
-        for sym in all_positions {
-            if let Some(pos) = portfolio.positions.remove(&sym) {
-                let sell_value = pos.value - pos.value.abs() * (config.fee_ratio + config.tax_ratio);
-                portfolio.cash += sell_value;
-            }
-        }
-        return;
-    }
-
-    let ratio = balance / total_target_weight.max(1.0);
-
-    // Store old positions (cost basis, market value, and full Position for retain_cost)
-    let old_positions: HashMap<String, f64> = portfolio
-        .positions
-        .iter()
-        .map(|(k, v)| (k.clone(), v.value))
-        .collect();
-    let old_market_values: HashMap<String, f64> = portfolio
-        .positions
-        .iter()
-        .map(|(k, v)| (k.clone(), v.last_market_value))
-        .collect();
-    // Store full Position for retain_cost_when_rebalance
-    let old_full_positions: HashMap<String, Position> = portfolio
-        .positions
-        .iter()
-        .map(|(k, v)| (k.clone(), v.clone()))
-        .collect();
-
-    // Clear and rebuild
-    portfolio.positions.clear();
-    let mut cash = portfolio.cash;
-
-    for (sym, &target_weight) in &effective_weights {
-        // Note: stopped stocks are already filtered out in effective_weights when
-        // stop_trading_next_period is true
-
-        // Get price and check validity
-        let price_opt = today_prices.get(sym.as_str()).copied();
-        let price_valid = price_opt.map_or(false, |p| p > 0.0 && !p.is_nan());
-
-        // Target position value (scaled by ratio)
-        let target_value = target_weight * ratio;
-        let current_value = old_positions.get(sym).copied().unwrap_or(0.0);
-
-        // Handle NaN price case (match Finlab behavior: enter even with NaN price)
-        if !price_valid {
-            // If target is 0 and we have an old position, sell it using old market value
-            if target_weight.abs() < 1e-10 {
-                if let Some(&old_mv) = old_market_values.get(sym) {
-                    if old_mv.abs() > 1e-10 {
-                        let sell_fee = old_mv.abs() * (config.fee_ratio + config.tax_ratio);
-                        cash += old_mv - sell_fee;
-                    }
-                }
-                continue;
-            }
-
-            // Finlab behavior: Enter/modify position even with NaN price
-            if target_value.abs() > 1e-10 {
-                let amount = target_value - current_value;
-                let is_buy = amount > 0.0;
-                let is_entry =
-                    (target_value >= 0.0 && amount > 0.0) || (target_value <= 0.0 && amount < 0.0);
-                let cost = if is_entry {
-                    amount.abs() * config.fee_ratio
-                } else {
-                    amount.abs() * (config.fee_ratio + config.tax_ratio)
-                };
-
-                let new_value = if is_buy {
-                    cash -= amount;
-                    current_value + amount - cost
-                } else {
-                    let sell_amount = amount.abs();
-                    cash += sell_amount - cost;
-                    current_value - sell_amount
-                };
-
-                if new_value.abs() > 1e-10 {
-                    portfolio.positions.insert(
-                        sym.clone(),
-                        Position::new_with_nan_price(new_value),
-                    );
-                }
-            }
-            continue;
-        }
-
-        // Valid price case: exit position if target is 0
-        if target_weight.abs() < 1e-10 {
-            if current_value.abs() > 1e-10 {
-                let sell_fee = current_value.abs() * (config.fee_ratio + config.tax_ratio);
-                cash += current_value - sell_fee;
-            }
-            continue;
-        }
-
-        let price = price_opt.unwrap();
-        let amount = target_value - current_value;
-
-        let is_buy = amount > 0.0;
-        let is_entry = (target_value >= 0.0 && amount > 0.0) || (target_value <= 0.0 && amount < 0.0);
-        let cost = if is_entry {
-            amount.abs() * config.fee_ratio
-        } else {
-            amount.abs() * (config.fee_ratio + config.tax_ratio)
-        };
-
-        let new_position_value = if is_buy {
-            cash -= amount;
-            current_value + amount - cost
-        } else {
-            let sell_amount = amount.abs();
-            cash += sell_amount - cost;
-            current_value - sell_amount
-        };
-
-        if new_position_value.abs() > 1e-10 {
-            // Determine if this is a continuing same-direction position
-            let old_value = old_positions.get(sym).copied().unwrap_or(0.0);
-            let is_continuing = old_value.abs() > 1e-10 && old_value * target_weight > 0.0;
-
-            let new_pos = if config.retain_cost_when_rebalance && is_continuing {
-                // Preserve stop tracking for continuing same-direction positions
-                if let Some(old_pos) = old_full_positions.get(sym) {
-                    Position::new_with_preserved_tracking(new_position_value, price, old_pos)
-                } else {
-                    Position::new(new_position_value, price)
-                }
-            } else {
-                // New position or direction change or retain_cost=False: reset all
-                Position::new(new_position_value, price)
-            };
-
-            portfolio.positions.insert(sym.clone(), new_pos);
-        }
-    }
-
-    // Handle positions outside effective_weights (which has stopped stocks filtered)
-    for (sym, &old_value) in old_positions.iter() {
-        if !effective_weights.contains_key(sym) && old_value.abs() > 1e-10 {
-            let sell_fee = old_value.abs() * (config.fee_ratio + config.tax_ratio);
-            cash += old_value - sell_fee;
-        }
-    }
-
-    portfolio.cash = cash;
-}
-
-/// Check if two weight maps differ (for PositionChange mode)
+/// Execute portfolio rebalance with optional trade tracking
 ///
-/// Two weight maps differ if:
-/// 1. They have different keys (symbols)
-/// 2. Any corresponding weights differ by more than 1e-10
-fn weights_differ(a: &HashMap<String, f64>, b: &HashMap<String, f64>) -> bool {
-    // Different number of symbols
-    if a.len() != b.len() {
-        return true;
-    }
-
-    // Check each symbol
-    for (sym, &weight_a) in a.iter() {
-        match b.get(sym) {
-            Some(&weight_b) => {
-                if (weight_a - weight_b).abs() > 1e-10 {
-                    return true;
-                }
-            }
-            None => return true, // Symbol in a but not in b
-        }
-    }
-
-    false
-}
-
-/// Normalize weights using Finlab's behavior
-fn normalize_weights(
-    weights: &HashMap<&str, f64>,
-    stopped_stocks: &HashMap<String, bool>,
-    position_limit: f64,
-) -> HashMap<String, f64> {
-    // Filter out stopped stocks and zero weights
-    let filtered: Vec<(&str, f64)> = weights
-        .iter()
-        .filter(|(sym, w)| {
-            // sym is &&str, *sym is &str
-            // stopped_stocks.get() takes &Q where String: Borrow<Q>
-            // String: Borrow<str>, so we need to pass &str
-            let is_stopped = stopped_stocks.get::<str>(*sym).copied().unwrap_or(false);
-            w.abs() > 1e-10 && !is_stopped
-        })
-        .map(|(&sym, &w)| (sym, w))
-        .collect();
-
-    if filtered.is_empty() {
-        return HashMap::new();
-    }
-
-    // Finlab normalization: divisor = max(abs_sum, 1.0)
-    let abs_sum: f64 = filtered.iter().map(|(_, w)| w.abs()).sum();
-    let divisor = abs_sum.max(1.0);
-
-    filtered
-        .into_iter()
-        .map(|(sym, w)| {
-            let norm_w = w / divisor;
-            let clipped = norm_w.clamp(-position_limit, position_limit);
-            (sym.to_string(), clipped)
-        })
-        .collect()
-}
-
-// ============================================================================
-// Backtest with trade tracking
-// ============================================================================
-
-/// Execute rebalance with trade tracking
-fn execute_rebalance_with_tracker<T: StringTradeTracker>(
+/// This is the unified implementation that supports both:
+/// - No tracking: Use `NoopSymbolTracker`
+/// - Trade tracking: Use `SymbolTracker`
+fn execute_rebalance_impl<T>(
     portfolio: &mut Portfolio,
     target_weights: &HashMap<String, f64>,
     today_prices: &HashMap<&str, f64>,
@@ -1180,7 +794,10 @@ fn execute_rebalance_with_tracker<T: StringTradeTracker>(
     current_date: i32,
     signal_date: i32,
     tracker: &mut T,
-) {
+)
+where
+    T: TradeTracker<Key = String, Date = i32, Record = LongTradeRecord>,
+{
     // Update existing positions to market value
     for (_sym, pos) in portfolio.positions.iter_mut() {
         pos.value = pos.last_market_value;
@@ -1327,7 +944,7 @@ fn execute_rebalance_with_tracker<T: StringTradeTracker>(
                 if new_value.abs() > 1e-10 {
                     // Open trade if this is a new position
                     if !had_position {
-                        tracker.open_trade(sym, current_date, signal_date, f64::NAN, target_weight);
+                        tracker.open_trade(sym.clone(), current_date, signal_date, f64::NAN, target_weight);
                     }
                     portfolio.positions.insert(
                         sym.clone(),
@@ -1382,11 +999,12 @@ fn execute_rebalance_with_tracker<T: StringTradeTracker>(
         if new_position_value.abs() > 1e-10 {
             // Open trade if this is a new position
             if !had_position {
-                tracker.open_trade(sym, current_date, signal_date, price, target_weight);
+                tracker.open_trade(sym.clone(), current_date, signal_date, price, target_weight);
             }
 
             // Determine if this is a continuing same-direction position
-            let is_continuing = had_position && current_value * target_weight > 0.0;
+            let old_value = old_positions.get(sym).copied().unwrap_or(0.0);
+            let is_continuing = old_value.abs() > 1e-10 && old_value * target_weight > 0.0;
 
             let new_pos = if config.retain_cost_when_rebalance && is_continuing {
                 // Preserve stop tracking for continuing same-direction positions
@@ -1405,7 +1023,6 @@ fn execute_rebalance_with_tracker<T: StringTradeTracker>(
     }
 
     // Handle positions outside effective_weights (close all)
-    // Note: stopped stocks are already filtered out, so they will be sold here
     for (sym, &old_value) in old_positions.iter() {
         if !effective_weights.contains_key(sym) && old_value.abs() > 1e-10 {
             let exit_price = today_prices.get(sym.as_str()).copied().unwrap_or(f64::NAN);
@@ -1425,36 +1042,72 @@ fn execute_rebalance_with_tracker<T: StringTradeTracker>(
     portfolio.cash = cash;
 }
 
-/// Execute pending stop exits with trade tracking
-fn execute_pending_stops_with_tracker<T: StringTradeTracker>(
-    portfolio: &mut Portfolio,
-    pending_stops: &mut Vec<String>,
-    stopped_stocks: &mut HashMap<String, bool>,
-    today_prices: &HashMap<&str, f64>,
-    config: &BacktestConfig,
-    current_date: i32,
-    tracker: &mut T,
-) {
-    for sym in pending_stops.drain(..) {
-        if let Some(pos) = portfolio.positions.remove(&sym) {
-            let exit_price = today_prices.get(sym.as_str()).copied().unwrap_or(pos.previous_price);
-            tracker.close_trade(
-                &sym,
-                current_date,
-                None, // Stop exit, no signal date
-                exit_price,
-                config.fee_ratio,
-                config.tax_ratio,
-            );
-            let sell_value =
-                pos.last_market_value - pos.last_market_value.abs() * (config.fee_ratio + config.tax_ratio);
-            portfolio.cash += sell_value;
-            if config.stop_trading_next_period {
-                stopped_stocks.insert(sym, true);
+/// Check if two weight maps differ (for PositionChange mode)
+///
+/// Two weight maps differ if:
+/// 1. They have different keys (symbols)
+/// 2. Any corresponding weights differ by more than 1e-10
+fn weights_differ(a: &HashMap<String, f64>, b: &HashMap<String, f64>) -> bool {
+    // Different number of symbols
+    if a.len() != b.len() {
+        return true;
+    }
+
+    // Check each symbol
+    for (sym, &weight_a) in a.iter() {
+        match b.get(sym) {
+            Some(&weight_b) => {
+                if (weight_a - weight_b).abs() > 1e-10 {
+                    return true;
+                }
             }
+            None => return true, // Symbol in a but not in b
         }
     }
+
+    false
 }
+
+/// Normalize weights using Finlab's behavior
+fn normalize_weights(
+    weights: &HashMap<&str, f64>,
+    stopped_stocks: &HashMap<String, bool>,
+    position_limit: f64,
+) -> HashMap<String, f64> {
+    // Filter out stopped stocks and zero weights
+    let filtered: Vec<(&str, f64)> = weights
+        .iter()
+        .filter(|(sym, w)| {
+            // sym is &&str, *sym is &str
+            // stopped_stocks.get() takes &Q where String: Borrow<Q>
+            // String: Borrow<str>, so we need to pass &str
+            let is_stopped = stopped_stocks.get::<str>(*sym).copied().unwrap_or(false);
+            w.abs() > 1e-10 && !is_stopped
+        })
+        .map(|(&sym, &w)| (sym, w))
+        .collect();
+
+    if filtered.is_empty() {
+        return HashMap::new();
+    }
+
+    // Finlab normalization: divisor = max(abs_sum, 1.0)
+    let abs_sum: f64 = filtered.iter().map(|(_, w)| w.abs()).sum();
+    let divisor = abs_sum.max(1.0);
+
+    filtered
+        .into_iter()
+        .map(|(sym, w)| {
+            let norm_w = w / divisor;
+            let clipped = norm_w.clamp(-position_limit, position_limit);
+            (sym.to_string(), clipped)
+        })
+        .collect()
+}
+
+// ============================================================================
+// Backtest with trade tracking
+// ============================================================================
 
 /// Run backtest on Arrow arrays with trade tracking
 ///
@@ -1474,7 +1127,7 @@ pub fn backtest_with_trades_long_arrow(
 
     let mut portfolio = Portfolio::new();
     let mut creturn: Vec<f64> = Vec::new();
-    let mut tracker = RealStringTracker::new();
+    let mut tracker = SymbolTracker::new();
 
     // Track stopped stocks by symbol string
     let mut stopped_stocks: HashMap<String, bool> = HashMap::new();
@@ -1513,7 +1166,7 @@ pub fn backtest_with_trades_long_arrow(
             update_positions(&mut portfolio, &today_prices);
 
             // STEP 2: Execute pending stop exits (from yesterday's detection)
-            execute_pending_stops_with_tracker(
+            execute_pending_stops_impl(
                 &mut portfolio,
                 &mut pending_stop_exits,
                 &mut stopped_stocks,
@@ -1535,7 +1188,7 @@ pub fn backtest_with_trades_long_arrow(
             // STEP 3: Execute pending rebalance (T+1 execution)
             if let Some(target_weights) = pending_weights.take() {
                 let sig_date = pending_signal_date.take().unwrap_or(prev_date);
-                execute_rebalance_with_tracker(
+                execute_rebalance_impl(
                     &mut portfolio,
                     &target_weights,
                     &today_prices,
@@ -1654,7 +1307,7 @@ pub fn backtest_with_trades_long_arrow(
             update_positions(&mut portfolio, &today_prices);
 
             // STEP 2: Execute pending stops
-            execute_pending_stops_with_tracker(
+            execute_pending_stops_impl(
                 &mut portfolio,
                 &mut pending_stop_exits,
                 &mut stopped_stocks,
@@ -1667,7 +1320,7 @@ pub fn backtest_with_trades_long_arrow(
             // STEP 3: Execute pending rebalance
             if let Some(target_weights) = pending_weights.take() {
                 let sig_date = pending_signal_date.take().unwrap_or(last_date);
-                execute_rebalance_with_tracker(
+                execute_rebalance_impl(
                     &mut portfolio,
                     &target_weights,
                     &today_prices,

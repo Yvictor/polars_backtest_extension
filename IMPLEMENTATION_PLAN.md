@@ -643,6 +643,147 @@ df (long) ──► PyDataFrame ──► cont_slice() ──► columnar backte
 
 ---
 
+## Stage 5: Unify TradeTracker and Eliminate Code Duplication
+
+**Goal**: 統一 `TradeTracker` (wide) 和 `StringTradeTracker` (long)，消除 long.rs 中 ~400 行重複代碼
+**Status**: In Progress
+
+### 5.1: Unify TradeTracker Trait
+
+**Files**: `btcore/src/tracker.rs`, `btcore/src/simulation/long.rs`
+
+**問題**: 兩個幾乎相同的 trait
+
+| Trait | Key Type | Date Type | Output |
+|-------|----------|-----------|--------|
+| `TradeTracker` (tracker.rs) | `usize` | `usize` | `TradeRecord` |
+| `StringTradeTracker` (long.rs) | `&str` | `i32` | `LongTradeRecord` |
+
+**解決方案**: 使用 Associated Types 統一
+
+```rust
+// tracker.rs - 統一的 trait
+pub trait TradeTracker {
+    type Key;    // usize (Wide) or String (Long)
+    type Date;   // usize (Wide) or i32 (Long)
+    type Record; // TradeRecord or LongTradeRecord
+
+    fn new() -> Self where Self: Sized;
+    fn open_trade(&mut self, key: Self::Key, entry_date: Self::Date, signal_date: Self::Date, price: f64, weight: f64);
+    fn close_trade(&mut self, key: &Self::Key, exit_date: Self::Date, exit_sig_date: Option<Self::Date>, price: f64, fee: f64, tax: f64);
+    fn has_open_trade(&self, key: &Self::Key) -> bool;
+    fn add_pending_entry(&mut self, key: Self::Key, signal_date: Self::Date, weight: f64);
+    fn finalize(self, fee_ratio: f64, tax_ratio: f64) -> Vec<Self::Record>;
+}
+
+// 實作
+pub struct NoopTracker;                           // 零開銷
+pub struct IndexTracker { ... }                   // Wide: Key=usize, Date=usize
+pub struct SymbolTracker { ... }                  // Long: Key=String, Date=i32
+```
+
+**Tasks**:
+- [ ] 修改 `TradeTracker` trait 使用 Associated Types
+- [ ] 實作 `NoopTracker` (泛型零開銷)
+- [ ] 重命名/重構 `RealTracker` → `IndexTracker`
+- [ ] 將 `RealStringTracker` 移至 tracker.rs 並重命名為 `SymbolTracker`
+- [ ] 刪除 `StringTradeTracker` trait 和 `NoopStringTracker`
+
+**Success Criteria**:
+- [ ] `cargo check -p btcore` passes
+- [ ] `cargo test -p btcore` passes
+
+---
+
+### 5.2: Unify Long Format Simulation
+
+**Files**: `btcore/src/simulation/long.rs`
+
+**問題**: 大量重複代碼
+
+| Function | Lines | 功能 |
+|----------|-------|------|
+| `backtest_long_arrow` | ~220 | No trades |
+| `backtest_with_trades_long_arrow` | ~220 | With trades (重複!) |
+| `execute_rebalance` | ~170 | No tracking |
+| `execute_rebalance_with_tracker` | ~220 | With tracking (重複!) |
+| `execute_pending_stops` | ~20 | No tracking |
+| `execute_pending_stops_with_tracker` | ~35 | With tracking (重複!) |
+
+**解決方案**: 使用泛型統一
+
+```rust
+// 統一的 helper functions
+fn execute_rebalance<T: TradeTracker<Key=String, Date=i32>>(
+    portfolio: &mut Portfolio,
+    target_weights: &HashMap<String, f64>,
+    today_prices: &HashMap<&str, f64>,
+    stopped_stocks: &HashMap<String, bool>,
+    config: &BacktestConfig,
+    current_date: i32,
+    signal_date: i32,
+    tracker: &mut T,
+) { ... }
+
+// 統一的核心模擬
+fn simulate_backtest_long<T: TradeTracker<Key=String, Date=i32>>(
+    input: &LongFormatArrowInput,
+    resample: ResampleFreq,
+    config: &BacktestConfig,
+    tracker: &mut T,
+) -> Vec<f64> { ... }
+
+// 公開 API
+pub fn backtest_long_arrow(...) -> BacktestResult {
+    let mut tracker = NoopTracker;
+    let creturn = simulate_backtest_long(..., &mut tracker);
+    BacktestResult { creturn, trades: vec![] }
+}
+
+pub fn backtest_with_trades_long_arrow(...) -> LongBacktestResult {
+    let mut tracker = SymbolTracker::new();
+    let creturn = simulate_backtest_long(..., &mut tracker);
+    LongBacktestResult { creturn, trades: tracker.finalize(...) }
+}
+```
+
+**Tasks**:
+- [ ] 統一 `execute_rebalance` 和 `execute_rebalance_with_tracker`
+- [ ] 統一 `execute_pending_stops` 和 `execute_pending_stops_with_tracker`
+- [ ] 建立 `simulate_backtest_long<T>` 泛型函數
+- [ ] 重構 `backtest_long_arrow` 使用泛型版本
+- [ ] 重構 `backtest_with_trades_long_arrow` 使用泛型版本
+- [ ] 刪除重複的 `*_with_tracker` 函數
+
+**Success Criteria**:
+- [ ] `cargo check -p btcore` passes
+- [ ] `cargo test -p btcore` passes
+- [ ] 減少 ~400 行重複代碼
+
+---
+
+### 5.3: Fix Failing Tests
+
+**Files**: `tests/test_long_format.py`
+
+**test_trades_match**:
+- Wide: 6430 trades vs Long: 5729 trades (10.9% diff)
+- 需在 Stage 5.2 後調查
+
+**test_polars_rolling_null**:
+- Expected null count > 0, got 0
+- 測試假設可能錯誤
+
+**Tasks**:
+- [ ] 調查 trades count 差異根本原因
+- [ ] 修復或調整 `test_trades_match`
+- [ ] 修復或調整 `test_polars_rolling_null`
+
+**Success Criteria**:
+- [ ] `uv run pytest tests/test_long_format.py -v` all pass
+
+---
+
 ## Notes
 
 1. **Backward Compatibility**: 保留 `backtest_with_report()` 函數，標記為 deprecated
