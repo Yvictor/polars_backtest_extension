@@ -59,6 +59,12 @@ pub struct LongFormatArrowInput<'a> {
     pub prices: &'a Float64Array,
     /// Target weights
     pub weights: &'a Float64Array,
+    /// Open prices for touched_exit (optional)
+    pub open_prices: Option<&'a Float64Array>,
+    /// High prices for touched_exit (optional)
+    pub high_prices: Option<&'a Float64Array>,
+    /// Low prices for touched_exit (optional)
+    pub low_prices: Option<&'a Float64Array>,
 }
 
 /// Resample frequency for rebalancing
@@ -87,6 +93,18 @@ impl ResampleFreq {
     }
 }
 
+/// Optional OHLC getters for touched_exit mode
+pub struct OhlcGetters<FO, FH, FL>
+where
+    FO: Fn(usize) -> f64,
+    FH: Fn(usize) -> f64,
+    FL: Fn(usize) -> f64,
+{
+    pub get_open: FO,
+    pub get_high: FH,
+    pub get_low: FL,
+}
+
 /// Core backtest implementation with closure-based data access and generic tracker
 ///
 /// This is the unified core that all backtest functions use.
@@ -104,7 +122,8 @@ impl ResampleFreq {
 /// * `resample` - Rebalancing frequency
 /// * `config` - Backtest configuration
 /// * `tracker` - Trade tracker (use NoopSymbolTracker::default() for no tracking)
-fn backtest_impl<'a, FD, FS, FP, FW, T>(
+/// * `ohlc` - Optional OHLC getters for touched_exit mode
+fn backtest_impl<'a, FD, FS, FP, FW, T, FO, FH, FL>(
     n_rows: usize,
     get_date: FD,
     get_symbol: FS,
@@ -113,12 +132,16 @@ fn backtest_impl<'a, FD, FS, FP, FW, T>(
     resample: ResampleFreq,
     config: &BacktestConfig,
     tracker: &mut T,
+    ohlc: Option<OhlcGetters<FO, FH, FL>>,
 ) -> Vec<f64>
 where
     FD: Fn(usize) -> i32,
     FS: Fn(usize) -> &'a str,
     FP: Fn(usize) -> f64,
     FW: Fn(usize) -> f64,
+    FO: Fn(usize) -> f64,
+    FH: Fn(usize) -> f64,
+    FL: Fn(usize) -> f64,
     T: TradeTracker<Key = String, Date = i32, Record = LongTradeRecord>,
 {
     if n_rows == 0 {
@@ -138,6 +161,12 @@ where
     let mut today_prices: HashMap<&str, f64> = HashMap::new();
     let mut today_weights: HashMap<&str, f64> = HashMap::new();
 
+    // OHLC data for touched_exit mode
+    let mut today_open: HashMap<&str, f64> = HashMap::new();
+    let mut today_high: HashMap<&str, f64> = HashMap::new();
+    let mut today_low: HashMap<&str, f64> = HashMap::new();
+    let touched_exit_enabled = config.touched_exit && ohlc.is_some();
+
     for i in 0..n_rows {
         let date = get_date(i);
         let symbol = get_symbol(i);
@@ -149,25 +178,54 @@ where
         if date_changed && current_date.is_some() {
             let prev_date = current_date.unwrap();
 
-            // STEP 1: Update positions
+            // STEP 1: Update positions (cr *= r, maxcr update)
             update_positions(&mut portfolio, &today_prices);
 
-            // STEP 2: Execute pending stops (from yesterday's detection)
-            execute_pending_stops_impl(
-                &mut portfolio,
-                &mut pending_stop_exits,
-                &mut stopped_stocks,
-                &today_prices,
-                config,
-                prev_date,
-                tracker,
-            );
+            // STEP 2: Stop detection and execution
+            if touched_exit_enabled {
+                // touched_exit mode: detect and execute IMMEDIATELY (T+0)
+                let ohlc_refs = Some((&today_open, &today_high, &today_low));
+                let stops = detect_stops_unified(&portfolio, &today_prices, ohlc_refs, config);
+                execute_stops_impl(
+                    &mut portfolio,
+                    stops,
+                    &mut stopped_stocks,
+                    &today_prices,
+                    config,
+                    prev_date,
+                    Some(prev_date), // exit_sig_date = current date (same day)
+                    tracker,
+                );
+                // Clear pending stops (not used in touched_exit mode)
+                pending_stop_exits.clear();
+            } else {
+                // Regular mode: execute pending stops (T+1), then detect new stops
+                // Execute pending stops from yesterday's detection
+                let pending_results: Vec<StopResult> = pending_stop_exits
+                    .drain(..)
+                    .map(|sym| StopResult { symbol: sym, exit_ratio: 1.0 })
+                    .collect();
+                execute_stops_impl(
+                    &mut portfolio,
+                    pending_results,
+                    &mut stopped_stocks,
+                    &today_prices,
+                    config,
+                    prev_date,
+                    None, // No exit_sig_date for regular stops
+                    tracker,
+                );
 
-            // STEP 2.5: Detect new stops (schedule for tomorrow's execution)
-            {
-                let new_stops = detect_stops_string(&portfolio, &today_prices, config);
-                pending_stop_exits.extend(new_stops);
+                // Detect new stops for tomorrow's execution
+                let new_stops = detect_stops_unified(&portfolio, &today_prices, None, config);
+                for stop in new_stops {
+                    pending_stop_exits.push(stop.symbol);
+                }
             }
+
+            // Update previous_price AFTER stop detection (matches wide format behavior)
+            // This ensures touched_exit uses the correct previous_price for ratio calculations
+            update_previous_prices(&mut portfolio, &today_prices);
 
             // STEP 3: Execute pending rebalance
             if let Some(target_weights) = pending_weights.take() {
@@ -252,6 +310,11 @@ where
 
             today_prices.clear();
             today_weights.clear();
+            if touched_exit_enabled {
+                today_open.clear();
+                today_high.clear();
+                today_low.clear();
+            }
         }
 
         current_date = Some(date);
@@ -261,6 +324,12 @@ where
         if !weight.is_nan() && weight.abs() > 1e-10 {
             today_weights.insert(symbol, weight);
         }
+        // Collect OHLC data AFTER date_changed processing (for correct date)
+        if let Some(ref ohlc_getters) = ohlc {
+            today_open.insert(symbol, (ohlc_getters.get_open)(i));
+            today_high.insert(symbol, (ohlc_getters.get_high)(i));
+            today_low.insert(symbol, (ohlc_getters.get_low)(i));
+        }
     }
 
     // Final day
@@ -268,15 +337,36 @@ where
         if !today_prices.is_empty() {
             update_positions(&mut portfolio, &today_prices);
 
-            execute_pending_stops_impl(
-                &mut portfolio,
-                &mut pending_stop_exits,
-                &mut stopped_stocks,
-                &today_prices,
-                config,
-                last_date,
-                tracker,
-            );
+            // Stop detection and execution (same logic as main loop)
+            if touched_exit_enabled {
+                // touched_exit mode: detect and execute immediately (T+0)
+                let ohlc_refs = Some((&today_open, &today_high, &today_low));
+                let stops = detect_stops_unified(&portfolio, &today_prices, ohlc_refs, config);
+                execute_stops_impl(
+                    &mut portfolio,
+                    stops,
+                    &mut stopped_stocks,
+                    &today_prices,
+                    config,
+                    last_date,
+                    Some(last_date),
+                    tracker,
+                );
+            } else {
+                // Regular mode: execute pending stops (T+1)
+                execute_pending_stops_impl(
+                    &mut portfolio,
+                    &mut pending_stop_exits,
+                    &mut stopped_stocks,
+                    &today_prices,
+                    config,
+                    last_date,
+                    tracker,
+                );
+            }
+
+            // Update previous_price AFTER stop detection
+            update_previous_prices(&mut portfolio, &today_prices);
 
             if let Some(target_weights) = pending_weights.take() {
                 let sig_date = pending_signal_date.take().unwrap_or(last_date);
@@ -325,6 +415,7 @@ where
     FW: Fn(usize) -> f64,
 {
     let mut tracker = NoopSymbolTracker::default();
+    let ohlc: Option<OhlcGetters<fn(usize) -> f64, fn(usize) -> f64, fn(usize) -> f64>> = None;
     let creturn = backtest_impl(
         n_rows,
         get_date,
@@ -334,6 +425,7 @@ where
         resample,
         config,
         &mut tracker,
+        ohlc,
     );
     BacktestResult {
         creturn,
@@ -427,7 +519,10 @@ fn days_to_year_month(days: i32) -> (i32, u32) {
     (year, m)
 }
 
-/// Update positions with daily returns
+/// Update positions with daily returns (cr *= r, maxcr, last_market_value, max_price)
+///
+/// NOTE: Does NOT update previous_price - call update_previous_prices separately
+/// after touched_exit detection. This matches wide format behavior.
 fn update_positions(portfolio: &mut Portfolio, prices: &HashMap<&str, f64>) {
     for (sym, pos) in portfolio.positions.iter_mut() {
         if let Some(&curr_price) = prices.get(sym.as_str()) {
@@ -441,6 +536,21 @@ fn update_positions(portfolio: &mut Portfolio, prices: &HashMap<&str, f64>) {
                     pos.max_price = curr_price;
                 }
                 pos.maxcr = pos.maxcr.max(pos.cr);
+                // NOTE: previous_price is NOT updated here.
+                // Call update_previous_prices after detect_touched_exit.
+            }
+        }
+    }
+}
+
+/// Update previous_price for all positions after touched_exit detection
+///
+/// This should be called AFTER update_positions and detect_stops_unified
+/// to properly track price history for the next day's calculations.
+fn update_previous_prices(portfolio: &mut Portfolio, prices: &HashMap<&str, f64>) {
+    for (sym, pos) in portfolio.positions.iter_mut() {
+        if let Some(&curr_price) = prices.get(sym.as_str()) {
+            if curr_price > 0.0 && !curr_price.is_nan() {
                 pos.previous_price = curr_price;
             }
         }
@@ -485,91 +595,176 @@ where
     }
 }
 
-/// Detect stops for string-keyed positions (Finlab mode)
+/// Stop detection result with optional exit ratio for touched_exit mode
+#[derive(Debug, Clone)]
+pub struct StopResult {
+    pub symbol: String,
+    /// Exit ratio for touched_exit (position value multiplier), 1.0 for regular stops
+    pub exit_ratio: f64,
+}
+
+/// Unified stop detection that handles both regular stops and touched_exit mode
 ///
-/// Returns list of symbols that should be stopped out.
-/// Accepts prices to match Finlab's floating point behavior (cr_at_close = cr * price / price).
-fn detect_stops_string(
+/// For regular stops (ohlc = None): Uses close price only, exit_ratio = 1.0
+/// For touched_exit (ohlc = Some): Uses OHLC prices, exit_ratio adjusted to touched price
+fn detect_stops_unified(
     portfolio: &Portfolio,
-    prices: &HashMap<&str, f64>,
+    close_prices: &HashMap<&str, f64>,
+    ohlc: Option<(&HashMap<&str, f64>, &HashMap<&str, f64>, &HashMap<&str, f64>)>,
     config: &BacktestConfig,
-) -> Vec<String> {
-    let mut stopped = Vec::new();
+) -> Vec<StopResult> {
+    let mut results = Vec::new();
 
     for (sym, pos) in portfolio.positions.iter() {
-        // Get current price for this symbol
-        let current_price = prices.get(sym.as_str()).copied().unwrap_or(0.0);
+        let sym_str = sym.as_str();
 
-        // Skip if price is invalid
-        if current_price <= 0.0 || current_price.is_nan() {
+        // Get current close price
+        let close_price = close_prices.get(sym_str).copied().unwrap_or(0.0);
+        if close_price <= 0.0 || close_price.is_nan() {
             continue;
         }
 
-        // Use last_market_value to determine long/short (like Wide format)
         let is_long = pos.last_market_value >= 0.0;
         let cr = pos.cr;
         let maxcr = pos.maxcr;
 
-        // Finlab uses cr_at_close = cr * close / price for stop detection (line 387)
-        // Even when close == price (both adj_close), the multiply-divide operation
-        // affects floating point precision, which matters at exact threshold boundaries.
-        let cr_at_close = cr * current_price / current_price;
-
-        if is_long {
-            // Long positions:
-            //   max_r = 1 + take_profit
-            //   min_r = max(1 - stop_loss, maxcr - trail_stop)
-            // Trigger: cr >= max_r (take profit) or cr < min_r (stop loss/trail)
-
-            // Check take profit
-            if config.take_profit < f64::INFINITY && cr_at_close >= 1.0 + config.take_profit {
-                stopped.push(sym.clone());
-                continue;
-            }
-
-            // Calculate min_r using Finlab formula
+        // Calculate thresholds
+        let (min_r, max_r) = if is_long {
             let stop_threshold = 1.0 - config.stop_loss;
             let trail_threshold = if config.trail_stop < f64::INFINITY {
                 maxcr - config.trail_stop
             } else {
                 f64::NEG_INFINITY
             };
-            let min_r = stop_threshold.max(trail_threshold);
-
-            // Check stop loss or trailing stop (Finlab uses < not <=)
-            if cr_at_close < min_r {
-                stopped.push(sym.clone());
-            }
+            (stop_threshold.max(trail_threshold), 1.0 + config.take_profit)
         } else {
-            // Short positions:
-            //   max_r = min(1 + stop_loss, maxcr + trail_stop)
-            //   min_r = 1 - take_profit
-            // Trigger: cr >= max_r (stop loss/trail) or cr < min_r (take profit)
-
-            // Calculate max_r for short positions
             let stop_threshold = 1.0 + config.stop_loss;
             let trail_threshold = if config.trail_stop < f64::INFINITY {
                 maxcr + config.trail_stop
             } else {
                 f64::INFINITY
             };
-            let max_r = stop_threshold.min(trail_threshold);
+            (1.0 - config.take_profit, stop_threshold.min(trail_threshold))
+        };
 
-            // Check stop loss or trailing stop
-            if cr_at_close >= max_r {
-                stopped.push(sym.clone());
+        // Handle touched_exit mode with OHLC
+        if let Some((open_prices, high_prices, low_prices)) = ohlc {
+            let open_price = open_prices.get(sym_str).copied().unwrap_or(f64::NAN);
+            let high_price = high_prices.get(sym_str).copied().unwrap_or(f64::NAN);
+            let low_price = low_prices.get(sym_str).copied().unwrap_or(f64::NAN);
+            let prev_price = pos.previous_price;
+
+            // Skip if OHLC invalid
+            if open_price.is_nan() || high_price.is_nan() || low_price.is_nan()
+                || prev_price <= 0.0 || cr.is_nan() || cr <= 0.0
+            {
                 continue;
             }
 
-            // Check take profit for short
-            let min_r = 1.0 - config.take_profit;
-            if config.take_profit < f64::INFINITY && cr_at_close < min_r {
-                stopped.push(sym.clone());
+            let r = close_price / prev_price;
+            if r.is_nan() || r <= 0.0 {
+                continue;
+            }
+
+            // Finlab formulas (lines 342-344 of backtest_core.pyx):
+            // open_r = cr[sid] / r * (open / prev)  = cr_old * (open / prev)
+            // high_r = cr[sid] / r * (high / prev)  = cr_old * (high / prev)
+            // low_r  = cr[sid] / r * (low / prev)   = cr_old * (low / prev)
+            //
+            // We compute in the EXACT same order as Finlab to ensure
+            // identical floating point behavior.
+            let open_r = cr / r * (open_price / prev_price);
+            let high_r = cr / r * (high_price / prev_price);
+            let low_r = cr / r * (low_price / prev_price);
+
+            // Check touch conditions (Finlab lines 348-350)
+            // NOTE: Uses <= for min_r (not <) to match Finlab's behavior
+            let touch_open = open_r >= max_r || open_r <= min_r;
+            let touch_high = high_r >= max_r;
+            let touch_low = low_r <= min_r;
+
+            // Priority: open > high > low (Finlab lines 354-380)
+            // Exit ratio adjusts pos[sid] to touched price level
+            if touch_open {
+                // Finlab: pos[sid] *= open_r / r
+                results.push(StopResult { symbol: sym.clone(), exit_ratio: open_r / r });
+            } else if touch_high {
+                // Finlab: pos[sid] = entry_pos * max_r = pos / cr * max_r
+                results.push(StopResult { symbol: sym.clone(), exit_ratio: max_r / cr });
+            } else if touch_low {
+                // Finlab: pos[sid] = entry_pos * min_r = pos / cr * min_r
+                results.push(StopResult { symbol: sym.clone(), exit_ratio: min_r / cr });
+            }
+        } else {
+            // Regular stop detection (close price only)
+            let cr_at_close = cr * close_price / close_price; // Finlab floating point behavior
+
+            if is_long {
+                if config.take_profit < f64::INFINITY && cr_at_close >= max_r {
+                    results.push(StopResult { symbol: sym.clone(), exit_ratio: 1.0 });
+                    continue;
+                }
+                if cr_at_close < min_r {
+                    results.push(StopResult { symbol: sym.clone(), exit_ratio: 1.0 });
+                }
+            } else {
+                if cr_at_close >= max_r {
+                    results.push(StopResult { symbol: sym.clone(), exit_ratio: 1.0 });
+                    continue;
+                }
+                if config.take_profit < f64::INFINITY && cr_at_close < min_r {
+                    results.push(StopResult { symbol: sym.clone(), exit_ratio: 1.0 });
+                }
             }
         }
     }
 
-    stopped
+    results
+}
+
+/// Execute stop exits with optional exit_ratio adjustment (for touched_exit)
+///
+/// This handles both:
+/// - Regular stops: exit_ratio = 1.0, scheduled for T+1
+/// - Touched exits: exit_ratio adjusted, executed immediately T+0
+fn execute_stops_impl<T>(
+    portfolio: &mut Portfolio,
+    stops: Vec<StopResult>,
+    stopped_stocks: &mut HashMap<String, bool>,
+    today_prices: &HashMap<&str, f64>,
+    config: &BacktestConfig,
+    current_date: i32,
+    exit_sig_date: Option<i32>,  // Some(date) for touched_exit, None for regular
+    tracker: &mut T,
+)
+where
+    T: TradeTracker<Key = String, Date = i32, Record = LongTradeRecord>,
+{
+    for stop in stops {
+        if let Some(pos) = portfolio.positions.remove(&stop.symbol) {
+            // Adjust position value by exit_ratio (1.0 for regular, adjusted for touched)
+            let exit_value = pos.last_market_value * stop.exit_ratio;
+
+            // For touched_exit, adjust exit_price by exit_ratio (touched_price / close_price)
+            let close_price = today_prices.get(stop.symbol.as_str()).copied().unwrap_or(pos.previous_price);
+            let exit_price = close_price * stop.exit_ratio;
+            tracker.close_trade(
+                &stop.symbol,
+                current_date,
+                exit_sig_date,
+                exit_price,
+                config.fee_ratio,
+                config.tax_ratio,
+            );
+
+            let sell_value = exit_value - exit_value.abs() * (config.fee_ratio + config.tax_ratio);
+            portfolio.cash += sell_value;
+
+            if config.stop_trading_next_period {
+                stopped_stocks.insert(stop.symbol, true);
+            }
+        }
+    }
 }
 
 /// Execute rebalance with string-keyed positions
@@ -881,22 +1076,55 @@ fn normalize_weights(
 ///
 /// Delegates to `backtest_impl` with `SymbolTracker` for trade tracking.
 /// Same as `backtest_long_arrow` but returns trade records as well.
+/// Supports touched_exit mode when OHLC data is provided in input.
 pub fn backtest_with_trades_long_arrow(
     input: &LongFormatArrowInput,
     resample: ResampleFreq,
     config: &BacktestConfig,
 ) -> LongBacktestResult {
     let mut tracker = SymbolTracker::new();
-    let creturn = backtest_impl(
-        input.dates.len(),
-        |i| input.dates.value(i),
-        |i| input.symbols.value(i),
-        |i| input.prices.value(i),
-        |i| input.weights.value(i),
-        resample,
-        config,
-        &mut tracker,
-    );
+
+    // Build OHLC getters if data is available and touched_exit is enabled
+    let creturn = if config.touched_exit
+        && input.open_prices.is_some()
+        && input.high_prices.is_some()
+        && input.low_prices.is_some()
+    {
+        let open_arr = input.open_prices.unwrap();
+        let high_arr = input.high_prices.unwrap();
+        let low_arr = input.low_prices.unwrap();
+
+        let ohlc = Some(OhlcGetters {
+            get_open: |i: usize| open_arr.value(i),
+            get_high: |i: usize| high_arr.value(i),
+            get_low: |i: usize| low_arr.value(i),
+        });
+
+        backtest_impl(
+            input.dates.len(),
+            |i| input.dates.value(i),
+            |i| input.symbols.value(i),
+            |i| input.prices.value(i),
+            |i| input.weights.value(i),
+            resample,
+            config,
+            &mut tracker,
+            ohlc,
+        )
+    } else {
+        let ohlc: Option<OhlcGetters<fn(usize) -> f64, fn(usize) -> f64, fn(usize) -> f64>> = None;
+        backtest_impl(
+            input.dates.len(),
+            |i| input.dates.value(i),
+            |i| input.symbols.value(i),
+            |i| input.prices.value(i),
+            |i| input.weights.value(i),
+            resample,
+            config,
+            &mut tracker,
+            ohlc,
+        )
+    };
 
     // Finalize trades (include open positions)
     let trades = tracker.finalize(config.fee_ratio, config.tax_ratio);
@@ -949,6 +1177,9 @@ mod tests {
             symbols,
             prices,
             weights,
+            open_prices: None,
+            high_prices: None,
+            low_prices: None,
         }
     }
 
@@ -972,6 +1203,7 @@ mod tests {
         // Day 1: entry at T+1
         // Day 2: +10%
         // Day 3: +10%
+        // Note: With ResampleFreq::Daily, weights must stay at 1.0 to keep position open
         let dates = Int32Array::from(vec![
             date_to_days("2024-01-01"),
             date_to_days("2024-01-02"),
@@ -980,7 +1212,7 @@ mod tests {
         ]);
         let symbols = make_symbols(vec!["AAPL", "AAPL", "AAPL", "AAPL"]);
         let prices = Float64Array::from(vec![100.0, 100.0, 110.0, 121.0]);
-        let weights = Float64Array::from(vec![1.0, 0.0, 0.0, 0.0]);
+        let weights = Float64Array::from(vec![1.0, 1.0, 1.0, 1.0]);
 
         let input = make_input(&dates, &symbols, &prices, &weights);
         let config = BacktestConfig {
