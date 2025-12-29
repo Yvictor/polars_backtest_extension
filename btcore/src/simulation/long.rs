@@ -596,6 +596,21 @@ where
         pos.value = pos.last_market_value;
     }
 
+    // Finlab behavior: Close ALL trades before rebalance (sell all, rebuy all)
+    // This matches wide.rs lines 263-279
+    let open_positions: Vec<String> = portfolio.positions.keys().cloned().collect();
+    for sym in &open_positions {
+        let exit_price = today_prices.get(sym.as_str()).copied().unwrap_or(f64::NAN);
+        tracker.close_trade(
+            sym,
+            current_date,
+            Some(signal_date),
+            exit_price,
+            config.fee_ratio,
+            config.tax_ratio,
+        );
+    }
+
     // Calculate total balance
     let balance = portfolio.balance();
 
@@ -633,18 +648,10 @@ where
 
     if total_target_weight == 0.0 || balance <= 0.0 {
         // Exit all positions
+        // Note: close_trade was already called for ALL positions at the start
         let all_positions: Vec<String> = portfolio.positions.keys().cloned().collect();
         for sym in all_positions {
             if let Some(pos) = portfolio.positions.remove(&sym) {
-                let exit_price = today_prices.get(sym.as_str()).copied().unwrap_or(pos.previous_price);
-                tracker.close_trade(
-                    &sym,
-                    current_date,
-                    Some(signal_date),
-                    exit_price,
-                    config.fee_ratio,
-                    config.tax_ratio,
-                );
                 let sell_value = pos.value - pos.value.abs() * (config.fee_ratio + config.tax_ratio);
                 portfolio.cash += sell_value;
             }
@@ -687,25 +694,14 @@ where
         // Target position value (scaled by ratio)
         let target_value = target_weight * ratio;
         let current_value = old_positions.get(sym).copied().unwrap_or(0.0);
-        let had_position = current_value.abs() > 1e-10;
 
         // Handle NaN price case (match Finlab behavior: enter even with NaN price)
         if !price_valid {
             // If target is 0 and we have an old position, sell it using old market value
+            // Note: close_trade was already called at the start for ALL positions
             if target_weight.abs() < 1e-10 {
                 if let Some(&old_mv) = old_market_values.get(sym) {
                     if old_mv.abs() > 1e-10 {
-                        // Close the trade
-                        if had_position {
-                            tracker.close_trade(
-                                sym,
-                                current_date,
-                                Some(signal_date),
-                                f64::NAN, // No valid price
-                                config.fee_ratio,
-                                config.tax_ratio,
-                            );
-                        }
                         let sell_fee = old_mv.abs() * (config.fee_ratio + config.tax_ratio);
                         cash += old_mv - sell_fee;
                     }
@@ -735,10 +731,8 @@ where
                 };
 
                 if new_value.abs() > 1e-10 {
-                    // Open trade if this is a new position
-                    if !had_position {
-                        tracker.open_trade(sym.clone(), current_date, signal_date, f64::NAN, target_weight);
-                    }
+                    // Finlab behavior: Open trade for ALL positions after rebalance
+                    tracker.open_trade(sym.clone(), current_date, signal_date, f64::NAN, target_weight);
                     portfolio.positions.insert(
                         sym.clone(),
                         Position::new_with_nan_price(new_value),
@@ -751,19 +745,9 @@ where
         let price = price_opt.unwrap();
 
         // Valid price case: exit position if target is 0
+        // Note: close_trade was already called at the start for ALL positions
         if target_weight.abs() < 1e-10 {
             if current_value.abs() > 1e-10 {
-                // Close the trade
-                if had_position {
-                    tracker.close_trade(
-                        sym,
-                        current_date,
-                        Some(signal_date),
-                        price,
-                        config.fee_ratio,
-                        config.tax_ratio,
-                    );
-                }
                 let sell_fee = current_value.abs() * (config.fee_ratio + config.tax_ratio);
                 cash += current_value - sell_fee;
             }
@@ -790,10 +774,9 @@ where
         };
 
         if new_position_value.abs() > 1e-10 {
-            // Open trade if this is a new position
-            if !had_position {
-                tracker.open_trade(sym.clone(), current_date, signal_date, price, target_weight);
-            }
+            // Finlab behavior: Open trade for ALL positions after rebalance
+            // (All trades were closed at the start of rebalance)
+            tracker.open_trade(sym.clone(), current_date, signal_date, price, target_weight);
 
             // Determine if this is a continuing same-direction position
             let old_value = old_positions.get(sym).copied().unwrap_or(0.0);
@@ -815,18 +798,10 @@ where
         }
     }
 
-    // Handle positions outside effective_weights (close all)
+    // Handle positions outside effective_weights (sell them)
+    // Note: close_trade was already called at the start for ALL positions
     for (sym, &old_value) in old_positions.iter() {
         if !effective_weights.contains_key(sym) && old_value.abs() > 1e-10 {
-            let exit_price = today_prices.get(sym.as_str()).copied().unwrap_or(f64::NAN);
-            tracker.close_trade(
-                sym,
-                current_date,
-                Some(signal_date),
-                exit_price,
-                config.fee_ratio,
-                config.tax_ratio,
-            );
             let sell_fee = old_value.abs() * (config.fee_ratio + config.tax_ratio);
             cash += old_value - sell_fee;
         }
