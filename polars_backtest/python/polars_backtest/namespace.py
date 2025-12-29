@@ -415,6 +415,9 @@ class BacktestNamespace:
         position: ColumnSpec = "weight",
         date: ColumnSpec = "date",
         symbol: ColumnSpec = "symbol",
+        open: ColumnSpec = "open",
+        high: ColumnSpec = "high",
+        low: ColumnSpec = "low",
         resample: str | None = "D",
         fee_ratio: float = 0.001425,
         tax_ratio: float = 0.003,
@@ -424,16 +427,21 @@ class BacktestNamespace:
         position_limit: float = 1.0,
         retain_cost_when_rebalance: bool = False,
         stop_trading_next_period: bool = True,
+        touched_exit: bool = False,
     ) -> BacktestReport:
         """Run backtest with trade tracking, returning a BacktestReport object.
 
         Uses the Rust long format implementation directly for performance.
+        When touched_exit=True, falls back to wide format for OHLC support.
 
         Args:
             trade_at_price: Price column name or Expr (default: "close")
             position: Position/weight column name or Expr (default: "weight")
             date: Date column name or Expr (default: "date")
             symbol: Symbol column name or Expr (default: "symbol")
+            open: Open price column name or Expr (default: "open", for touched_exit)
+            high: High price column name or Expr (default: "high", for touched_exit)
+            low: Low price column name or Expr (default: "low", for touched_exit)
             resample: Rebalance frequency ('D', 'W', 'M', or None)
             fee_ratio: Transaction fee ratio
             tax_ratio: Transaction tax ratio
@@ -443,6 +451,7 @@ class BacktestNamespace:
             position_limit: Maximum weight per stock
             retain_cost_when_rebalance: Retain costs when rebalancing
             stop_trading_next_period: Stop trading after stop triggered
+            touched_exit: Use OHLC for intraday stop detection (requires open/high/low)
 
         Returns:
             BacktestReport object with creturn (list) and trades (DataFrame)
@@ -455,11 +464,28 @@ class BacktestNamespace:
         df, price_col = _resolve_column(df, trade_at_price, "_bt_price")
         df, position_col = _resolve_column(df, position, "_bt_position")
 
-        # Validate columns exist
+        # Validate required columns exist
         required = [date_col, symbol_col, price_col, position_col]
         missing = [c for c in required if c not in df.columns]
         if missing:
             raise ValueError(f"Missing required columns: {missing}")
+
+        # Resolve OHLC columns only when touched_exit is True
+        open_col: str | None = None
+        high_col: str | None = None
+        low_col: str | None = None
+        if touched_exit:
+            df, open_col = _resolve_column(df, open, "_bt_open")
+            df, high_col = _resolve_column(df, high, "_bt_high")
+            df, low_col = _resolve_column(df, low, "_bt_low")
+
+            # Validate OHLC columns exist
+            ohlc_cols = [open_col, high_col, low_col]
+            ohlc_missing = [c for c in ohlc_cols if c not in df.columns]
+            if ohlc_missing:
+                raise ValueError(
+                    f"touched_exit=True requires open/high/low columns. Missing: {ohlc_missing}"
+                )
 
         # Check if position column is boolean (signals)
         position_dtype = df.get_column(position_col).dtype
@@ -484,7 +510,15 @@ class BacktestNamespace:
             retain_cost_when_rebalance=retain_cost_when_rebalance,
             stop_trading_next_period=stop_trading_next_period,
             finlab_mode=True,  # Use Finlab mode for report
+            touched_exit=touched_exit,
         )
+
+        # touched_exit requires OHLC support in Rust (not implemented yet)
+        if touched_exit:
+            raise NotImplementedError(
+                "touched_exit=True is not yet supported in long format. "
+                "This feature requires OHLC support in the Rust backend."
+            )
 
         # Check if already sorted
         skip_sort = df.get_column(date_col).is_sorted()
@@ -500,7 +534,6 @@ class BacktestNamespace:
             config,
             skip_sort,
         )
-
 
 # =============================================================================
 # Standalone Function API
@@ -577,6 +610,9 @@ def backtest_with_report(
     position: ColumnSpec = "weight",
     date: ColumnSpec = "date",
     symbol: ColumnSpec = "symbol",
+    open: ColumnSpec = "open",
+    high: ColumnSpec = "high",
+    low: ColumnSpec = "low",
     resample: str | None = "D",
     fee_ratio: float = 0.001425,
     tax_ratio: float = 0.003,
@@ -586,6 +622,7 @@ def backtest_with_report(
     position_limit: float = 1.0,
     retain_cost_when_rebalance: bool = False,
     stop_trading_next_period: bool = True,
+    touched_exit: bool = False,
 ) -> BacktestReport:
     """Run backtest with trade tracking on long format DataFrame.
 
@@ -597,6 +634,9 @@ def backtest_with_report(
         position: Position/weight column name or Expr (default: "weight")
         date: Date column name or Expr (default: "date")
         symbol: Symbol column name or Expr (default: "symbol")
+        open: Open price column name or Expr (default: "open", for touched_exit)
+        high: High price column name or Expr (default: "high", for touched_exit)
+        low: Low price column name or Expr (default: "low", for touched_exit)
         resample: Rebalance frequency ('D', 'W', 'M', or None)
         fee_ratio: Transaction fee ratio
         tax_ratio: Transaction tax ratio
@@ -606,6 +646,8 @@ def backtest_with_report(
         position_limit: Maximum weight per stock
         retain_cost_when_rebalance: Retain costs when rebalancing
         stop_trading_next_period: Stop trading after stop triggered
+        touched_exit: Use OHLC for intraday stop detection (requires open/high/low)
+                     NOTE: Not yet implemented, will raise NotImplementedError.
 
     Returns:
         BacktestReport object with creturn (list) and trades (DataFrame)
@@ -621,6 +663,9 @@ def backtest_with_report(
         position=position,
         date=date,
         symbol=symbol,
+        open=open,
+        high=high,
+        low=low,
         resample=resample,
         fee_ratio=fee_ratio,
         tax_ratio=tax_ratio,
@@ -630,4 +675,5 @@ def backtest_with_report(
         position_limit=position_limit,
         retain_cost_when_rebalance=retain_cost_when_rebalance,
         stop_trading_next_period=stop_trading_next_period,
+        touched_exit=touched_exit,
     )
