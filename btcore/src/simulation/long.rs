@@ -172,13 +172,13 @@ impl ResampleOffset {
 /// Delayed rebalance entry for offset support
 ///
 /// Only stores the target date. When triggered (date > target_date),
-/// uses the signal date's weights (from today_weights at prev_date).
+/// we use prev_date as the signal date and today_weights for rebalancing.
 /// This matches Wide format's _resample_position behavior where
-/// the position is sampled at the signal date, not the boundary date.
+/// the signal date is the LAST trading day <= target_date.
 #[derive(Debug, Clone, Copy)]
 struct DelayedRebalance {
     /// The target date to trigger rebalance (boundary_date + offset.days)
-    /// When date > target_date, prev_date becomes the signal date
+    /// When date > target_date, the rebalance triggers with prev_date as signal date
     target_date: i32,
 }
 
@@ -328,46 +328,39 @@ where
             //
             // Wide format behavior with offset:
             // - _resample_position shifts boundary dates forward by offset
-            // - The weights used are from the SIGNAL date, not boundary date
-            // - This is because _resample_position samples position at shifted date
+            // - Signal date = LAST trading day <= target_date
+            // - The weights used are from the signal date
+            // - Signal date records creturn BEFORE rebalance
+            // - Rebalance executes on T+1
             //
-            // When date > target_date:
-            // - prev_date is the signal date (last trading day <= target_date)
-            // - Use prev_date's weights (from today_weights)
-            let mut delayed_triggered_first_signal = false;
-            while let Some(delayed) = delayed_rebalances.front() {
-                if date > delayed.target_date {
-                    // date crossed target_date, prev_date is the signal date
-                    let _delayed = delayed_rebalances.pop_front().unwrap();
-
-                    // Normalize signal date's weights (from today_weights)
-                    let signal_weights = normalize_weights(
-                        &today_weights,
-                        &stopped_stocks,
-                        config.position_limit,
-                    );
-
-                    if !signal_weights.is_empty() {
-                        // Track if this is the first signal (for skipping immediate execution)
-                        if !has_first_signal {
-                            delayed_triggered_first_signal = true;
-                        }
-                        // First signal is when delayed rebalance triggers
-                        has_first_signal = true;
-                        pending_weights = Some(signal_weights);
-                        pending_signal_date = Some(prev_date);
-                    }
-                    // Only process one delayed rebalance per day
-                    break;
-                } else {
-                    break;
-                }
-            }
+            // Key insight: When date > target_date, prev_date is the last trading day
+            // before date. If there are no trading days between prev_date and date
+            // that are <= target_date, then prev_date IS the last trading day <= target_date.
+            // This is exactly the signal date that Wide format uses.
+            //
+            // Example with Q+1D (boundary = Dec 31, target_date = Jan 1):
+            // Case 1: Jan 1 is NOT a trading day (holiday)
+            // - Dec 31 → Jan 5: date=Jan5, prev_date=Dec31
+            // - date (Jan5) > target_date (Jan1)? YES
+            // - prev_date (Dec31) is the last trading day <= Jan1
+            // - Use today_weights (Dec31's weights)
+            //
+            // Case 2: Apr 1 IS a trading day
+            // - Mar 31 → Apr 1: Queue delayed with target_date = Apr 1
+            // - Apr 1 → Apr 2: date=Apr2, prev_date=Apr1
+            // - date (Apr2) > target_date (Apr1)? YES
+            // - prev_date (Apr1) is the last trading day <= Apr1
+            // - Use today_weights (Apr1's weights)
+            //
+            // Note: The delayed rebalance is checked AFTER queueing new ones (below).
+            // This ensures that if a delayed rebalance is queued and triggers on
+            // the same transition, it uses the correct weights (today_weights).
+            let mut delayed_triggered = false;
 
             // STEP 3: Execute pending rebalance
-            // Skip if this is the first signal from delayed rebalance (will execute on T+1)
-            // This matches Wide format where signal_date has creturn=1.0, trade executes on T+1
-            if delayed_triggered_first_signal {
+            // Skip if delayed triggered this iteration - execute on T+1
+            // This matches Wide format where signal_date records creturn BEFORE rebalance
+            if delayed_triggered {
                 // Keep pending_weights for next day (T+1 execution)
                 // Don't take() so it stays in pending_weights
             } else if let Some(target_weights) = pending_weights.take() {
@@ -485,18 +478,67 @@ where
 
             if should_rebalance {
                 if offset_days > 0 {
-                    // Delay the rebalance by offset_days
-                    // target_date = prev_date + offset_days (calendar days)
-                    // When date > target_date, prev_date becomes the signal date
-                    // Signal date's weights will be used (not boundary weights)
-                    delayed_rebalances.push_back(DelayedRebalance {
-                        target_date: prev_date + offset_days,
-                    });
+                    // Delay the rebalance by offset_days from the ACTUAL period boundary
+                    // For weekly, boundary is Sunday (not last trading day)
+                    // For monthly/quarterly, boundary is the last calendar day (= last trading day)
+                    //
+                    // IMPORTANT: Handle multi-period gaps (e.g., multiple weeks during holidays)
+                    // We need to queue a delayed rebalance for EACH period boundary in the gap.
+                    let boundaries = get_all_period_boundaries(prev_date, date, resample);
+                    for boundary in boundaries {
+                        delayed_rebalances.push_back(DelayedRebalance {
+                            target_date: boundary + offset_days,
+                        });
+                    }
                 } else if has_first_signal {
                     // No offset: set pending_weights for next day (T+1)
                     pending_weights = Some(active_weights.clone());
                     pending_signal_date = Some(prev_date);
                 }
+            }
+
+            // STEP 5b: Check delayed rebalances AFTER queueing new ones
+            // This is critical: if a delayed rebalance is queued and should trigger
+            // on the same transition (e.g., Q+1D when target_date falls in a trading gap),
+            // we need to check it NOW while today_weights has the correct weights.
+            //
+            // IMPORTANT: Wide format de-duplicates weeks with the same signal date.
+            // When multiple weeks fall in a trading gap, they all use the same signal
+            // (last trading day before the gap). We need to collapse all such delayed
+            // rebalances into a single rebalance.
+            //
+            // Strategy: Pop ALL delayed rebalances with target_date < date, but only
+            // set pending_weights once. This matches Wide format's de-duplication.
+            let mut any_triggered = false;
+            while let Some(delayed) = delayed_rebalances.front() {
+                // Trigger when date crosses target_date
+                if date > delayed.target_date {
+                    let _delayed = delayed_rebalances.pop_front().unwrap();
+                    any_triggered = true;
+                    // Continue popping all triggered delayed rebalances
+                } else {
+                    break;
+                }
+            }
+
+            // If any delayed rebalances triggered, set pending_weights once
+            if any_triggered {
+                // Use today_weights (prev_date's weights, which is the signal date)
+                let signal_weights = normalize_weights(
+                    &today_weights,
+                    &stopped_stocks,
+                    config.position_limit,
+                );
+
+                // Only set has_first_signal when we have actual non-empty weights
+                // This matches Wide format behavior where creturn recording starts
+                // from the first actual position, not from zero-weight signals.
+                if !has_first_signal && !signal_weights.is_empty() {
+                    has_first_signal = true;
+                }
+                pending_weights = Some(signal_weights);
+                pending_signal_date = Some(prev_date);
+                delayed_triggered = true;
             }
 
             // STEP 6: Record date and creturn (only after first signal)
@@ -878,6 +920,151 @@ fn weekday_of_i32(days: i32) -> u8 {
     ((days.rem_euclid(7) + 3) % 7) as u8
 }
 
+/// Compute the actual period boundary date for a given trading day transition.
+///
+/// The boundary is the CALENDAR last day of the period, not the last TRADING day.
+/// This is important for offset calculation because:
+/// - Wide format computes: boundary = last calendar day of period
+/// - target_date = boundary + offset
+///
+/// For example, if Q3 ends Sep 30 (Sunday), the boundary is Sep 30, not the
+/// last trading day (Sep 28 Friday). With Q+1D, target_date = Oct 1.
+///
+/// This matches Wide format's `_get_period_end_dates` behavior.
+#[inline]
+fn compute_period_boundary(prev_date: i32, resample: ResampleFreq) -> i32 {
+    match resample {
+        ResampleFreq::Weekly | ResampleFreq::WeeklyOn(_) => {
+            // Week ends on Sunday (weekday = 6)
+            // Compute the Sunday after or on prev_date
+            let weekday = weekday_of_i32(prev_date);
+            if weekday == 6 {
+                prev_date // Already Sunday (rare for trading day)
+            } else {
+                prev_date + (6 - weekday as i32) // Days until Sunday
+            }
+        }
+        ResampleFreq::Monthly | ResampleFreq::MonthStart => {
+            // Month ends on the last calendar day of the month
+            last_day_of_month_i32(prev_date)
+        }
+        ResampleFreq::Quarterly | ResampleFreq::QuarterStart => {
+            // Quarter ends on the last calendar day of the quarter
+            last_day_of_quarter_i32(prev_date)
+        }
+        ResampleFreq::Yearly => {
+            // Year ends on Dec 31
+            last_day_of_year_i32(prev_date)
+        }
+        // For Daily and PositionChange, boundary is the trading day itself
+        _ => prev_date,
+    }
+}
+
+/// Get all period boundaries between prev_date (inclusive) and date (exclusive)
+/// for a given resample frequency.
+///
+/// This handles multi-period gaps (e.g., multiple weeks during a long holiday).
+/// Returns boundaries in chronological order.
+///
+/// The function includes the period containing prev_date if prev_date is before or on
+/// the boundary. For example, if prev_date = Dec 31 (quarter end) for quarterly,
+/// it includes Dec 31 as a boundary.
+fn get_all_period_boundaries(
+    prev_date: i32,
+    date: i32,
+    resample: ResampleFreq,
+) -> Vec<i32> {
+    let mut boundaries = Vec::new();
+
+    match resample {
+        ResampleFreq::Weekly | ResampleFreq::WeeklyOn(_) => {
+            // Find all Sundays from prev_date's week to the week before date
+            // First: compute the Sunday of prev_date's week (on or after prev_date)
+            let weekday = weekday_of_i32(prev_date);
+            let first_sunday = if weekday == 6 {
+                prev_date // prev_date is already Sunday
+            } else {
+                prev_date + (6 - weekday as i32)
+            };
+
+            // Iterate through all Sundays before date
+            let mut sunday = first_sunday;
+            while sunday < date {
+                boundaries.push(sunday);
+                sunday += 7;
+            }
+        }
+        ResampleFreq::Monthly | ResampleFreq::MonthStart => {
+            // Find all month ends from prev_date's month to the month before date
+            let (mut year, mut month) = days_to_year_month(prev_date);
+            loop {
+                let month_end = last_day_of_month_i32(ymd_to_days(year, month, 1));
+                // Include if boundary >= prev_date (prev_date could be before or on boundary)
+                // and boundary < date
+                if month_end >= prev_date && month_end < date {
+                    boundaries.push(month_end);
+                }
+                // Move to next month
+                if month == 12 {
+                    month = 1;
+                    year += 1;
+                } else {
+                    month += 1;
+                }
+                // Check if we've passed date
+                if ymd_to_days(year, month, 1) >= date {
+                    break;
+                }
+            }
+        }
+        ResampleFreq::Quarterly | ResampleFreq::QuarterStart => {
+            // Find all quarter ends from prev_date's quarter to the quarter before date
+            let (mut year, month) = days_to_year_month(prev_date);
+            let mut qtr = ((month - 1) / 3) + 1; // 1, 2, 3, or 4
+            loop {
+                let qtr_end_month = qtr * 3;
+                let qtr_end = last_day_of_quarter_i32(ymd_to_days(year, qtr_end_month, 1));
+                // Include if boundary >= prev_date and boundary < date
+                if qtr_end >= prev_date && qtr_end < date {
+                    boundaries.push(qtr_end);
+                }
+                // Move to next quarter
+                if qtr == 4 {
+                    qtr = 1;
+                    year += 1;
+                } else {
+                    qtr += 1;
+                }
+                // Check if we've passed date
+                if ymd_to_days(year, qtr * 3, 1) >= date {
+                    break;
+                }
+            }
+        }
+        ResampleFreq::Yearly => {
+            // Find all year ends from prev_date's year to the year before date
+            let (mut year, _) = days_to_year_month(prev_date);
+            loop {
+                let year_end = last_day_of_year_i32(ymd_to_days(year, 12, 31));
+                // Include if boundary >= prev_date and boundary < date
+                if year_end >= prev_date && year_end < date {
+                    boundaries.push(year_end);
+                }
+                year += 1;
+                if ymd_to_days(year, 1, 1) >= date {
+                    break;
+                }
+            }
+        }
+        _ => {
+            // Daily and PositionChange don't have period boundaries
+        }
+    }
+
+    boundaries
+}
+
 /// Convert days since 1970-01-01 to (year, month)
 #[inline]
 fn days_to_year_month(days: i32) -> (i32, u32) {
@@ -893,6 +1080,65 @@ fn days_to_year_month(days: i32) -> (i32, u32) {
     let m = if mp < 10 { mp + 3 } else { mp - 9 }; // actual month [1, 12]
     let year = if m <= 2 { y + 1 } else { y };
     (year, m)
+}
+
+/// Convert (year, month, day) to days since 1970-01-01
+#[inline]
+fn ymd_to_days(year: i32, month: u32, day: u32) -> i32 {
+    // Algorithm from Howard Hinnant's date library
+    // https://howardhinnant.github.io/date_algorithms.html
+    let y = if month <= 2 { year - 1 } else { year };
+    let m = if month <= 2 { month + 12 } else { month };
+    let era = if y >= 0 { y / 400 } else { (y - 399) / 400 };
+    let yoe = (y - era * 400) as u32;
+    let doy = (153 * (m - 3) + 2) / 5 + day - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    era * 146097 + doe as i32 - 719468
+}
+
+/// Get number of days in a month
+#[inline]
+fn days_in_month(year: i32, month: u32) -> u32 {
+    match month {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        2 => {
+            if (year % 4 == 0 && year % 100 != 0) || (year % 400 == 0) {
+                29
+            } else {
+                28
+            }
+        }
+        _ => 30, // fallback
+    }
+}
+
+/// Get the last day of the month for a given date (days since epoch).
+/// Returns the days since epoch for the last day of that month.
+#[inline]
+fn last_day_of_month_i32(days: i32) -> i32 {
+    let (year, month) = days_to_year_month(days);
+    let last_day = days_in_month(year, month);
+    ymd_to_days(year, month, last_day)
+}
+
+/// Get the last day of the quarter for a given date (days since epoch).
+/// Returns the days since epoch for the last day of that quarter.
+#[inline]
+fn last_day_of_quarter_i32(days: i32) -> i32 {
+    let (year, month) = days_to_year_month(days);
+    // Quarter end months: 3 (Mar), 6 (Jun), 9 (Sep), 12 (Dec)
+    let quarter_end_month = ((month - 1) / 3 + 1) * 3;
+    let last_day = days_in_month(year, quarter_end_month);
+    ymd_to_days(year, quarter_end_month, last_day)
+}
+
+/// Get the last day of the year for a given date (days since epoch).
+/// Returns the days since epoch for Dec 31 of that year.
+#[inline]
+fn last_day_of_year_i32(days: i32) -> i32 {
+    let (year, _) = days_to_year_month(days);
+    ymd_to_days(year, 12, 31)
 }
 
 /// Update positions with daily returns (cr *= r, maxcr, last_market_value, max_price)

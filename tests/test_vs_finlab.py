@@ -114,6 +114,22 @@ def test_resample(price_data, resample):
     run_comparison(adj_close, position, f"resample={resample}", resample=resample)
 
 
+# Resample Offset
+@pytest.mark.parametrize("resample,resample_offset", [
+    ('W', '1D'),
+    ('W', '2D'),
+    ('W', '-1D'),
+    ('M', '1D'),
+    ('M', '5D'),
+    ('M', '-1D'),
+])
+def test_resample_offset(price_data, resample, resample_offset):
+    close, adj_close = price_data
+    position = close >= close.rolling(300).max()
+    run_comparison(adj_close, position, f"resample={resample}+offset={resample_offset}",
+                   resample=resample, resample_offset=resample_offset)
+
+
 # Fees
 @pytest.mark.parametrize("fee_ratio,tax_ratio", [(0, 0), (0.001425, 0.003), (0.01, 0.005)])
 def test_fees(price_data, fee_ratio, tax_ratio):

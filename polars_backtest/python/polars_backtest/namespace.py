@@ -265,7 +265,7 @@ class BacktestNamespace:
 
         # Check if we can use Rust path
         # Supported resample: D, W, W-MON..W-SUN, M, MS, Q, QS, Y, None
-        # TODO: Rust offset implementation still has issues, use Python fallback for now
+        # Rust now fully supports resample_offset with correct T+1 execution timing
         resample_supported = resample in (
             None, "D",
             "W", "W-MON", "W-TUE", "W-WED", "W-THU", "W-FRI", "W-SAT", "W-SUN",
@@ -273,7 +273,7 @@ class BacktestNamespace:
             "Q", "QE", "QS",
             "Y", "YE", "A",
         )
-        use_rust = resample_supported and resample_offset is None
+        use_rust = resample_supported
 
         if use_rust:
             # Use Rust backtest directly (does pivot internally)
