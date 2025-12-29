@@ -452,7 +452,7 @@ def run_trades_comparison(
 # =============================================================================
 
 
-@pytest.mark.parametrize("resample", ["D", "W", "M", None])
+@pytest.mark.parametrize("resample", ["D", "W", "M", "Q", "Y", None])
 def test_resample(wide_format_df, long_format_df, position_bool, resample):
     """Test different resample frequencies."""
     df_adj, df_close = wide_format_df
