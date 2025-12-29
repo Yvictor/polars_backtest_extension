@@ -175,10 +175,35 @@ impl From<SimTradeRecord> for PyTradeRecord {
     }
 }
 
-/// Python wrapper for BacktestResult
+/// Python wrapper for BacktestResult (long format - returns DataFrame creturn)
 #[pyclass(name = "BacktestResult")]
 #[derive(Clone)]
 pub struct PyBacktestResult {
+    creturn_df: DataFrame,
+    #[pyo3(get)]
+    pub trades: Vec<PyTradeRecord>,
+}
+
+#[pymethods]
+impl PyBacktestResult {
+    /// Get cumulative returns as a Polars DataFrame with date column
+    #[getter]
+    fn creturn(&self) -> PyDataFrame {
+        PyDataFrame(self.creturn_df.clone())
+    }
+
+    fn __repr__(&self) -> String {
+        format!(
+            "BacktestResult(creturn_len={}, trades_count={})",
+            self.creturn_df.height(), self.trades.len(),
+        )
+    }
+}
+
+/// Python wrapper for wide format BacktestResult (returns Vec<f64> creturn for Report compatibility)
+#[pyclass(name = "WideBacktestResult")]
+#[derive(Clone)]
+pub struct PyWideBacktestResult {
     #[pyo3(get)]
     pub creturn: Vec<f64>,
     #[pyo3(get)]
@@ -186,16 +211,16 @@ pub struct PyBacktestResult {
 }
 
 #[pymethods]
-impl PyBacktestResult {
+impl PyWideBacktestResult {
     fn __repr__(&self) -> String {
         format!(
-            "BacktestResult(creturn_len={}, trades_count={})",
+            "WideBacktestResult(creturn_len={}, trades_count={})",
             self.creturn.len(), self.trades.len(),
         )
     }
 }
 
-impl From<BacktestResult> for PyBacktestResult {
+impl From<BacktestResult> for PyWideBacktestResult {
     fn from(r: BacktestResult) -> Self {
         Self {
             creturn: r.creturn,
@@ -600,10 +625,49 @@ fn backtest(
     let result = backtest_long_arrow(&input, resample_freq, &cfg);
 
     eprintln!("[PROFILE] Backtest (btcore arrow): {:?}", step_start.elapsed());
+
+    // Get unique dates for creturn DataFrame
+    let unique_dates = df.column(date)
+        .map_err(|e| PyValueError::new_err(format!("Failed to get date column: {}", e)))?
+        .unique()
+        .map_err(|e| PyValueError::new_err(format!("Failed to get unique dates: {}", e)))?
+        .sort(Default::default())
+        .map_err(|e| PyValueError::new_err(format!("Failed to sort dates: {}", e)))?;
+
+    // Find first index where creturn != 1.0 (first actual return change)
+    // This correctly handles resample: with monthly resample, signal may exist before
+    // the rebalance date, but creturn only changes after rebalance.
+    // We go back one day to include the signal/entry day (where creturn is still 1.0)
+    let first_change_idx = result.creturn.iter()
+        .position(|&v| (v - 1.0).abs() > 1e-10)
+        .unwrap_or(0);
+
+    // Start one day before first change (the signal day), but not less than 0
+    let first_active_idx = if first_change_idx > 0 { first_change_idx - 1 } else { 0 };
+
+    // Slice creturn and dates from first active index
+    let sliced_creturn: Vec<f64> = result.creturn[first_active_idx..].to_vec();
+    let sliced_dates = unique_dates.slice(first_active_idx as i64, sliced_creturn.len());
+
+    // Normalize creturn to start at 1.0 (divide by first value)
+    let normalized_creturn: Vec<f64> = if !sliced_creturn.is_empty() && sliced_creturn[0] != 0.0 {
+        let normalizer = sliced_creturn[0];
+        sliced_creturn.iter().map(|&v| v / normalizer).collect()
+    } else {
+        sliced_creturn
+    };
+
+    // Build creturn DataFrame with date and creturn columns
+    let creturn_series = Column::new("creturn".into(), normalized_creturn);
+    let creturn_df = DataFrame::new(vec![
+        sliced_dates.into_column(),
+        creturn_series,
+    ]).map_err(|e| PyValueError::new_err(format!("Failed to create creturn DataFrame: {}", e)))?;
+
     eprintln!("[PROFILE] TOTAL: {:?}", total_start.elapsed());
 
     Ok(PyBacktestResult {
-        creturn: result.creturn,
+        creturn_df,
         trades: vec![],
     })
 }
@@ -1074,8 +1138,9 @@ fn backtest_with_report(
         .map_err(|e| PyValueError::new_err(format!("Failed to sort dates: {}", e)))?;
 
     // Find first index where creturn != 1.0 (first actual return change)
-    // Wide format keeps the signal day (where creturn is still 1.0) before the first change
-    // So we start from first_change_idx - 1 to include the signal day
+    // This correctly handles resample: with monthly resample, signal may exist before
+    // the rebalance date, but creturn only changes after rebalance.
+    // We go back one day to include the signal/entry day (where creturn is still 1.0)
     let first_change_idx = result.creturn.iter()
         .position(|&v| (v - 1.0).abs() > 1e-10)
         .unwrap_or(0);
@@ -1157,7 +1222,7 @@ fn backtest_wide(
 ///     open_prices/high_prices/low_prices: Optional OHLC for touched_exit
 ///
 /// Returns:
-///     BacktestResult with creturn and trades
+///     WideBacktestResult with creturn (Vec<f64>) and trades
 #[pyfunction]
 #[pyo3(signature = (adj_prices, original_prices, weights, rebalance_indices, config=None, open_prices=None, high_prices=None, low_prices=None))]
 fn backtest_with_trades_wide(
@@ -1169,7 +1234,7 @@ fn backtest_with_trades_wide(
     open_prices: Option<PyDataFrame>,
     high_prices: Option<PyDataFrame>,
     low_prices: Option<PyDataFrame>,
-) -> PyResult<PyBacktestResult> {
+) -> PyResult<PyWideBacktestResult> {
     let adj_prices_df = adj_prices.0;
     let original_prices_df = original_prices.0;
     let weights_df = weights.0;
@@ -1209,6 +1274,7 @@ fn backtest_with_trades_wide(
 
     let result = run_backtest_with_trades(&prices, &weights_2d, &rebalance_indices, &cfg);
 
+    // Wide format returns raw creturn Vec<f64> for Report compatibility
     Ok(result.into())
 }
 
@@ -1265,8 +1331,9 @@ fn _polars_backtest(m: &Bound<'_, PyModule>) -> PyResult<()> {
     // Wide format types
     m.add_class::<PyBacktestConfig>()?;
     m.add_class::<PyTradeRecord>()?;
-    m.add_class::<PyBacktestResult>()?;
+    m.add_class::<PyWideBacktestResult>()?;
     // Long format types
+    m.add_class::<PyBacktestResult>()?;
     m.add_class::<PyLongTradeRecord>()?;
     m.add_class::<PyLongBacktestResult>()?;
     m.add_class::<PyBacktestReport>()?;

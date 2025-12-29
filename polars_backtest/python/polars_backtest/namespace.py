@@ -274,37 +274,9 @@ class BacktestNamespace:
                 skip_sort,
             )
 
-            # Get dates from DataFrame
-            dates = (
-                df.select(date_col)
-                .unique()
-                .sort(date_col)
-                .get_column(date_col)
-            )
-
-            # Find where creturn starts changing (first actual trade)
-            # With monthly resample, signals may exist before first rebalance
-            # We find the last consecutive 1.0 from the start - that's the entry day
-            first_trade_idx = 0
-            for i, c in enumerate(result.creturn):
-                if c != 1.0:
-                    # Found first change - go back one day (entry day has creturn=1.0)
-                    first_trade_idx = max(0, i - 1)
-                    break
-
-            # Slice from first trade date
-            sliced_creturn = result.creturn[first_trade_idx:]
-            sliced_dates = dates[first_trade_idx:]
-
-            # Normalize so first value is 1.0 (should already be, but just in case)
-            if len(sliced_creturn) > 0 and sliced_creturn[0] != 0:
-                normalizer = sliced_creturn[0]
-                sliced_creturn = [c / normalizer for c in sliced_creturn]
-
-            return pl.DataFrame({
-                date_col: sliced_dates,
-                "creturn": sliced_creturn,
-            })
+            # Rust now returns creturn as DataFrame with date and creturn columns
+            # Filtering and normalization is done in Rust
+            return result.creturn.rename({result.creturn.columns[0]: date_col})
 
         # Fallback to Python path for complex resample patterns
         # Convert to wide format (using df with nulls filled)
