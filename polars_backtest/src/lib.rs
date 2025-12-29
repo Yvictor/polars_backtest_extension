@@ -291,6 +291,92 @@ impl From<LongBacktestResult> for PyLongBacktestResult {
     }
 }
 
+/// Convert Vec<LongTradeRecord> to a Polars DataFrame
+///
+/// Columns:
+/// - stock_id: String (symbol)
+/// - entry_date: Date (days since epoch -> Date)
+/// - exit_date: Date (optional)
+/// - entry_sig_date: Date
+/// - exit_sig_date: Date (optional)
+/// - position: Float64 (position weight)
+/// - period: Int32 (holding period in days, optional)
+/// - return: Float64 (trade return, optional)
+/// - entry_price: Float64
+/// - exit_price: Float64 (optional)
+fn trades_to_dataframe(trades: &[LongTradeRecord]) -> PolarsResult<DataFrame> {
+    // Build columns
+    let stock_id: Vec<&str> = trades.iter().map(|t| t.symbol.as_str()).collect();
+    let entry_date: Vec<Option<i32>> = trades.iter().map(|t| t.entry_date).collect();
+    let exit_date: Vec<Option<i32>> = trades.iter().map(|t| t.exit_date).collect();
+    let entry_sig_date: Vec<i32> = trades.iter().map(|t| t.entry_sig_date).collect();
+    let exit_sig_date: Vec<Option<i32>> = trades.iter().map(|t| t.exit_sig_date).collect();
+    let position: Vec<f64> = trades.iter().map(|t| t.position_weight).collect();
+    let period: Vec<Option<i32>> = trades.iter().map(|t| {
+        match (t.entry_date, t.exit_date) {
+            (Some(e), Some(x)) => Some(x - e),
+            _ => None,
+        }
+    }).collect();
+    let trade_return: Vec<Option<f64>> = trades.iter().map(|t| t.trade_return).collect();
+    let entry_price: Vec<f64> = trades.iter().map(|t| t.entry_price).collect();
+    let exit_price: Vec<Option<f64>> = trades.iter().map(|t| t.exit_price).collect();
+
+    // Create Series
+    let stock_id_series = Series::new("stock_id".into(), stock_id);
+    let entry_date_series = Series::new("entry_date".into(), entry_date)
+        .cast(&DataType::Date)?;
+    let exit_date_series = Series::new("exit_date".into(), exit_date)
+        .cast(&DataType::Date)?;
+    let entry_sig_date_series = Series::new("entry_sig_date".into(), entry_sig_date)
+        .cast(&DataType::Date)?;
+    let exit_sig_date_series = Series::new("exit_sig_date".into(), exit_sig_date)
+        .cast(&DataType::Date)?;
+    let position_series = Series::new("position".into(), position);
+    let period_series = Series::new("period".into(), period);
+    let return_series = Series::new("return".into(), trade_return);
+    let entry_price_series = Series::new("entry_price".into(), entry_price);
+    let exit_price_series = Series::new("exit_price".into(), exit_price);
+
+    DataFrame::new(vec![
+        stock_id_series.into_column(),
+        entry_date_series.into_column(),
+        exit_date_series.into_column(),
+        entry_sig_date_series.into_column(),
+        exit_sig_date_series.into_column(),
+        position_series.into_column(),
+        period_series.into_column(),
+        return_series.into_column(),
+        entry_price_series.into_column(),
+        exit_price_series.into_column(),
+    ])
+}
+
+/// Python wrapper for backtest report with trades as DataFrame
+#[pyclass(name = "BacktestReport")]
+#[derive(Clone)]
+pub struct PyBacktestReport {
+    #[pyo3(get)]
+    pub creturn: Vec<f64>,
+    trades_df: DataFrame,
+}
+
+#[pymethods]
+impl PyBacktestReport {
+    /// Get trades as a Polars DataFrame
+    #[getter]
+    fn trades(&self) -> PyDataFrame {
+        PyDataFrame(self.trades_df.clone())
+    }
+
+    fn __repr__(&self) -> String {
+        format!(
+            "BacktestReport(creturn_len={}, trades_count={})",
+            self.creturn.len(), self.trades_df.height(),
+        )
+    }
+}
+
 // =============================================================================
 // Main API: Long Format Backtest (zero-copy)
 // =============================================================================
@@ -709,6 +795,209 @@ fn backtest_with_trades(
     Ok(result.into())
 }
 
+/// Run backtest with report (trades as Polars DataFrame)
+///
+/// Same as backtest_with_trades but returns trades as a Polars DataFrame
+/// instead of a list of TradeRecord objects.
+///
+/// Args:
+///     df: DataFrame with columns [date, symbol, trade_at_price, position]
+///     date: Name of date column (default: "date")
+///     symbol: Name of symbol column (default: "symbol")
+///     trade_at_price: Name of price column (default: "close")
+///     position: Name of position/weight column (default: "weight")
+///     resample: Rebalancing frequency ("D", "W", "M", or None for daily)
+///     config: BacktestConfig (optional)
+///     skip_sort: Skip sorting if data is already sorted by date (default: false)
+///
+/// Returns:
+///     BacktestReport with creturn (Vec<f64>) and trades (DataFrame)
+#[pyfunction]
+#[pyo3(signature = (
+    df,
+    date="date",
+    symbol="symbol",
+    trade_at_price="close",
+    position="weight",
+    resample=None,
+    config=None,
+    skip_sort=false
+))]
+fn backtest_with_report(
+    df: PyDataFrame,
+    date: &str,
+    symbol: &str,
+    trade_at_price: &str,
+    position: &str,
+    resample: Option<&str>,
+    config: Option<PyBacktestConfig>,
+    skip_sort: bool,
+) -> PyResult<PyBacktestReport> {
+    use polars_arrow::array::{PrimitiveArray, Utf8ViewArray};
+
+    let df = df.0;
+    let n_rows = df.height();
+
+    // Validate required columns exist
+    for col_name in [date, symbol, trade_at_price, position] {
+        if df.column(col_name).is_err() {
+            return Err(PyValueError::new_err(format!(
+                "Missing required column: '{}'", col_name
+            )));
+        }
+    }
+
+    // Sort by date if needed
+    let df = if skip_sort {
+        df
+    } else {
+        df.sort([date], SortMultipleOptions::default())
+            .map_err(|e| PyValueError::new_err(format!("Failed to sort: {}", e)))?
+    };
+
+    // Get ChunkedArrays - only cast/rechunk when necessary
+    let date_col_ref = df.column(date)
+        .map_err(|e| PyValueError::new_err(format!("Failed to get date column: {}", e)))?;
+    let date_series = if date_col_ref.dtype() == &DataType::Date {
+        date_col_ref.clone()
+    } else {
+        date_col_ref.cast(&DataType::Date)
+            .map_err(|e| PyValueError::new_err(format!("Failed to cast date: {}", e)))?
+    };
+    let date_phys = date_series.date()
+        .map_err(|e| PyValueError::new_err(format!("Date column must be Date: {}", e)))?
+        .physical();
+    let date_nc = date_phys.chunks().len();
+    let date_ca_rechunked;
+    let date_ca: &ChunkedArray<Int32Type> = if date_nc > 1 {
+        date_ca_rechunked = date_phys.rechunk();
+        &date_ca_rechunked
+    } else {
+        date_phys
+    };
+
+    let symbol_ref = df.column(symbol)
+        .map_err(|e| PyValueError::new_err(format!("Failed to get symbol column: {}", e)))?
+        .str()
+        .map_err(|e| PyValueError::new_err(format!("Symbol column must be string: {}", e)))?;
+    let sym_nc = symbol_ref.chunks().len();
+    let symbol_ca_rechunked;
+    let symbol_ca: &StringChunked = if sym_nc > 1 {
+        symbol_ca_rechunked = symbol_ref.rechunk();
+        &symbol_ca_rechunked
+    } else {
+        symbol_ref
+    };
+
+    let price_col_ref = df.column(trade_at_price)
+        .map_err(|e| PyValueError::new_err(format!("Failed to get price column: {}", e)))?;
+    let price_series = if price_col_ref.dtype() == &DataType::Float64 {
+        price_col_ref.clone()
+    } else {
+        price_col_ref.cast(&DataType::Float64)
+            .map_err(|e| PyValueError::new_err(format!("Failed to cast price: {}", e)))?
+    };
+    let price_f64 = price_series.f64()
+        .map_err(|e| PyValueError::new_err(format!("Price must be f64: {}", e)))?;
+    let price_nc = price_f64.chunks().len();
+    let price_ca_rechunked;
+    let price_ca: &Float64Chunked = if price_nc > 1 {
+        price_ca_rechunked = price_f64.rechunk();
+        &price_ca_rechunked
+    } else {
+        price_f64
+    };
+
+    let position_col_ref = df.column(position)
+        .map_err(|e| PyValueError::new_err(format!("Failed to get position column: {}", e)))?;
+    let position_series = if position_col_ref.dtype() == &DataType::Float64 {
+        position_col_ref.clone()
+    } else {
+        position_col_ref.cast(&DataType::Float64)
+            .map_err(|e| PyValueError::new_err(format!("Failed to cast position: {}", e)))?
+    };
+    let position_f64 = position_series.f64()
+        .map_err(|e| PyValueError::new_err(format!("Position must be f64: {}", e)))?;
+    let position_nc = position_f64.chunks().len();
+    let position_ca_rechunked;
+    let position_ca: &Float64Chunked = if position_nc > 1 {
+        position_ca_rechunked = position_f64.rechunk();
+        &position_ca_rechunked
+    } else {
+        position_f64
+    };
+
+    // Get underlying polars-arrow arrays (single chunk guaranteed by rechunk)
+    let date_chunks = date_ca.chunks();
+    let symbol_chunks = symbol_ca.chunks();
+    let price_chunks = price_ca.chunks();
+    let position_chunks = position_ca.chunks();
+
+    // Downcast to concrete polars-arrow types
+    let dates_arrow = date_chunks[0]
+        .as_any()
+        .downcast_ref::<PrimitiveArray<i32>>()
+        .ok_or_else(|| PyValueError::new_err("Failed to downcast date array"))?;
+
+    let symbols_arrow = symbol_chunks[0]
+        .as_any()
+        .downcast_ref::<Utf8ViewArray>()
+        .ok_or_else(|| PyValueError::new_err("Failed to downcast symbol array"))?;
+
+    let prices_arrow = price_chunks[0]
+        .as_any()
+        .downcast_ref::<PrimitiveArray<f64>>()
+        .ok_or_else(|| PyValueError::new_err("Failed to downcast price array"))?;
+
+    let positions_arrow = position_chunks[0]
+        .as_any()
+        .downcast_ref::<PrimitiveArray<f64>>()
+        .ok_or_else(|| PyValueError::new_err("Failed to downcast position array"))?;
+
+    // Convert polars-arrow arrays to arrow-rs arrays using FFI (zero-copy)
+    let dates_rs = ffi_convert::polars_i32_to_arrow(dates_arrow)
+        .map_err(|e| PyValueError::new_err(format!("FFI date conversion failed: {}", e)))?;
+    let symbols_rs = ffi_convert::polars_utf8view_to_arrow(symbols_arrow)
+        .map_err(|e| PyValueError::new_err(format!("FFI symbol conversion failed: {}", e)))?;
+    let prices_rs = ffi_convert::polars_f64_to_arrow(prices_arrow)
+        .map_err(|e| PyValueError::new_err(format!("FFI price conversion failed: {}", e)))?;
+    let positions_rs = ffi_convert::polars_f64_to_arrow(positions_arrow)
+        .map_err(|e| PyValueError::new_err(format!("FFI position conversion failed: {}", e)))?;
+
+    // Get config (default to finlab_mode=true for long format)
+    let cfg = config.map(|c| c.inner).unwrap_or_else(|| {
+        BacktestConfig {
+            finlab_mode: true,
+            ..Default::default()
+        }
+    });
+
+    // Parse resample frequency
+    let resample_freq = ResampleFreq::from_str(resample);
+
+    // Build arrow input for btcore
+    let input = LongFormatArrowInput {
+        dates: &dates_rs,
+        symbols: &symbols_rs,
+        prices: &prices_rs,
+        weights: &positions_rs,
+    };
+
+    // Run backtest with trades using btcore
+    let result = backtest_with_trades_long_arrow(&input, resample_freq, &cfg);
+
+    // Convert trades to DataFrame
+    let trades_df = trades_to_dataframe(&result.trades)
+        .map_err(|e| PyValueError::new_err(format!("Failed to create trades DataFrame: {}", e)))?;
+
+    eprintln!("[PROFILE] backtest_with_report: {} rows, {} trades", n_rows, result.trades.len());
+
+    Ok(PyBacktestReport {
+        creturn: result.creturn,
+        trades_df,
+    })
+}
+
 // =============================================================================
 // Wide Format API (for validation/compatibility)
 // =============================================================================
@@ -868,9 +1157,11 @@ fn _polars_backtest(m: &Bound<'_, PyModule>) -> PyResult<()> {
     // Long format types
     m.add_class::<PyLongTradeRecord>()?;
     m.add_class::<PyLongBacktestResult>()?;
+    m.add_class::<PyBacktestReport>()?;
     // Main API (long format)
     m.add_function(wrap_pyfunction!(backtest, m)?)?;
     m.add_function(wrap_pyfunction!(backtest_with_trades, m)?)?;
+    m.add_function(wrap_pyfunction!(backtest_with_report, m)?)?;
     // Wide format API (for validation)
     m.add_function(wrap_pyfunction!(backtest_wide, m)?)?;
     m.add_function(wrap_pyfunction!(backtest_with_trades_wide, m)?)?;

@@ -18,8 +18,10 @@ from dotenv import load_dotenv
 from polars_backtest import (
     backtest_with_report_wide,
     backtest_with_trades_long,
+    backtest_with_report_long,
     BacktestConfig,
 )
+from polars.testing import assert_frame_equal
 
 load_dotenv()
 
@@ -284,7 +286,7 @@ def run_trades_comparison(
     # Run wide format backtest (reference)
     wide_report = backtest_with_report_wide(df_adj, df_position, **kwargs)
 
-    # Parse resample for long format (backtest_with_trades_long uses None for daily)
+    # Parse resample for long format (backtest_with_report_long uses None for daily)
     resample = kwargs.get("resample", "D")
     resample_long = None if resample == "D" else resample
 
@@ -301,8 +303,8 @@ def run_trades_comparison(
         finlab_mode=True,
     )
 
-    # Run long format backtest with trades (uses Rust API directly)
-    long_result = backtest_with_trades_long(
+    # Run long format backtest with report (trades as DataFrame from Rust)
+    long_report = backtest_with_report_long(
         df_long,
         trade_at_price="adj_close",
         position="weight",
@@ -312,15 +314,11 @@ def run_trades_comparison(
 
     print(f"\n=== {test_name} (trades) ===")
     print(f"Wide trades: {len(wide_report.trades)}")
-    print(f"Long trades: {len(long_result.trades)}")
+    print(f"Long trades: {len(long_report.trades)}")
 
-    # Convert long trades to DataFrame
-    long_trades_df = long_trades_to_df(long_result.trades)
+    # Get trades as DataFrames (long format already returns DataFrame from Rust)
+    long_trades_df = long_report.trades
     wide_trades_df = wide_report.trades
-
-    # Trade count must match exactly
-    wide_trade_count = len(wide_trades_df)
-    long_trade_count = len(long_trades_df)
 
     # Filter out pending trades (null entry_date) and open trades (null exit_date)
     # Wide format tracks pending trades (signaled but never executed due to NaN price),
@@ -345,114 +343,116 @@ def run_trades_comparison(
     )
 
     if wide_completed_count == 0:
-        return long_result, wide_report
+        return long_report, wide_report
+
+    # Normalize both DataFrames to same schema for assert_frame_equal comparison
+    # Wide format: dates as strings (Utf8), columns like "trade_price@entry_date"
+    # Long format: dates as Date type, columns like "entry_price"
+
+    # Normalize wide format: cast dates to Date type, rename columns
+    wide_normalized = wide_completed.select([
+        pl.col("stock_id"),
+        pl.col("entry_date").str.to_date("%Y-%m-%d").alias("entry_date"),
+        pl.col("exit_date").str.to_date("%Y-%m-%d").alias("exit_date"),
+        pl.col("entry_sig_date").str.to_date("%Y-%m-%d").alias("entry_sig_date"),
+        pl.col("exit_sig_date").str.to_date("%Y-%m-%d").alias("exit_sig_date"),
+        pl.col("position"),
+        pl.col("trade_price@entry_date").alias("entry_price"),
+        pl.col("trade_price@exit_date").alias("exit_price"),
+        pl.col("return"),
+    ])
+
+    # Normalize long format: select same columns in same order
+    long_normalized = long_completed.select([
+        pl.col("stock_id"),
+        pl.col("entry_date"),
+        pl.col("exit_date"),
+        pl.col("entry_sig_date"),
+        pl.col("exit_sig_date"),
+        pl.col("position"),
+        pl.col("entry_price"),
+        pl.col("exit_price"),
+        pl.col("return"),
+    ])
 
     # Sort both DataFrames by (stock_id, entry_date, exit_date) for comparison
     sort_cols = ["stock_id", "entry_date", "exit_date"]
-    wide_sorted = wide_completed.sort(sort_cols)
-    long_sorted = long_completed.sort(sort_cols)
+    wide_sorted = wide_normalized.sort(sort_cols)
+    long_sorted = long_normalized.sort(sort_cols)
 
-    # Compare key fields
-    # Note: Wide format uses "trade_price@entry_date" and "trade_price@exit_date"
-    # Long format uses "entry_price" and "exit_price"
+    # Use assert_frame_equal for comparison
+    # Note: Wide format uses raw trade_prices (can be NaN for missing data),
+    # Long format uses filtered prices with fallback. This causes exit_price
+    # differences when wide has NaN. We handle this by comparing non-NaN rows.
 
-    # 1. Check stock_id
-    wide_symbols = wide_sorted["stock_id"].to_list()
-    long_symbols = long_sorted["stock_id"].to_list()
-    assert wide_symbols == long_symbols, f"stock_id mismatch at first difference"
+    # First compare columns that should match exactly
+    exact_cols = ["stock_id", "entry_date", "exit_date", "entry_sig_date", "exit_sig_date"]
+    assert_frame_equal(
+        wide_sorted.select(exact_cols),
+        long_sorted.select(exact_cols),
+        check_exact=True,
+    )
 
-    # 2. Check entry_date
-    wide_entry = wide_sorted["entry_date"].to_list()
-    long_entry = long_sorted["entry_date"].to_list()
-    for i, (w, l) in enumerate(zip(wide_entry, long_entry)):
-        if w != l:
-            print(f"entry_date mismatch at index {i}: wide={w}, long={l}")
-            print(f"  wide trade: {wide_sorted.row(i)}")
-            print(f"  long trade: {long_sorted.row(i)}")
-    assert wide_entry == long_entry, "entry_date mismatch"
+    # Compare float columns with tolerance
+    float_cols = ["position", "entry_price"]
+    assert_frame_equal(
+        wide_sorted.select(float_cols),
+        long_sorted.select(float_cols),
+        check_exact=False,
+        abs_tol=1e-6,
+    )
 
-    # 3. Check exit_date
-    wide_exit = wide_sorted["exit_date"].to_list()
-    long_exit = long_sorted["exit_date"].to_list()
-    for i, (w, l) in enumerate(zip(wide_exit, long_exit)):
-        if w != l:
-            print(f"exit_date mismatch at index {i}: wide={w}, long={l}")
-    assert wide_exit == long_exit, "exit_date mismatch"
-
-    # 4. Check position weight
-    wide_pos = wide_sorted["position"].to_list()
-    long_pos = long_sorted["position"].to_list()
-    for i, (w, l) in enumerate(zip(wide_pos, long_pos)):
-        if w is not None and l is not None and abs(w - l) > 1e-6:
-            print(f"position mismatch at index {i}: wide={w}, long={l}")
-    # Allow small tolerance for floating point
-    for w, l in zip(wide_pos, long_pos):
-        if w is None and l is None:
-            continue
-        assert w is not None and l is not None, "position None mismatch"
-        assert abs(w - l) < 1e-6, f"position mismatch: wide={w}, long={l}"
-
+    # For exit_price and return, we need special handling due to NaN fallback difference
+    # Wide format may have NaN exit_price when price data is missing
+    # Long format uses fallback price instead
+    # Filter to rows where both have non-NaN exit_price for strict comparison
     import math
 
-    def floats_equal(a, b, tol=1e-4):
-        """Compare floats handling NaN."""
-        if a is None and b is None:
-            return True
-        if a is None or b is None:
-            return False
-        if math.isnan(a) and math.isnan(b):
-            return True
-        if math.isnan(a) or math.isnan(b):
-            return False
-        return abs(a - b) < tol
+    wide_exit_prices = wide_sorted["exit_price"].to_list()
+    long_exit_prices = long_sorted["exit_price"].to_list()
 
-    # 5. Check entry_price
-    wide_entry_price = wide_sorted["trade_price@entry_date"].to_list()
-    long_entry_price = long_sorted["entry_price"].to_list()
-    for i, (w, lng) in enumerate(zip(wide_entry_price, long_entry_price)):
-        if not floats_equal(w, lng):
-            print(f"entry_price mismatch at index {i}: wide={w}, long={lng}")
-    for w, lng in zip(wide_entry_price, long_entry_price):
-        assert floats_equal(w, lng), f"entry_price mismatch: wide={w}, long={lng}"
+    # Find rows with NaN in wide (known difference)
+    nan_fallback_rows = []
+    for i, (w, l) in enumerate(zip(wide_exit_prices, long_exit_prices)):
+        if w is not None and math.isnan(w) and l is not None and not math.isnan(l):
+            nan_fallback_rows.append(i)
 
-    # 6. Check exit_price (with known difference: long format uses fallback price when wide has NaN)
-    # This is a known behavior difference - wide format uses raw price (can be NaN),
-    # long format uses filtered prices or falls back to previous_price.
-    wide_exit_price = wide_sorted["trade_price@exit_date"].to_list()
-    long_exit_price = long_sorted["exit_price"].to_list()
-    exit_price_mismatches = 0
-    for i, (w, lng) in enumerate(zip(wide_exit_price, long_exit_price)):
-        if not floats_equal(w, lng):
-            # Allow NaN in wide but valid in long (known difference)
-            if w is not None and lng is not None and math.isnan(w) and not math.isnan(lng):
-                continue  # Known difference: long uses fallback price
-            exit_price_mismatches += 1
-            if exit_price_mismatches <= 5:
-                print(f"exit_price mismatch at index {i}: wide={w}, long={lng}")
-    assert exit_price_mismatches == 0 or all(
-        (math.isnan(w) if w is not None else True) or floats_equal(w, lng)
-        for w, lng in zip(wide_exit_price, long_exit_price)
-    ), f"exit_price has {exit_price_mismatches} real mismatches (excluding NaN fallback)"
+    if nan_fallback_rows:
+        print(f"Note: {len(nan_fallback_rows)} rows have NaN exit_price in wide but valid in long (expected)")
 
-    # 7. Check trade return (with same NaN exception as exit_price)
-    # When exit_price differs due to NaN fallback, return will also differ
-    wide_return = wide_sorted["return"].to_list()
-    long_return = long_sorted["return"].to_list()
-    return_mismatches = 0
-    for i, (w, lng) in enumerate(zip(wide_return, long_return)):
-        if not floats_equal(w, lng, tol=1e-6):
-            # Check if this is due to NaN exit_price difference
-            wide_ep = wide_exit_price[i] if i < len(wide_exit_price) else None
-            if wide_ep is not None and math.isnan(wide_ep):
-                continue  # Known difference due to NaN fallback
-            return_mismatches += 1
-            if return_mismatches <= 5:
-                print(f"return mismatch at index {i}: wide={w}, long={lng}")
-    assert return_mismatches == 0, f"return has {return_mismatches} real mismatches"
+    # For non-NaN rows, verify exit_price and return match
+    wide_returns = wide_sorted["return"].to_list()
+    long_returns = long_sorted["return"].to_list()
+
+    mismatches = 0
+    for i, (w_ep, l_ep, w_ret, l_ret) in enumerate(
+        zip(wide_exit_prices, long_exit_prices, wide_returns, long_returns)
+    ):
+        # Skip rows with NaN fallback difference
+        if i in nan_fallback_rows:
+            continue
+        # Check exit_price
+        if w_ep is None or l_ep is None:
+            continue
+        if not (math.isnan(w_ep) and math.isnan(l_ep)):
+            if abs(w_ep - l_ep) > 1e-4:
+                mismatches += 1
+                if mismatches <= 3:
+                    print(f"exit_price mismatch at {i}: wide={w_ep}, long={l_ep}")
+        # Check return
+        if w_ret is None or l_ret is None:
+            continue
+        if not (math.isnan(w_ret) and math.isnan(l_ret)):
+            if abs(w_ret - l_ret) > 1e-6:
+                mismatches += 1
+                if mismatches <= 3:
+                    print(f"return mismatch at {i}: wide={w_ret}, long={l_ret}")
+
+    assert mismatches == 0, f"Found {mismatches} exit_price/return mismatches"
 
     print(f"  All {wide_completed_count} completed trades match exactly!")
 
-    return long_result, wide_report
+    return long_report, wide_report
 
 
 # =============================================================================
