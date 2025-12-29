@@ -40,11 +40,11 @@ use pyo3_polars::PyDataFrame;
 use polars::prelude::*;
 
 use btcore::{
-    run_backtest, run_backtest_with_trades, BacktestConfig, BacktestResult, PriceData,
-    SimTradeRecord,
+    run_backtest, run_backtest_with_trades, BacktestConfig, WideBacktestResult,
+    PriceData, TradeRecord, WideTradeRecord,
     simulation::{
         backtest_long_arrow, backtest_with_report_long_arrow,
-        LongBacktestResult, LongFormatArrowInput, LongTradeRecord, ResampleFreq,
+        LongFormatArrowInput, ResampleFreq,
     },
 };
 
@@ -136,10 +136,10 @@ impl PyBacktestConfig {
     }
 }
 
-/// Python wrapper for TradeRecord
-#[pyclass(name = "TradeRecord")]
+/// Python wrapper for WideTradeRecord (wide format, usize indices)
+#[pyclass(name = "WideTradeRecord")]
 #[derive(Clone)]
-pub struct PyTradeRecord {
+pub struct PyWideTradeRecord {
     #[pyo3(get)]
     pub stock_id: usize,
     #[pyo3(get)]
@@ -161,7 +161,7 @@ pub struct PyTradeRecord {
 }
 
 #[pymethods]
-impl PyTradeRecord {
+impl PyWideTradeRecord {
     fn holding_period(&self) -> Option<usize> {
         match (self.entry_index, self.exit_index) {
             (Some(entry), Some(exit)) => Some(exit - entry),
@@ -171,15 +171,15 @@ impl PyTradeRecord {
 
     fn __repr__(&self) -> String {
         format!(
-            "TradeRecord(stock_id={}, entry={:?}, exit={:?}, weight={:.4}, return={:?})",
+            "WideTradeRecord(stock_id={}, entry={:?}, exit={:?}, weight={:.4}, return={:?})",
             self.stock_id, self.entry_index, self.exit_index,
             self.position_weight, self.trade_return,
         )
     }
 }
 
-impl From<SimTradeRecord> for PyTradeRecord {
-    fn from(r: SimTradeRecord) -> Self {
+impl From<WideTradeRecord> for PyWideTradeRecord {
+    fn from(r: WideTradeRecord) -> Self {
         Self {
             stock_id: r.stock_id,
             entry_index: r.entry_index,
@@ -199,8 +199,6 @@ impl From<SimTradeRecord> for PyTradeRecord {
 #[derive(Clone)]
 pub struct PyBacktestResult {
     creturn_df: DataFrame,
-    #[pyo3(get)]
-    pub trades: Vec<PyTradeRecord>,
 }
 
 #[pymethods]
@@ -213,8 +211,8 @@ impl PyBacktestResult {
 
     fn __repr__(&self) -> String {
         format!(
-            "BacktestResult(creturn_len={}, trades_count={})",
-            self.creturn_df.height(), self.trades.len(),
+            "BacktestResult(creturn_len={})",
+            self.creturn_df.height(),
         )
     }
 }
@@ -226,7 +224,7 @@ pub struct PyWideBacktestResult {
     #[pyo3(get)]
     pub creturn: Vec<f64>,
     #[pyo3(get)]
-    pub trades: Vec<PyTradeRecord>,
+    pub trades: Vec<PyWideTradeRecord>,
 }
 
 #[pymethods]
@@ -239,8 +237,8 @@ impl PyWideBacktestResult {
     }
 }
 
-impl From<BacktestResult> for PyWideBacktestResult {
-    fn from(r: BacktestResult) -> Self {
+impl From<WideBacktestResult> for PyWideBacktestResult {
+    fn from(r: WideBacktestResult) -> Self {
         Self {
             creturn: r.creturn,
             trades: r.trades.into_iter().map(|t| t.into()).collect(),
@@ -248,10 +246,10 @@ impl From<BacktestResult> for PyWideBacktestResult {
     }
 }
 
-/// Python wrapper for LongTradeRecord (string symbols, i32 dates)
-#[pyclass(name = "LongTradeRecord")]
+/// Python wrapper for TradeRecord (default format - string symbols, i32 dates)
+#[pyclass(name = "TradeRecord")]
 #[derive(Clone)]
-pub struct PyLongTradeRecord {
+pub struct PyTradeRecord {
     #[pyo3(get)]
     pub symbol: String,
     #[pyo3(get)]
@@ -273,7 +271,7 @@ pub struct PyLongTradeRecord {
 }
 
 #[pymethods]
-impl PyLongTradeRecord {
+impl PyTradeRecord {
     fn holding_days(&self) -> Option<i32> {
         match (self.entry_date, self.exit_date) {
             (Some(entry), Some(exit)) => Some(exit - entry),
@@ -283,15 +281,15 @@ impl PyLongTradeRecord {
 
     fn __repr__(&self) -> String {
         format!(
-            "LongTradeRecord(symbol='{}', entry_date={:?}, exit_date={:?}, weight={:.4}, return={:?})",
+            "TradeRecord(symbol='{}', entry_date={:?}, exit_date={:?}, weight={:.4}, return={:?})",
             self.symbol, self.entry_date, self.exit_date,
             self.position_weight, self.trade_return,
         )
     }
 }
 
-impl From<LongTradeRecord> for PyLongTradeRecord {
-    fn from(r: LongTradeRecord) -> Self {
+impl From<TradeRecord> for PyTradeRecord {
+    fn from(r: TradeRecord) -> Self {
         Self {
             symbol: r.symbol,
             entry_date: r.entry_date,
@@ -306,36 +304,7 @@ impl From<LongTradeRecord> for PyLongTradeRecord {
     }
 }
 
-/// Python wrapper for LongBacktestResult
-#[pyclass(name = "LongBacktestResult")]
-#[derive(Clone)]
-pub struct PyLongBacktestResult {
-    #[pyo3(get)]
-    pub creturn: Vec<f64>,
-    #[pyo3(get)]
-    pub trades: Vec<PyLongTradeRecord>,
-}
-
-#[pymethods]
-impl PyLongBacktestResult {
-    fn __repr__(&self) -> String {
-        format!(
-            "LongBacktestResult(creturn_len={}, trades_count={})",
-            self.creturn.len(), self.trades.len(),
-        )
-    }
-}
-
-impl From<LongBacktestResult> for PyLongBacktestResult {
-    fn from(r: LongBacktestResult) -> Self {
-        Self {
-            creturn: r.creturn,
-            trades: r.trades.into_iter().map(|t| t.into()).collect(),
-        }
-    }
-}
-
-/// Convert Vec<LongTradeRecord> to a Polars DataFrame
+/// Convert Vec<TradeRecord> to a Polars DataFrame
 ///
 /// Columns:
 /// - stock_id: String (symbol)
@@ -348,7 +317,7 @@ impl From<LongBacktestResult> for PyLongBacktestResult {
 /// - return: Float64 (trade return, optional)
 /// - entry_price: Float64
 /// - exit_price: Float64 (optional)
-fn trades_to_dataframe(trades: &[LongTradeRecord]) -> PolarsResult<DataFrame> {
+fn trades_to_dataframe(trades: &[TradeRecord]) -> PolarsResult<DataFrame> {
     // Build columns
     let stock_id: Vec<&str> = trades.iter().map(|t| t.symbol.as_str()).collect();
     let entry_date: Vec<Option<i32>> = trades.iter().map(|t| t.entry_date).collect();
@@ -441,6 +410,9 @@ impl PyBacktestReport {
 ///     symbol: Name of symbol column (default: "symbol")
 ///     trade_at_price: Name of price column (default: "close")
 ///     position: Name of position/weight column (default: "weight")
+///     open: Name of open price column (default: "open", for touched_exit)
+///     high: Name of high price column (default: "high", for touched_exit)
+///     low: Name of low price column (default: "low", for touched_exit)
 ///     resample: Rebalancing frequency ("D", "W", "M", or None for daily)
 ///     config: BacktestConfig (optional)
 ///     skip_sort: Skip sorting if data is already sorted by date (default: false)
@@ -454,6 +426,9 @@ impl PyBacktestReport {
     symbol="symbol",
     trade_at_price="close",
     position="weight",
+    open="open",
+    high="high",
+    low="low",
     resample=None,
     config=None,
     skip_sort=false
@@ -464,6 +439,9 @@ fn backtest(
     symbol: &str,
     trade_at_price: &str,
     position: &str,
+    open: &str,
+    high: &str,
+    low: &str,
     resample: Option<&str>,
     config: Option<PyBacktestConfig>,
     skip_sort: bool,
@@ -477,12 +455,32 @@ fn backtest(
     let df = df.0;
     let n_rows = df.height();
 
+    // Get config first to check if touched_exit is enabled
+    let cfg = config.map(|c| c.inner).unwrap_or_else(|| {
+        BacktestConfig {
+            finlab_mode: true,
+            ..Default::default()
+        }
+    });
+    let touched_exit = cfg.touched_exit;
+
     // Validate required columns exist
     for col_name in [date, symbol, trade_at_price, position] {
         if df.column(col_name).is_err() {
             return Err(PyValueError::new_err(format!(
                 "Missing required column: '{}'", col_name
             )));
+        }
+    }
+
+    // Validate OHLC columns if touched_exit is enabled
+    if touched_exit {
+        for col_name in [open, high, low] {
+            if df.column(col_name).is_err() {
+                return Err(PyValueError::new_err(format!(
+                    "touched_exit=True requires column '{}', but it is missing", col_name
+                )));
+            }
         }
     }
 
@@ -618,13 +616,47 @@ fn backtest(
     profile!("[PROFILE] FFI conversion (polars-arrow -> arrow-rs): {:?}", step_start.elapsed());
     step_start = Instant::now();
 
-    // Get config (default to finlab_mode=true for long format)
-    let cfg = config.map(|c| c.inner).unwrap_or_else(|| {
-        BacktestConfig {
-            finlab_mode: true,
-            ..Default::default()
-        }
-    });
+    // Process OHLC columns if touched_exit is enabled
+    let (open_rs, high_rs, low_rs) = if touched_exit {
+        // Helper to process a float column
+        let process_float_col = |col_name: &str| -> PyResult<arrow::array::Float64Array> {
+            let col_ref = df.column(col_name)
+                .map_err(|e| PyValueError::new_err(format!("Failed to get {} column: {}", col_name, e)))?;
+            let col_series = if col_ref.dtype() == &DataType::Float64 {
+                col_ref.clone()
+            } else {
+                col_ref.cast(&DataType::Float64)
+                    .map_err(|e| PyValueError::new_err(format!("Failed to cast {}: {}", col_name, e)))?
+            };
+            let col_f64 = col_series.f64()
+                .map_err(|e| PyValueError::new_err(format!("{} must be f64: {}", col_name, e)))?;
+            let col_rechunked;
+            let col_ca: &Float64Chunked = if col_f64.chunks().len() > 1 {
+                col_rechunked = col_f64.rechunk();
+                &col_rechunked
+            } else {
+                col_f64
+            };
+            let col_chunks = col_ca.chunks();
+            let col_arrow = col_chunks[0]
+                .as_any()
+                .downcast_ref::<PrimitiveArray<f64>>()
+                .ok_or_else(|| PyValueError::new_err(format!("Failed to downcast {} array", col_name)))?;
+            ffi_convert::polars_f64_to_arrow(col_arrow)
+                .map_err(|e| PyValueError::new_err(format!("FFI {} conversion failed: {}", col_name, e)))
+        };
+
+        (
+            Some(process_float_col(open)?),
+            Some(process_float_col(high)?),
+            Some(process_float_col(low)?),
+        )
+    } else {
+        (None, None, None)
+    };
+
+    profile!("[PROFILE] OHLC processing: {:?}", step_start.elapsed());
+    step_start = Instant::now();
 
     // Parse resample frequency
     let resample_freq = ResampleFreq::from_str(resample);
@@ -635,9 +667,9 @@ fn backtest(
         symbols: &symbols_rs,
         prices: &prices_rs,
         weights: &positions_rs,
-        open_prices: None,
-        high_prices: None,
-        low_prices: None,
+        open_prices: open_rs.as_ref(),
+        high_prices: high_rs.as_ref(),
+        low_prices: low_rs.as_ref(),
     };
 
     // Run backtest using btcore with arrow-rs arrays
@@ -694,7 +726,6 @@ fn backtest(
 
     Ok(PyBacktestResult {
         creturn_df,
-        trades: vec![],
     })
 }
 
@@ -1157,15 +1188,15 @@ fn df_to_f64_2d(df: &DataFrame) -> Result<Vec<Vec<f64>>, String> {
 #[pymodule]
 fn _polars_backtest(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add("__version__", env!("CARGO_PKG_VERSION"))?;
-    // Wide format types
+    // Config
     m.add_class::<PyBacktestConfig>()?;
+    // Default types (long format)
     m.add_class::<PyTradeRecord>()?;
-    m.add_class::<PyWideBacktestResult>()?;
-    // Long format types
     m.add_class::<PyBacktestResult>()?;
-    m.add_class::<PyLongTradeRecord>()?;
-    m.add_class::<PyLongBacktestResult>()?;
     m.add_class::<PyBacktestReport>()?;
+    // Wide format types
+    m.add_class::<PyWideTradeRecord>()?;
+    m.add_class::<PyWideBacktestResult>()?;
     // Main API (long format)
     m.add_function(wrap_pyfunction!(backtest, m)?)?;
     m.add_function(wrap_pyfunction!(backtest_with_report, m)?)?;

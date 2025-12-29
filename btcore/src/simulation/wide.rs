@@ -14,7 +14,7 @@ use crate::config::BacktestConfig;
 use crate::portfolio::PortfolioState;
 use crate::position::Position;
 use crate::stops::{detect_stops, detect_stops_finlab, detect_touched_exit};
-use crate::tracker::{BacktestResult, LegacyNoopTracker as NoopTracker, LegacyRealTracker as RealTracker, LegacyTradeTracker as TradeTracker};
+use crate::tracker::{WideBacktestResult, LegacyNoopTracker as NoopTracker, LegacyRealTracker as RealTracker, LegacyTradeTracker as TradeTracker};
 use crate::weights::{normalize_weights_finlab, IntoWeights};
 
 // ============================================================================
@@ -1354,13 +1354,13 @@ impl<'a> PriceData<'a> {
 /// * `config` - Backtest configuration
 ///
 /// # Returns
-/// BacktestResult containing creturn and trades list
+/// WideBacktestResult containing creturn and trades list
 pub fn run_backtest_with_trades<S: IntoWeights>(
     prices: &PriceData,
     signals: &[S],
     rebalance_indices: &[usize],
     config: &BacktestConfig,
-) -> BacktestResult {
+) -> WideBacktestResult {
     // Convert signals to weights
     let weights: Vec<Vec<f64>> = signals
         .iter()
@@ -1398,7 +1398,7 @@ pub fn run_backtest_with_trades<S: IntoWeights>(
         config.tax_ratio,
     );
 
-    BacktestResult { creturn, trades }
+    WideBacktestResult { creturn, trades }
 }
 
 // Dead code removed - the following functions were replaced by simulate_backtest:

@@ -17,6 +17,38 @@ if TYPE_CHECKING:
 
 from datetime import date, timedelta
 
+# Register DataFrame namespace (df.bt) and import main API functions
+# Import at the end to avoid circular imports
+from polars_backtest.namespace import (
+    BacktestNamespace,
+    backtest,
+    backtest_with_report,
+)
+
+# Load the Rust extension
+from polars_backtest._polars_backtest import (
+    BacktestConfig,
+    BacktestReport,
+    BacktestResult,
+    # Default types (long format)
+    TradeRecord,
+    WideBacktestResult,
+    # Wide format types
+    WideTradeRecord,
+    __version__,
+)
+from polars_backtest._polars_backtest import (
+    # Main API (long format, zero-copy)
+    backtest as backtest_long,
+)
+from polars_backtest._polars_backtest import (
+    # Wide format API (for validation)
+    backtest_wide as _backtest_wide_rust,
+)
+from polars_backtest._polars_backtest import (
+    backtest_with_report_wide_impl as _backtest_with_report_wide_impl,
+)
+
 
 def _parse_resample_freq(resample: str) -> tuple[str, int | None]:
     """Parse pandas-style resample frequency to polars interval format.
@@ -33,44 +65,44 @@ def _parse_resample_freq(resample: str) -> tuple[str, int | None]:
     resample = resample.upper()
 
     # Daily
-    if resample == 'D':
-        return ('1d', None)
+    if resample == "D":
+        return ("1d", None)
 
     # Weekly with anchor (W-MON, W-FRI, etc.)
-    if resample.startswith('W-'):
-        day_map = {'MON': 1, 'TUE': 2, 'WED': 3, 'THU': 4, 'FRI': 5, 'SAT': 6, 'SUN': 7}
+    if resample.startswith("W-"):
+        day_map = {"MON": 1, "TUE": 2, "WED": 3, "THU": 4, "FRI": 5, "SAT": 6, "SUN": 7}
         anchor = resample[2:]
         if anchor not in day_map:
             raise ValueError(f"Invalid weekly anchor: {anchor}")
-        return ('1w', day_map[anchor])
+        return ("1w", day_map[anchor])
 
     # Weekly (default Sunday end, like pandas)
-    if resample == 'W':
-        return ('1w', 7)  # Sunday
+    if resample == "W":
+        return ("1w", 7)  # Sunday
 
     # Monthly (end of month)
-    if resample in ('M', 'ME', 'BM', 'SM', 'CBM'):
-        return ('1mo', None)
+    if resample in ("M", "ME", "BM", "SM", "CBM"):
+        return ("1mo", None)
 
     # Monthly (start of month)
-    if resample == 'MS':
-        return ('1mo_start', None)
+    if resample == "MS":
+        return ("1mo_start", None)
 
     # Quarterly (end of quarter)
-    if resample in ('Q', 'QE', 'BQ'):
-        return ('3mo', None)
+    if resample in ("Q", "QE", "BQ"):
+        return ("3mo", None)
 
     # Quarterly (start of quarter)
-    if resample == 'QS':
-        return ('3mo_start', None)
+    if resample == "QS":
+        return ("3mo_start", None)
 
     # Yearly (end of year)
-    if resample in ('A', 'Y', 'YE', 'BY'):
-        return ('1y', None)
+    if resample in ("A", "Y", "YE", "BY"):
+        return ("1y", None)
 
     # Yearly (start of year)
-    if resample in ('AS', 'YS'):
-        return ('1y_start', None)
+    if resample in ("AS", "YS"):
+        return ("1y_start", None)
 
     raise ValueError(f"Invalid resample frequency: {resample}")
 
@@ -93,7 +125,7 @@ def _parse_offset(offset_str: str) -> timedelta:
         return timedelta(0)
 
     # Parse format: optional sign, number, unit
-    match = re.match(r'^(-)?(\d+)([DWHMST])$', offset_str.upper())
+    match = re.match(r"^(-)?(\d+)([DWHMST])$", offset_str.upper())
     if not match:
         raise ValueError(f"Invalid offset format: {offset_str}")
 
@@ -101,15 +133,15 @@ def _parse_offset(offset_str: str) -> timedelta:
     value = int(match.group(2))
     unit = match.group(3)
 
-    if unit == 'D':
+    if unit == "D":
         return timedelta(days=sign * value)
-    elif unit == 'W':
+    elif unit == "W":
         return timedelta(weeks=sign * value)
-    elif unit == 'H':
+    elif unit == "H":
         return timedelta(hours=sign * value)
-    elif unit == 'M':
+    elif unit == "M":
         return timedelta(minutes=sign * value)
-    elif unit == 'S':
+    elif unit == "S":
         return timedelta(seconds=sign * value)
     else:
         raise ValueError(f"Unsupported offset unit: {unit}")
@@ -134,7 +166,7 @@ def _get_period_end_dates(
     """
     result_dates = []
 
-    if freq == '1w':
+    if freq == "1w":
         # Weekly: find all specified weekdays between start and end
         # weekday is 1-7 (Mon-Sun)
         current = start_date
@@ -150,7 +182,7 @@ def _get_period_end_dates(
             result_dates.append(current)
             current = current + timedelta(weeks=1)
 
-    elif freq == '1mo':
+    elif freq == "1mo":
         # Monthly end: last day of each month
         current = start_date
         while current <= end_date:
@@ -167,7 +199,7 @@ def _get_period_end_dates(
             # Move to next month
             current = next_month_start
 
-    elif freq == '1mo_start':
+    elif freq == "1mo_start":
         # Monthly start: first day of each month
         current = date(start_date.year, start_date.month, 1)
         while current <= end_date:
@@ -179,7 +211,7 @@ def _get_period_end_dates(
             else:
                 current = date(current.year, current.month + 1, 1)
 
-    elif freq == '3mo':
+    elif freq == "3mo":
         # Quarterly end: last day of March, June, September, December
         quarter_end_months = [3, 6, 9, 12]
         current = start_date
@@ -204,7 +236,7 @@ def _get_period_end_dates(
             else:
                 current = date(current.year, ((current.month - 1) // 3 + 1) * 3 + 1, 1)
 
-    elif freq == '3mo_start':
+    elif freq == "3mo_start":
         # Quarterly start: first day of January, April, July, October
         quarter_start_months = [1, 4, 7, 10]
         current = start_date
@@ -217,7 +249,7 @@ def _get_period_end_dates(
             # Move to next year
             current = date(current.year + 1, 1, 1)
 
-    elif freq == '1y':
+    elif freq == "1y":
         # Yearly end: December 31st
         current_year = start_date.year
         while True:
@@ -228,7 +260,7 @@ def _get_period_end_dates(
                 result_dates.append(year_end)
             current_year += 1
 
-    elif freq == '1y_start':
+    elif freq == "1y_start":
         # Yearly start: January 1st
         current_year = start_date.year
         while True:
@@ -244,36 +276,21 @@ def _get_period_end_dates(
 
     return sorted(set(result_dates))
 
-# Load the Rust extension
-from polars_backtest._polars_backtest import (
-    __version__,
-    BacktestConfig,
-    # Wide format types
-    TradeRecord,
-    BacktestResult,
-    # Long format types
-    LongTradeRecord,
-    LongBacktestResult,
-    BacktestReport,
-    # Main API (long format, zero-copy)
-    backtest as backtest_long,
-    # Wide format API (for validation)
-    backtest_wide as _backtest_wide_rust,
-    backtest_with_report_wide_impl as _backtest_with_report_wide_impl,
-)
+
+
 
 __all__ = [
     "__version__",
     "BacktestConfig",
-    # Wide format types
+    # Default types (long format)
     "TradeRecord",
     "BacktestResult",
-    # Long format types
-    "LongTradeRecord",
-    "LongBacktestResult",
     "BacktestReport",
     "Report",
     "BacktestNamespace",
+    # Wide format types
+    "WideTradeRecord",
+    "WideBacktestResult",
     # Main API (long format, zero-copy)
     "backtest",
     "backtest_with_report",
@@ -483,7 +500,7 @@ def _resample_position(
     Returns:
         Resampled position DataFrame with dates at period boundaries (trading days).
     """
-    if resample == 'D':
+    if resample == "D":
         return position
 
     date_col = position.columns[0]
@@ -503,7 +520,7 @@ def _resample_position(
             return date.fromisoformat(d)
         else:
             # Assume datetime-like
-            return d.date() if hasattr(d, 'date') else date.fromisoformat(str(d)[:10])
+            return d.date() if hasattr(d, "date") else date.fromisoformat(str(d)[:10])
 
     all_dates = [to_date(d) for d in price_dates]
 
@@ -511,12 +528,8 @@ def _resample_position(
     all_dates_df = pl.DataFrame({date_col: [str(d) for d in all_dates]})
 
     # Forward fill position to all trading dates
-    pos_filled = (
-        all_dates_df
-        .join(position, on=date_col, how="left")
-        .with_columns([
-            pl.col(col).forward_fill() for col in stock_cols
-        ])
+    pos_filled = all_dates_df.join(position, on=date_col, how="left").with_columns(
+        [pl.col(col).forward_fill() for col in stock_cols]
     )
 
     # Generate rebalance dates
@@ -524,9 +537,9 @@ def _resample_position(
     end_date = all_dates[-1]
 
     # Extend end_date by one period to include upcoming rebalance date (Finlab behavior)
-    if freq == '1w':
+    if freq == "1w":
         extended_end = end_date + timedelta(weeks=1)
-    elif freq == '1mo' or freq == '1mo_start':
+    elif freq == "1mo" or freq == "1mo_start":
         # Add approximately one month
         if end_date.month == 12:
             extended_end = date(end_date.year + 1, 1, end_date.day)
@@ -536,7 +549,7 @@ def _resample_position(
             except ValueError:
                 # Handle day overflow (e.g., Jan 31 -> Feb 28)
                 extended_end = date(end_date.year, end_date.month + 2, 1) - timedelta(days=1)
-    elif freq == '3mo' or freq == '3mo_start':
+    elif freq == "3mo" or freq == "3mo_start":
         # Add approximately one quarter
         new_month = end_date.month + 3
         new_year = end_date.year + (new_month - 1) // 12
@@ -545,7 +558,7 @@ def _resample_position(
             extended_end = date(new_year, new_month, end_date.day)
         except ValueError:
             extended_end = date(new_year, new_month + 1, 1) - timedelta(days=1)
-    elif freq == '1y' or freq == '1y_start':
+    elif freq == "1y" or freq == "1y_start":
         extended_end = date(end_date.year + 1, end_date.month, end_date.day)
     else:
         extended_end = end_date
@@ -587,11 +600,7 @@ def _resample_position(
     pos_at_dates = pos_filled.filter(pl.col(date_col).is_in(selected_date_strs))
 
     # Remove duplicates and ensure sorted
-    pos_at_dates = (
-        pos_at_dates
-        .unique(subset=[date_col], keep="last")
-        .sort(date_col)
-    )
+    pos_at_dates = pos_at_dates.unique(subset=[date_col], keep="last").sort(date_col)
 
     return pos_at_dates
 
@@ -638,8 +647,7 @@ def _filter_changed_positions(position: pl.DataFrame) -> pl.DataFrame:
     # Calculate diff for each stock column
     # diff().abs().sum(axis=1) != 0 means position changed
     diff_exprs = [
-        pl.col(col).diff().abs().fill_null(0.0).alias(f"_diff_{col}")
-        for col in stock_cols
+        pl.col(col).diff().abs().fill_null(0.0).alias(f"_diff_{col}") for col in stock_cols
     ]
 
     # Add diff columns
@@ -647,9 +655,7 @@ def _filter_changed_positions(position: pl.DataFrame) -> pl.DataFrame:
 
     # Sum of absolute diffs across all stocks
     diff_cols = [f"_diff_{col}" for col in stock_cols]
-    with_diff = with_diff.with_columns(
-        pl.sum_horizontal(diff_cols).alias("_diff_sum")
-    )
+    with_diff = with_diff.with_columns(pl.sum_horizontal(diff_cols).alias("_diff_sum"))
 
     # First row should always be included if it has any non-null values
     # Check if first row has any non-zero/non-null values
@@ -674,9 +680,11 @@ def _filter_changed_positions(position: pl.DataFrame) -> pl.DataFrame:
     kept_indices = with_diff.filter(mask).get_column("_row_idx").to_list()
 
     # Filter original position using the indices (preserves original types)
-    result = position.with_row_index("_row_idx").filter(
-        pl.col("_row_idx").is_in(kept_indices)
-    ).drop("_row_idx")
+    result = (
+        position.with_row_index("_row_idx")
+        .filter(pl.col("_row_idx").is_in(kept_indices))
+        .drop("_row_idx")
+    )
 
     return result
 
@@ -684,7 +692,7 @@ def _filter_changed_positions(position: pl.DataFrame) -> pl.DataFrame:
 def backtest_wide(
     prices: pl.DataFrame,
     position: pl.DataFrame,
-    resample: str | None = 'D',
+    resample: str | None = "D",
     resample_offset: str | None = None,
     rebalance_indices: list[int] | None = None,
     fee_ratio: float = 0.001425,
@@ -785,7 +793,7 @@ def backtest_wide(
     if resample is None:
         # resample=None: Only rebalance when position changes (Finlab behavior)
         position = _filter_changed_positions(position)
-    elif resample != 'D':
+    elif resample != "D":
         position = _resample_position(position, price_dates, resample, resample_offset)
 
     # Select only common stocks and reorder
@@ -838,10 +846,12 @@ def backtest_wide(
 
     # Build result DataFrame
     dates = prices.select(date_col).to_series()
-    result = pl.DataFrame({
-        date_col: dates,
-        "creturn": creturn,
-    })
+    result = pl.DataFrame(
+        {
+            date_col: dates,
+            "creturn": creturn,
+        }
+    )
 
     return result
 
@@ -902,10 +912,12 @@ class Report:
 
         Like Finlab, starts from the first date with signals.
         """
-        return pl.DataFrame({
-            "date": self._dates[self._first_signal_index:],
-            "creturn": self._creturn_list[self._first_signal_index:],
-        })
+        return pl.DataFrame(
+            {
+                "date": self._dates[self._first_signal_index :],
+                "creturn": self._creturn_list[self._first_signal_index :],
+            }
+        )
 
     @property
     def position(self) -> pl.DataFrame:
@@ -929,53 +941,77 @@ class Report:
             trade_price@exit_date: Exit price (ORIGINAL, not adjusted)
         """
         if not self._trades_raw:
-            return pl.DataFrame({
-                "stock_id": [],
-                "entry_date": [],
-                "exit_date": [],
-                "entry_sig_date": [],
-                "exit_sig_date": [],
-                "position": [],
-                "period": [],
-                "return": [],
-                "trade_price@entry_date": [],
-                "trade_price@exit_date": [],
-            })
+            return pl.DataFrame(
+                {
+                    "stock_id": [],
+                    "entry_date": [],
+                    "exit_date": [],
+                    "entry_sig_date": [],
+                    "exit_sig_date": [],
+                    "position": [],
+                    "period": [],
+                    "return": [],
+                    "trade_price@entry_date": [],
+                    "trade_price@exit_date": [],
+                }
+            )
 
         # Convert TradeRecord objects to DataFrame
         records = []
         for t in self._trades_raw:
-            stock_id = self._stock_columns[t.stock_id] if t.stock_id < len(self._stock_columns) else str(t.stock_id)
+            stock_id = (
+                self._stock_columns[t.stock_id]
+                if t.stock_id < len(self._stock_columns)
+                else str(t.stock_id)
+            )
             # entry_index can be None for pending entries (signals not yet executed)
-            entry_date = self._dates[t.entry_index] if t.entry_index is not None and t.entry_index < len(self._dates) else None
-            exit_date = self._dates[t.exit_index] if t.exit_index is not None and t.exit_index < len(self._dates) else None
-            entry_sig_date = self._dates[t.entry_sig_index] if t.entry_sig_index < len(self._dates) else None
-            exit_sig_date = self._dates[t.exit_sig_index] if t.exit_sig_index is not None and t.exit_sig_index < len(self._dates) else None
+            entry_date = (
+                self._dates[t.entry_index]
+                if t.entry_index is not None and t.entry_index < len(self._dates)
+                else None
+            )
+            exit_date = (
+                self._dates[t.exit_index]
+                if t.exit_index is not None and t.exit_index < len(self._dates)
+                else None
+            )
+            entry_sig_date = (
+                self._dates[t.entry_sig_index] if t.entry_sig_index < len(self._dates) else None
+            )
+            exit_sig_date = (
+                self._dates[t.exit_sig_index]
+                if t.exit_sig_index is not None and t.exit_sig_index < len(self._dates)
+                else None
+            )
             period = t.holding_period()
 
-            records.append({
-                "stock_id": stock_id,
-                "entry_date": entry_date,
-                "exit_date": exit_date,
-                "entry_sig_date": entry_sig_date,
-                "exit_sig_date": exit_sig_date,
-                "position": t.position_weight,
-                "period": period,
-                "return": t.trade_return,
-                "trade_price@entry_date": t.entry_price,
-                "trade_price@exit_date": t.exit_price,
-            })
+            records.append(
+                {
+                    "stock_id": stock_id,
+                    "entry_date": entry_date,
+                    "exit_date": exit_date,
+                    "entry_sig_date": entry_sig_date,
+                    "exit_sig_date": exit_sig_date,
+                    "position": t.position_weight,
+                    "period": period,
+                    "return": t.trade_return,
+                    "trade_price@entry_date": t.entry_price,
+                    "trade_price@exit_date": t.exit_price,
+                }
+            )
 
         return pl.DataFrame(records)
 
     def __repr__(self) -> str:
-        return f"Report(creturn_len={len(self._creturn_list)}, trades_count={len(self._trades_raw)})"
+        return (
+            f"Report(creturn_len={len(self._creturn_list)}, trades_count={len(self._trades_raw)})"
+        )
 
 
 def backtest_with_report_wide(
     close: pl.DataFrame,
     position: pl.DataFrame,
-    resample: str | None = 'D',
+    resample: str | None = "D",
     resample_offset: str | None = None,
     trade_at_price: str | pl.DataFrame = "close",
     open: pl.DataFrame | None = None,
@@ -1107,8 +1143,10 @@ def backtest_with_report_wide(
                 raise ValueError("trade_at_price='low' requires 'low' DataFrame")
             trade_prices = low
         else:
-            raise ValueError(f"Invalid trade_at_price: {trade_at_price}. "
-                           "Must be 'close', 'open', 'high', 'low', or a DataFrame")
+            raise ValueError(
+                f"Invalid trade_at_price: {trade_at_price}. "
+                "Must be 'close', 'open', 'high', 'low', or a DataFrame"
+            )
     else:
         trade_prices = trade_at_price
 
@@ -1143,7 +1181,7 @@ def backtest_with_report_wide(
     if resample is None:
         # resample=None: Only rebalance when position changes (Finlab behavior)
         position = _filter_changed_positions(position)
-    elif resample != 'D':
+    elif resample != "D":
         position = _resample_position(position, dates, resample, resample_offset)
 
     # Ensure position has same stock columns
@@ -1173,7 +1211,7 @@ def backtest_with_report_wide(
         if first_idx is None:
             raise ValueError("No matching dates between prices and position")
 
-        if resample == 'D':
+        if resample == "D":
             # resample='D' means daily rebalance (like Finlab)
             # Every day from first position date is a rebalance point
             rebalance_indices = list(range(first_idx, len(dates)))
@@ -1184,12 +1222,9 @@ def backtest_with_report_wide(
 
             # Join and forward fill
             position_expanded = (
-                all_dates_df
-                .join(position, on=pos_date_col, how="left")
+                all_dates_df.join(position, on=pos_date_col, how="left")
                 .select([pos_date_col] + position_stock_cols)
-                .with_columns([
-                    pl.col(col).forward_fill() for col in position_stock_cols
-                ])
+                .with_columns([pl.col(col).forward_fill() for col in position_stock_cols])
             )
 
             # Take only from first_idx onwards
@@ -1217,10 +1252,15 @@ def backtest_with_report_wide(
             # add the last price date as a rebalance point so the signal becomes pending
             if unmatched_position_indices:
                 # Check if unmatched dates are AFTER all matched dates
-                last_matched_pos_idx = max(
-                    i for i, pos_d in enumerate(position_dates)
-                    if pos_d in [dates[idx] for idx in rebalance_indices]
-                ) if rebalance_indices else -1
+                last_matched_pos_idx = (
+                    max(
+                        i
+                        for i, pos_d in enumerate(position_dates)
+                        if pos_d in [dates[idx] for idx in rebalance_indices]
+                    )
+                    if rebalance_indices
+                    else -1
+                )
 
                 for unmatched_idx in unmatched_position_indices:
                     if unmatched_idx > last_matched_pos_idx:
@@ -1250,8 +1290,7 @@ def backtest_with_report_wide(
         row = position_data[i]
         # Check if any value in this row is non-zero (True or > 0)
         has_signal = any(
-            row[col][0] is not None and row[col][0] > 0
-            for col in position_data.columns
+            row[col][0] is not None and row[col][0] > 0 for col in position_data.columns
         )
         if has_signal:
             first_signal_rebalance_idx = i
@@ -1323,12 +1362,3 @@ def backtest_with_report_wide(
         tax_ratio=tax_ratio,
         first_signal_index=first_signal_index,
     )
-
-
-# Register DataFrame namespace (df.bt) and import main API functions
-# Import at the end to avoid circular imports
-from polars_backtest.namespace import (
-    BacktestNamespace,
-    backtest,
-    backtest_with_report,
-)

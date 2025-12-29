@@ -174,6 +174,9 @@ class BacktestNamespace:
         position: ColumnSpec = "weight",
         date: ColumnSpec = "date",
         symbol: ColumnSpec = "symbol",
+        open: ColumnSpec = "open",
+        high: ColumnSpec = "high",
+        low: ColumnSpec = "low",
         resample: str | None = "D",
         resample_offset: str | None = None,
         fee_ratio: float = 0.001425,
@@ -185,6 +188,7 @@ class BacktestNamespace:
         retain_cost_when_rebalance: bool = False,
         stop_trading_next_period: bool = True,
         finlab_mode: bool = False,
+        touched_exit: bool = False,
     ) -> pl.DataFrame:
         """Run backtest on long format DataFrame.
 
@@ -193,6 +197,9 @@ class BacktestNamespace:
             position: Position/weight column name or Expr (default: "weight")
             date: Date column name or Expr (default: "date")
             symbol: Symbol column name or Expr (default: "symbol")
+            open: Open price column name or Expr (default: "open", for touched_exit)
+            high: High price column name or Expr (default: "high", for touched_exit)
+            low: Low price column name or Expr (default: "low", for touched_exit)
             resample: Rebalance frequency ('D', 'W', 'M', 'Q', 'Y', None)
             resample_offset: Optional offset for rebalance dates
             fee_ratio: Transaction fee ratio
@@ -204,6 +211,7 @@ class BacktestNamespace:
             retain_cost_when_rebalance: Retain costs when rebalancing
             stop_trading_next_period: Stop trading after stop triggered
             finlab_mode: Use Finlab-compatible calculation
+            touched_exit: Use OHLC for intraday stop detection (requires open/high/low)
 
         Returns:
             DataFrame with columns: date, creturn
@@ -221,6 +229,23 @@ class BacktestNamespace:
         missing = [c for c in required if c not in df.columns]
         if missing:
             raise ValueError(f"Missing required columns: {missing}")
+
+        # Resolve OHLC columns only when touched_exit is True
+        open_col: str = "open"
+        high_col: str = "high"
+        low_col: str = "low"
+        if touched_exit:
+            df, open_col = _resolve_column(df, open, "_bt_open")
+            df, high_col = _resolve_column(df, high, "_bt_high")
+            df, low_col = _resolve_column(df, low, "_bt_low")
+
+            # Validate OHLC columns exist
+            ohlc_cols = [open_col, high_col, low_col]
+            ohlc_missing = [c for c in ohlc_cols if c not in df.columns]
+            if ohlc_missing:
+                raise ValueError(
+                    f"touched_exit=True requires open/high/low columns. Missing: {ohlc_missing}"
+                )
 
         # Check if position column is boolean (signals)
         position_dtype = df.get_column(position_col).dtype
@@ -256,6 +281,7 @@ class BacktestNamespace:
                 retain_cost_when_rebalance=retain_cost_when_rebalance,
                 stop_trading_next_period=stop_trading_next_period,
                 finlab_mode=finlab_mode,
+                touched_exit=touched_exit,
             )
 
             # Check if already sorted by date (pyo3-polars loses this flag during transfer)
@@ -268,6 +294,9 @@ class BacktestNamespace:
                 symbol_col,
                 price_col,
                 position_col,
+                open_col,
+                high_col,
+                low_col,
                 resample,
                 config,
                 skip_sort,
@@ -338,6 +367,7 @@ class BacktestNamespace:
             retain_cost_when_rebalance=retain_cost_when_rebalance,
             stop_trading_next_period=stop_trading_next_period,
             finlab_mode=finlab_mode,
+            touched_exit=touched_exit,
         )
 
         # Run backtest (convert bool to float if needed)
@@ -346,6 +376,8 @@ class BacktestNamespace:
         else:
             position_data = position_data.cast(pl.Float64)
 
+        # Note: Wide format backtest doesn't support touched_exit yet
+        # Would need to pass OHLC data as well
         creturn = _backtest_wide_rust(
             prices_data, position_data, rebalance_indices, config
         )
@@ -514,6 +546,9 @@ def backtest(
     position: ColumnSpec = "weight",
     date: ColumnSpec = "date",
     symbol: ColumnSpec = "symbol",
+    open: ColumnSpec = "open",
+    high: ColumnSpec = "high",
+    low: ColumnSpec = "low",
     resample: str | None = "D",
     resample_offset: str | None = None,
     fee_ratio: float = 0.001425,
@@ -525,6 +560,7 @@ def backtest(
     retain_cost_when_rebalance: bool = False,
     stop_trading_next_period: bool = True,
     finlab_mode: bool = False,
+    touched_exit: bool = False,
 ) -> pl.DataFrame:
     """Run backtest on long format DataFrame.
 
@@ -534,6 +570,9 @@ def backtest(
         position: Position/weight column name or Expr (default: "weight")
         date: Date column name or Expr (default: "date")
         symbol: Symbol column name or Expr (default: "symbol")
+        open: Open price column name or Expr (default: "open", for touched_exit)
+        high: High price column name or Expr (default: "high", for touched_exit)
+        low: Low price column name or Expr (default: "low", for touched_exit)
         resample: Rebalance frequency ('D', 'W', 'M', 'Q', 'Y', None)
         resample_offset: Optional offset for rebalance dates
         fee_ratio: Transaction fee ratio
@@ -545,6 +584,7 @@ def backtest(
         retain_cost_when_rebalance: Retain costs when rebalancing
         stop_trading_next_period: Stop trading after stop triggered
         finlab_mode: Use Finlab-compatible calculation
+        touched_exit: Use OHLC for intraday stop detection (requires open/high/low)
 
     Returns:
         DataFrame with columns: date, creturn
@@ -558,6 +598,9 @@ def backtest(
         position=position,
         date=date,
         symbol=symbol,
+        open=open,
+        high=high,
+        low=low,
         resample=resample,
         resample_offset=resample_offset,
         fee_ratio=fee_ratio,
@@ -569,6 +612,7 @@ def backtest(
         retain_cost_when_rebalance=retain_cost_when_rebalance,
         stop_trading_next_period=stop_trading_next_period,
         finlab_mode=finlab_mode,
+        touched_exit=touched_exit,
     )
 
 

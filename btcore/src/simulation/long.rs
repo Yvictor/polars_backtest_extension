@@ -17,7 +17,7 @@ use arrow::array::{Float64Array, Int32Array, StringViewArray};
 
 use crate::config::BacktestConfig;
 use crate::position::Position;
-use crate::tracker::{BacktestResult, LongBacktestResult, LongTradeRecord, NoopSymbolTracker, SymbolTracker, TradeTracker};
+use crate::tracker::{BacktestResult, TradeRecord, NoopSymbolTracker, SymbolTracker, TradeTracker};
 
 /// Portfolio with string symbol keys (for zero-copy backtest)
 pub struct Portfolio {
@@ -142,7 +142,7 @@ where
     FO: Fn(usize) -> f64,
     FH: Fn(usize) -> f64,
     FL: Fn(usize) -> f64,
-    T: TradeTracker<Key = String, Date = i32, Record = LongTradeRecord>,
+    T: TradeTracker<Key = String, Date = i32, Record = TradeRecord>,
 {
     if n_rows == 0 {
         return (vec![], vec![]);
@@ -402,12 +402,13 @@ where
 /// * `get_weight` - Closure to get weight at index (NaN = no signal)
 /// * `resample` - Rebalancing frequency
 /// * `config` - Backtest configuration
-pub fn backtest_with_accessor<'a, FD, FS, FP, FW>(
+pub fn backtest_with_accessor<'a, FD, FS, FP, FW, FO, FH, FL>(
     n_rows: usize,
     get_date: FD,
     get_symbol: FS,
     get_price: FP,
     get_weight: FW,
+    ohlc_accessors: Option<(FO, FH, FL)>,
     resample: ResampleFreq,
     config: &BacktestConfig,
 ) -> BacktestResult
@@ -416,21 +417,47 @@ where
     FS: Fn(usize) -> &'a str,
     FP: Fn(usize) -> f64,
     FW: Fn(usize) -> f64,
+    FO: Fn(usize) -> f64,
+    FH: Fn(usize) -> f64,
+    FL: Fn(usize) -> f64,
 {
     let mut tracker = NoopSymbolTracker::default();
-    let ohlc: Option<OhlcGetters<fn(usize) -> f64, fn(usize) -> f64, fn(usize) -> f64>> = None;
-    let (_dates, creturn) = backtest_impl(
-        n_rows,
-        get_date,
-        get_symbol,
-        get_price,
-        get_weight,
-        resample,
-        config,
-        &mut tracker,
-        ohlc,
-    );
+
+    let (dates, creturn) = if config.touched_exit && ohlc_accessors.is_some() {
+        let (get_open, get_high, get_low) = ohlc_accessors.unwrap();
+        let ohlc = Some(OhlcGetters {
+            get_open,
+            get_high,
+            get_low,
+        });
+        backtest_impl(
+            n_rows,
+            get_date,
+            get_symbol,
+            get_price,
+            get_weight,
+            resample,
+            config,
+            &mut tracker,
+            ohlc,
+        )
+    } else {
+        let ohlc: Option<OhlcGetters<fn(usize) -> f64, fn(usize) -> f64, fn(usize) -> f64>> = None;
+        backtest_impl(
+            n_rows,
+            get_date,
+            get_symbol,
+            get_price,
+            get_weight,
+            resample,
+            config,
+            &mut tracker,
+            ohlc,
+        )
+    };
+
     BacktestResult {
+        dates,
         creturn,
         trades: vec![],
     }
@@ -439,6 +466,7 @@ where
 /// Run backtest on Arrow arrays with zero-copy access
 ///
 /// Delegates to `backtest_with_accessor` using Arrow array closures.
+/// Supports touched_exit mode when OHLC data is provided in input.
 ///
 /// # Arguments
 /// * `input` - Arrow arrays containing long format data (must be sorted by date)
@@ -446,59 +474,145 @@ where
 /// * `config` - Backtest configuration
 ///
 /// # Returns
-/// LongBacktestResult containing dates, cumulative returns, and empty trades
+/// BacktestResult containing dates, cumulative returns, and empty trades
 pub fn backtest_long_arrow(
     input: &LongFormatArrowInput,
     resample: ResampleFreq,
     config: &BacktestConfig,
-) -> LongBacktestResult {
-    let mut tracker = NoopSymbolTracker::default();
-    let ohlc: Option<OhlcGetters<fn(usize) -> f64, fn(usize) -> f64, fn(usize) -> f64>> = None;
-    let (dates, creturn) = backtest_impl(
+) -> BacktestResult {
+    // Build OHLC accessors if data is available
+    let ohlc_accessors = if input.open_prices.is_some()
+        && input.high_prices.is_some()
+        && input.low_prices.is_some()
+    {
+        let open_arr = input.open_prices.unwrap();
+        let high_arr = input.high_prices.unwrap();
+        let low_arr = input.low_prices.unwrap();
+        Some((
+            move |i: usize| open_arr.value(i),
+            move |i: usize| high_arr.value(i),
+            move |i: usize| low_arr.value(i),
+        ))
+    } else {
+        None
+    };
+
+    backtest_with_accessor(
         input.dates.len(),
         |i| input.dates.value(i),
         |i| input.symbols.value(i),
         |i| input.prices.value(i),
         |i| input.weights.value(i),
+        ohlc_accessors,
         resample,
         config,
-        &mut tracker,
-        ohlc,
-    );
-    LongBacktestResult {
-        dates,
-        creturn,
-        trades: vec![],
-    }
+    )
 }
 
 /// Run backtest on native Rust slices
+///
+/// Supports touched_exit mode when OHLC data is provided.
 pub fn backtest_long_slice(
     dates: &[i32],
     symbols: &[&str],
     prices: &[f64],
     weights: &[f64],
+    open_prices: Option<&[f64]>,
+    high_prices: Option<&[f64]>,
+    low_prices: Option<&[f64]>,
     resample: ResampleFreq,
     config: &BacktestConfig,
-) -> LongBacktestResult {
-    let mut tracker = NoopSymbolTracker::default();
-    let ohlc: Option<OhlcGetters<fn(usize) -> f64, fn(usize) -> f64, fn(usize) -> f64>> = None;
-    let (result_dates, creturn) = backtest_impl(
+) -> BacktestResult {
+    // Build OHLC accessors if data is available
+    let ohlc_accessors =
+        if open_prices.is_some() && high_prices.is_some() && low_prices.is_some() {
+            let open = open_prices.unwrap();
+            let high = high_prices.unwrap();
+            let low = low_prices.unwrap();
+            Some((
+                move |i: usize| open[i],
+                move |i: usize| high[i],
+                move |i: usize| low[i],
+            ))
+        } else {
+            None
+        };
+
+    backtest_with_accessor(
         dates.len(),
         |i| dates[i],
         |i| symbols[i],
         |i| prices[i],
         |i| weights[i],
+        ohlc_accessors,
         resample,
         config,
-        &mut tracker,
-        ohlc,
-    );
-    LongBacktestResult {
-        dates: result_dates,
-        creturn,
-        trades: vec![],
-    }
+    )
+}
+
+
+// ============================================================================
+// Backtest with trade tracking
+// ============================================================================
+
+/// Run backtest on Arrow arrays with full report (trades tracking)
+///
+/// Delegates to `backtest_impl` with `SymbolTracker` for trade tracking.
+/// Same as `backtest_long_arrow` but returns trade records as well.
+/// Supports touched_exit mode when OHLC data is provided in input.
+pub fn backtest_with_report_long_arrow(
+    input: &LongFormatArrowInput,
+    resample: ResampleFreq,
+    config: &BacktestConfig,
+) -> BacktestResult {
+    let mut tracker = SymbolTracker::new();
+
+    // Build OHLC getters if data is available and touched_exit is enabled
+    let (dates, creturn) = if config.touched_exit
+        && input.open_prices.is_some()
+        && input.high_prices.is_some()
+        && input.low_prices.is_some()
+    {
+        let open_arr = input.open_prices.unwrap();
+        let high_arr = input.high_prices.unwrap();
+        let low_arr = input.low_prices.unwrap();
+
+        let ohlc = Some(OhlcGetters {
+            get_open: |i: usize| open_arr.value(i),
+            get_high: |i: usize| high_arr.value(i),
+            get_low: |i: usize| low_arr.value(i),
+        });
+
+        backtest_impl(
+            input.dates.len(),
+            |i| input.dates.value(i),
+            |i| input.symbols.value(i),
+            |i| input.prices.value(i),
+            |i| input.weights.value(i),
+            resample,
+            config,
+            &mut tracker,
+            ohlc,
+        )
+    } else {
+        let ohlc: Option<OhlcGetters<fn(usize) -> f64, fn(usize) -> f64, fn(usize) -> f64>> = None;
+        backtest_impl(
+            input.dates.len(),
+            |i| input.dates.value(i),
+            |i| input.symbols.value(i),
+            |i| input.prices.value(i),
+            |i| input.weights.value(i),
+            resample,
+            config,
+            &mut tracker,
+            ohlc,
+        )
+    };
+
+    // Finalize trades (include open positions)
+    let trades = tracker.finalize(config.fee_ratio, config.tax_ratio);
+
+    BacktestResult { dates, creturn, trades }
 }
 
 /// Check if prev_date is a month-end using i32 dates (days since 1970-01-01)
@@ -593,7 +707,7 @@ fn execute_pending_stops_impl<T>(
     tracker: &mut T,
 )
 where
-    T: TradeTracker<Key = String, Date = i32, Record = LongTradeRecord>,
+    T: TradeTracker<Key = String, Date = i32, Record = TradeRecord>,
 {
     for sym in pending_stops.drain(..) {
         if let Some(pos) = portfolio.positions.remove(&sym) {
@@ -759,7 +873,7 @@ fn execute_stops_impl<T>(
     tracker: &mut T,
 )
 where
-    T: TradeTracker<Key = String, Date = i32, Record = LongTradeRecord>,
+    T: TradeTracker<Key = String, Date = i32, Record = TradeRecord>,
 {
     for stop in stops {
         if let Some(pos) = portfolio.positions.remove(&stop.symbol) {
@@ -805,7 +919,7 @@ fn execute_rebalance_impl<T>(
     tracker: &mut T,
 )
 where
-    T: TradeTracker<Key = String, Date = i32, Record = LongTradeRecord>,
+    T: TradeTracker<Key = String, Date = i32, Record = TradeRecord>,
 {
     // Update existing positions to market value
     for (_sym, pos) in portfolio.positions.iter_mut() {
@@ -1089,69 +1203,7 @@ fn normalize_weights(
         .collect()
 }
 
-// ============================================================================
-// Backtest with trade tracking
-// ============================================================================
 
-/// Run backtest on Arrow arrays with full report (trades tracking)
-///
-/// Delegates to `backtest_impl` with `SymbolTracker` for trade tracking.
-/// Same as `backtest_long_arrow` but returns trade records as well.
-/// Supports touched_exit mode when OHLC data is provided in input.
-pub fn backtest_with_report_long_arrow(
-    input: &LongFormatArrowInput,
-    resample: ResampleFreq,
-    config: &BacktestConfig,
-) -> LongBacktestResult {
-    let mut tracker = SymbolTracker::new();
-
-    // Build OHLC getters if data is available and touched_exit is enabled
-    let (dates, creturn) = if config.touched_exit
-        && input.open_prices.is_some()
-        && input.high_prices.is_some()
-        && input.low_prices.is_some()
-    {
-        let open_arr = input.open_prices.unwrap();
-        let high_arr = input.high_prices.unwrap();
-        let low_arr = input.low_prices.unwrap();
-
-        let ohlc = Some(OhlcGetters {
-            get_open: |i: usize| open_arr.value(i),
-            get_high: |i: usize| high_arr.value(i),
-            get_low: |i: usize| low_arr.value(i),
-        });
-
-        backtest_impl(
-            input.dates.len(),
-            |i| input.dates.value(i),
-            |i| input.symbols.value(i),
-            |i| input.prices.value(i),
-            |i| input.weights.value(i),
-            resample,
-            config,
-            &mut tracker,
-            ohlc,
-        )
-    } else {
-        let ohlc: Option<OhlcGetters<fn(usize) -> f64, fn(usize) -> f64, fn(usize) -> f64>> = None;
-        backtest_impl(
-            input.dates.len(),
-            |i| input.dates.value(i),
-            |i| input.symbols.value(i),
-            |i| input.prices.value(i),
-            |i| input.weights.value(i),
-            resample,
-            config,
-            &mut tracker,
-            ohlc,
-        )
-    };
-
-    // Finalize trades (include open positions)
-    let trades = tracker.finalize(config.fee_ratio, config.tax_ratio);
-
-    LongBacktestResult { dates, creturn, trades }
-}
 
 #[cfg(test)]
 mod tests {
@@ -1353,7 +1405,7 @@ mod tests {
             ..Default::default()
         };
 
-        let result = backtest_long_slice(&dates, &symbols, &prices, &weights, ResampleFreq::Daily, &config);
+        let result = backtest_long_slice(&dates, &symbols, &prices, &weights, None, None, None, ResampleFreq::Daily, &config);
 
         assert_eq!(result.creturn.len(), 3);
         assert!((result.creturn[2] - 1.1).abs() < 1e-10);

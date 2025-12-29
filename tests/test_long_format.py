@@ -885,6 +885,174 @@ def run_touched_exit_comparison(
     return long_report, wide_report
 
 
+def run_backtest_touched_exit_comparison(
+    df_long: pl.DataFrame,
+    df_adj: pl.DataFrame,
+    df_position: pl.DataFrame,
+    df_open: pl.DataFrame,
+    df_high: pl.DataFrame,
+    df_low: pl.DataFrame,
+    test_name: str,
+    **kwargs,
+):
+    """Run comparison between long format backtest() and wide format with touched_exit.
+
+    Compares pl_bt.backtest() (long format) against backtest_with_report_wide() (reference).
+    """
+    # Run wide format backtest (reference)
+    wide_report = backtest_with_report_wide(
+        df_adj, df_position,
+        open=df_open, high=df_high, low=df_low,
+        touched_exit=True,
+        **kwargs,
+    )
+
+    # Parse resample for long format
+    resample = kwargs.get("resample", "D")
+
+    # Run long format backtest() with touched_exit
+    long_result = pl_bt.backtest(
+        df_long,
+        trade_at_price="adj_close",
+        position="weight",
+        open="open",
+        high="high",
+        low="low",
+        resample=resample,
+        fee_ratio=kwargs.get("fee_ratio", 0.001425),
+        tax_ratio=kwargs.get("tax_ratio", 0.003),
+        stop_loss=kwargs.get("stop_loss", 1.0),
+        take_profit=kwargs.get("take_profit", float("inf")),
+        trail_stop=kwargs.get("trail_stop", float("inf")),
+        position_limit=kwargs.get("position_limit", 1.0),
+        finlab_mode=True,
+        touched_exit=True,
+    )
+
+    # Compare creturn
+    wide_creturn = wide_report.creturn.with_columns(pl.col("date").cast(pl.Date))
+    long_creturn = long_result.rename({"creturn": "creturn_long"}).with_columns(
+        pl.col("date").cast(pl.Date)
+    )
+
+    print(f"\n=== {test_name} (backtest function) ===")
+    print(f"Wide rows: {len(wide_creturn)}, Long rows: {len(long_creturn)}")
+    print(f"Wide final: {wide_creturn.get_column('creturn')[-1]:.6f}")
+    print(f"Long final: {long_creturn.get_column('creturn_long')[-1]:.6f}")
+
+    df_cmp = wide_creturn.join(long_creturn, on="date", how="inner")
+
+    max_diff = df_cmp.select(
+        ((pl.col("creturn") - pl.col("creturn_long")).abs().max()).alias("max_diff")
+    ).get_column("max_diff")[0]
+
+    df_ne = df_cmp.filter(pl.col("creturn").round(6) != pl.col("creturn_long").round(6))
+
+    print(f"Max diff: {max_diff:.2e}")
+    if not df_ne.is_empty():
+        print(f"Differences:\n{df_ne.head(5)}")
+
+    assert df_ne.is_empty(), f"Found {len(df_ne)} differences in creturn"
+    assert max_diff < CRETURN_RTOL, f"Max diff {max_diff} exceeds tolerance"
+
+    return long_result, wide_report
+
+
+@pytest.mark.parametrize("stop_loss", [0.05, 0.1])
+def test_backtest_touched_exit_stop_loss(
+    wide_format_df, long_format_with_ohlc, wide_ohlc_dfs, position_bool, stop_loss
+):
+    """Test backtest() with touched_exit and stop_loss - compare with wide format."""
+    df_adj, _ = wide_format_df
+    df_long = long_format_with_ohlc
+    df_open, df_high, df_low = wide_ohlc_dfs
+
+    df_position = wide_position_to_pl(position_bool)
+    df_long_with_weight = add_weight_to_long(df_long)
+
+    run_backtest_touched_exit_comparison(
+        df_long_with_weight,
+        df_adj,
+        df_position,
+        df_open,
+        df_high,
+        df_low,
+        f"backtest+touched_exit+stop_loss={stop_loss}",
+        resample="M",
+        stop_loss=stop_loss,
+    )
+
+
+@pytest.mark.parametrize("take_profit", [0.1, 0.2])
+def test_backtest_touched_exit_take_profit(
+    wide_format_df, long_format_with_ohlc, wide_ohlc_dfs, position_bool, take_profit
+):
+    """Test backtest() with touched_exit and take_profit - compare with wide format."""
+    df_adj, _ = wide_format_df
+    df_long = long_format_with_ohlc
+    df_open, df_high, df_low = wide_ohlc_dfs
+
+    df_position = wide_position_to_pl(position_bool)
+    df_long_with_weight = add_weight_to_long(df_long)
+
+    run_backtest_touched_exit_comparison(
+        df_long_with_weight,
+        df_adj,
+        df_position,
+        df_open,
+        df_high,
+        df_low,
+        f"backtest+touched_exit+take_profit={take_profit}",
+        resample="M",
+        take_profit=take_profit,
+    )
+
+
+def test_backtest_touched_exit_combined(
+    wide_format_df, long_format_with_ohlc, wide_ohlc_dfs, position_bool
+):
+    """Test backtest() with touched_exit, stop_loss and take_profit - compare with wide format."""
+    df_adj, _ = wide_format_df
+    df_long = long_format_with_ohlc
+    df_open, df_high, df_low = wide_ohlc_dfs
+
+    df_position = wide_position_to_pl(position_bool)
+    df_long_with_weight = add_weight_to_long(df_long)
+
+    run_backtest_touched_exit_comparison(
+        df_long_with_weight,
+        df_adj,
+        df_position,
+        df_open,
+        df_high,
+        df_low,
+        "backtest+touched_exit+combined",
+        resample="M",
+        stop_loss=0.1,
+        take_profit=0.2,
+    )
+
+
+def test_backtest_touched_exit_missing_ohlc_columns():
+    """Test that backtest() raises error when touched_exit=True but OHLC columns missing."""
+    df = pl.DataFrame({
+        "date": ["2024-01-01", "2024-01-02", "2024-01-03"],
+        "symbol": ["AAPL", "AAPL", "AAPL"],
+        "close": [100.0, 102.0, 105.0],
+        "weight": [1.0, 1.0, 0.0],
+    }).with_columns(pl.col("date").str.to_date())
+
+    # Should raise error because open/high/low columns are missing
+    with pytest.raises(ValueError, match="touched_exit=True requires"):
+        pl_bt.backtest(
+            df,
+            trade_at_price="close",
+            position="weight",
+            touched_exit=True,
+            stop_loss=0.1,
+        )
+
+
 @pytest.mark.parametrize("stop_loss", [0.05, 0.1])
 def test_touched_exit_stop_loss(
     wide_format_df, long_format_with_ohlc, wide_ohlc_dfs, position_bool, stop_loss

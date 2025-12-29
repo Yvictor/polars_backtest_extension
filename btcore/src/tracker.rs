@@ -22,7 +22,7 @@ use std::hash::Hash;
 /// Fields use original prices (not adjusted) for entry/exit prices,
 /// matching Finlab's actual trading record format.
 #[derive(Debug, Clone)]
-pub struct TradeRecord {
+pub struct WideTradeRecord {
     /// Stock ID (column index in price matrix)
     pub stock_id: usize,
     /// Actual entry date (row index in price matrix, T+1 after signal)
@@ -44,7 +44,7 @@ pub struct TradeRecord {
     pub trade_return: Option<f64>,
 }
 
-impl TradeRecord {
+impl WideTradeRecord {
     /// Calculate holding period in days
     pub fn holding_period(&self) -> Option<usize> {
         match (self.entry_index, self.exit_index) {
@@ -64,12 +64,12 @@ impl TradeRecord {
     }
 }
 
-/// Trade record for long format (string symbols, i32 dates)
+/// Trade record (string symbols, i32 dates) - default format
 ///
-/// Similar to TradeRecord but uses string symbols and i32 dates (days since epoch)
-/// instead of usize indices for direct use with Polars DataFrames.
+/// Uses string symbols and i32 dates (days since epoch) for direct use with Polars DataFrames.
+/// This is the default/recommended format.
 #[derive(Debug, Clone)]
-pub struct LongTradeRecord {
+pub struct TradeRecord {
     /// Stock symbol (string key)
     pub symbol: String,
     /// Actual entry date (days since epoch, T+1 after signal)
@@ -91,7 +91,7 @@ pub struct LongTradeRecord {
     pub trade_return: Option<f64>,
 }
 
-impl LongTradeRecord {
+impl TradeRecord {
     /// Calculate holding period in days
     pub fn holding_days(&self) -> Option<i32> {
         match (self.entry_date, self.exit_date) {
@@ -114,22 +114,22 @@ impl LongTradeRecord {
 
 /// Result of a backtest simulation including trades (wide format)
 #[derive(Debug, Clone)]
-pub struct BacktestResult {
+pub struct WideBacktestResult {
     /// Cumulative returns at each time step
     pub creturn: Vec<f64>,
     /// List of completed trades
-    pub trades: Vec<TradeRecord>,
+    pub trades: Vec<WideTradeRecord>,
 }
 
-/// Result of a long format backtest with trades
+/// Result of a backtest with trades - default format
 #[derive(Debug, Clone)]
-pub struct LongBacktestResult {
+pub struct BacktestResult {
     /// Unique dates (i32 days since epoch) - same length as creturn
     pub dates: Vec<i32>,
     /// Cumulative returns at each time step (one per unique date)
     pub creturn: Vec<f64>,
-    /// List of completed trades with string symbols
-    pub trades: Vec<LongTradeRecord>,
+    /// List of completed trades
+    pub trades: Vec<TradeRecord>,
 }
 
 // ============================================================================
@@ -139,8 +139,8 @@ pub struct LongBacktestResult {
 /// Trait for tracking trades during simulation
 ///
 /// Uses associated types to support both:
-/// - Wide format: `Key=usize`, `Date=usize`, `Record=TradeRecord`
-/// - Long format: `Key=String`, `Date=i32`, `Record=LongTradeRecord`
+/// - Wide format: `Key=usize`, `Date=usize`, `Record=WideTradeRecord`
+/// - Long format: `Key=String`, `Date=i32`, `Record=TradeRecord`
 ///
 /// This allows zero-cost abstraction when trade tracking is not needed.
 pub trait TradeTracker {
@@ -250,8 +250,8 @@ where
 }
 
 // Type aliases for convenience
-pub type NoopIndexTracker = NoopTracker<usize, usize, TradeRecord>;
-pub type NoopSymbolTracker = NoopTracker<String, i32, LongTradeRecord>;
+pub type NoopIndexTracker = NoopTracker<usize, usize, WideTradeRecord>;
+pub type NoopSymbolTracker = NoopTracker<String, i32, TradeRecord>;
 
 // ============================================================================
 // IndexTracker - Wide format (usize keys)
@@ -270,13 +270,13 @@ struct IndexOpenTrade {
 /// Trade tracker for wide format - uses usize indices
 pub struct IndexTracker {
     open_trades: HashMap<usize, IndexOpenTrade>,
-    completed_trades: Vec<TradeRecord>,
+    completed_trades: Vec<WideTradeRecord>,
 }
 
 impl TradeTracker for IndexTracker {
     type Key = usize;
     type Date = usize;
-    type Record = TradeRecord;
+    type Record = WideTradeRecord;
 
     fn new() -> Self {
         Self {
@@ -315,7 +315,7 @@ impl TradeTracker for IndexTracker {
         tax_ratio: f64,
     ) {
         if let Some(open_trade) = self.open_trades.remove(key) {
-            let trade = TradeRecord {
+            let trade = WideTradeRecord {
                 stock_id: *key,
                 entry_index: Some(open_trade.entry_index),
                 exit_index: Some(exit_date),
@@ -328,7 +328,7 @@ impl TradeTracker for IndexTracker {
             };
             let trade_return = trade.calculate_return(fee_ratio, tax_ratio);
 
-            self.completed_trades.push(TradeRecord {
+            self.completed_trades.push(WideTradeRecord {
                 trade_return,
                 ..trade
             });
@@ -340,7 +340,7 @@ impl TradeTracker for IndexTracker {
     }
 
     fn add_pending_entry(&mut self, key: usize, signal_date: usize, weight: f64) {
-        self.completed_trades.push(TradeRecord {
+        self.completed_trades.push(WideTradeRecord {
             stock_id: key,
             entry_index: None,
             exit_index: None,
@@ -353,10 +353,10 @@ impl TradeTracker for IndexTracker {
         });
     }
 
-    fn finalize(mut self, _fee_ratio: f64, _tax_ratio: f64) -> Vec<TradeRecord> {
+    fn finalize(mut self, _fee_ratio: f64, _tax_ratio: f64) -> Vec<WideTradeRecord> {
         // Report open positions as still open (like Finlab: exit_date=NaT)
         for (stock_id, open_trade) in self.open_trades.drain() {
-            self.completed_trades.push(TradeRecord {
+            self.completed_trades.push(WideTradeRecord {
                 stock_id,
                 entry_index: Some(open_trade.entry_index),
                 exit_index: None,
@@ -389,13 +389,13 @@ struct SymbolOpenTrade {
 /// Trade tracker for long format - uses String symbols and i32 dates
 pub struct SymbolTracker {
     open_trades: HashMap<String, SymbolOpenTrade>,
-    completed_trades: Vec<LongTradeRecord>,
+    completed_trades: Vec<TradeRecord>,
 }
 
 impl TradeTracker for SymbolTracker {
     type Key = String;
     type Date = i32;
-    type Record = LongTradeRecord;
+    type Record = TradeRecord;
 
     fn new() -> Self {
         Self {
@@ -434,7 +434,7 @@ impl TradeTracker for SymbolTracker {
         tax_ratio: f64,
     ) {
         if let Some(open_trade) = self.open_trades.remove(key) {
-            let trade = LongTradeRecord {
+            let trade = TradeRecord {
                 symbol: open_trade.symbol,
                 entry_date: Some(open_trade.entry_date),
                 exit_date: Some(exit_date),
@@ -447,7 +447,7 @@ impl TradeTracker for SymbolTracker {
             };
             let trade_return = trade.calculate_return(fee_ratio, tax_ratio);
 
-            self.completed_trades.push(LongTradeRecord {
+            self.completed_trades.push(TradeRecord {
                 trade_return,
                 ..trade
             });
@@ -459,7 +459,7 @@ impl TradeTracker for SymbolTracker {
     }
 
     fn add_pending_entry(&mut self, key: String, signal_date: i32, weight: f64) {
-        self.completed_trades.push(LongTradeRecord {
+        self.completed_trades.push(TradeRecord {
             symbol: key,
             entry_date: None,
             exit_date: None,
@@ -472,10 +472,10 @@ impl TradeTracker for SymbolTracker {
         });
     }
 
-    fn finalize(mut self, _fee_ratio: f64, _tax_ratio: f64) -> Vec<LongTradeRecord> {
+    fn finalize(mut self, _fee_ratio: f64, _tax_ratio: f64) -> Vec<TradeRecord> {
         // Report open positions as still open
         for (_symbol, open_trade) in self.open_trades.drain() {
-            self.completed_trades.push(LongTradeRecord {
+            self.completed_trades.push(TradeRecord {
                 symbol: open_trade.symbol,
                 entry_date: Some(open_trade.entry_date),
                 exit_date: None,
@@ -508,7 +508,7 @@ pub(crate) trait LegacyTradeTracker {
     #[allow(dead_code)]
     fn get_entry_price(&self, stock_id: usize) -> Option<f64>;
     fn add_pending_entry(&mut self, stock_id: usize, signal_index: usize, weight: f64);
-    fn finalize(self, last_index: usize, trade_prices: &[f64], fee_ratio: f64, tax_ratio: f64) -> Vec<TradeRecord>;
+    fn finalize(self, last_index: usize, trade_prices: &[f64], fee_ratio: f64, tax_ratio: f64) -> Vec<WideTradeRecord>;
 }
 
 /// Legacy NoopTracker for wide.rs compatibility
@@ -528,13 +528,13 @@ impl LegacyTradeTracker for LegacyNoopTracker {
     #[inline]
     fn add_pending_entry(&mut self, _: usize, _: usize, _: f64) {}
     #[inline]
-    fn finalize(self, _: usize, _: &[f64], _: f64, _: f64) -> Vec<TradeRecord> { vec![] }
+    fn finalize(self, _: usize, _: &[f64], _: f64, _: f64) -> Vec<WideTradeRecord> { vec![] }
 }
 
 /// Legacy RealTracker for wide.rs compatibility
 pub(crate) struct LegacyRealTracker {
     open_trades: HashMap<usize, IndexOpenTrade>,
-    completed_trades: Vec<TradeRecord>,
+    completed_trades: Vec<WideTradeRecord>,
 }
 
 impl LegacyTradeTracker for LegacyRealTracker {
@@ -560,7 +560,7 @@ impl LegacyTradeTracker for LegacyRealTracker {
 
     fn close_trade(&mut self, stock_id: usize, exit_index: usize, exit_sig_index: Option<usize>, exit_price: f64, fee_ratio: f64, tax_ratio: f64) {
         if let Some(open_trade) = self.open_trades.remove(&stock_id) {
-            let trade = TradeRecord {
+            let trade = WideTradeRecord {
                 stock_id,
                 entry_index: Some(open_trade.entry_index),
                 exit_index: Some(exit_index),
@@ -572,7 +572,7 @@ impl LegacyTradeTracker for LegacyRealTracker {
                 trade_return: None,
             };
             let trade_return = trade.calculate_return(fee_ratio, tax_ratio);
-            self.completed_trades.push(TradeRecord { trade_return, ..trade });
+            self.completed_trades.push(WideTradeRecord { trade_return, ..trade });
         }
     }
 
@@ -585,7 +585,7 @@ impl LegacyTradeTracker for LegacyRealTracker {
     }
 
     fn add_pending_entry(&mut self, stock_id: usize, signal_index: usize, weight: f64) {
-        self.completed_trades.push(TradeRecord {
+        self.completed_trades.push(WideTradeRecord {
             stock_id,
             entry_index: None,
             exit_index: None,
@@ -598,9 +598,9 @@ impl LegacyTradeTracker for LegacyRealTracker {
         });
     }
 
-    fn finalize(mut self, _last_index: usize, _trade_prices: &[f64], _fee_ratio: f64, _tax_ratio: f64) -> Vec<TradeRecord> {
+    fn finalize(mut self, _last_index: usize, _trade_prices: &[f64], _fee_ratio: f64, _tax_ratio: f64) -> Vec<WideTradeRecord> {
         for (stock_id, open_trade) in self.open_trades.drain() {
-            self.completed_trades.push(TradeRecord {
+            self.completed_trades.push(WideTradeRecord {
                 stock_id,
                 entry_index: Some(open_trade.entry_index),
                 exit_index: None,
@@ -621,8 +621,8 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_trade_record_holding_period() {
-        let trade = TradeRecord {
+    fn test_wide_trade_record_holding_period() {
+        let trade = WideTradeRecord {
             stock_id: 0,
             entry_index: Some(5),
             exit_index: Some(15),
@@ -637,8 +637,8 @@ mod tests {
     }
 
     #[test]
-    fn test_trade_record_calculate_return() {
-        let trade = TradeRecord {
+    fn test_wide_trade_record_calculate_return() {
+        let trade = WideTradeRecord {
             stock_id: 0,
             entry_index: Some(0),
             exit_index: Some(10),
@@ -724,8 +724,8 @@ mod tests {
     }
 
     #[test]
-    fn test_long_trade_record_holding_days() {
-        let trade = LongTradeRecord {
+    fn test_trade_record_holding_days() {
+        let trade = TradeRecord {
             symbol: "2330".to_string(),
             entry_date: Some(19000),
             exit_date: Some(19010),
