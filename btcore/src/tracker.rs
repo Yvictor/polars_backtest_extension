@@ -260,7 +260,6 @@ pub type NoopSymbolTracker = NoopTracker<String, i32, TradeRecord>;
 /// Open position tracking for wide format
 #[derive(Debug, Clone)]
 struct IndexOpenTrade {
-    stock_id: usize,
     entry_index: usize,
     entry_sig_index: usize,
     weight: f64,
@@ -296,7 +295,6 @@ impl TradeTracker for IndexTracker {
         self.open_trades.insert(
             key,
             IndexOpenTrade {
-                stock_id: key,
                 entry_index: entry_date,
                 entry_sig_index: signal_date,
                 weight,

@@ -92,6 +92,7 @@ pub fn polars_utf8view_to_arrow(
 
 /// Check that FFI struct sizes match (for safe transmute)
 /// Returns (polars_array_size, polars_schema_size, arrow_array_size, arrow_schema_size)
+#[allow(dead_code)]
 pub fn check_ffi_struct_sizes() -> (usize, usize, usize, usize) {
     (
         std::mem::size_of::<pa_ffi::ArrowArray>(),
@@ -102,6 +103,7 @@ pub fn check_ffi_struct_sizes() -> (usize, usize, usize, usize) {
 }
 
 /// Verify FFI compatibility at runtime
+#[allow(dead_code)]
 pub fn verify_ffi_compatibility() -> Result<(), String> {
     let (pa_array, pa_schema, ar_array, ar_schema) = check_ffi_struct_sizes();
 
