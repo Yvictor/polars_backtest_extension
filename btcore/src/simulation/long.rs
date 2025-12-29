@@ -171,8 +171,10 @@ impl ResampleOffset {
 
 /// Delayed rebalance entry for offset support
 ///
-/// Only stores the target date. When triggered, uses the weights from that day
-/// (prev_date when date > target_date), matching Wide format's forward-fill behavior.
+/// Only stores the target date. When triggered (date > target_date),
+/// uses the signal date's weights (from today_weights at prev_date).
+/// This matches Wide format's _resample_position behavior where
+/// the position is sampled at the signal date, not the boundary date.
 #[derive(Debug, Clone, Copy)]
 struct DelayedRebalance {
     /// The target date to trigger rebalance (boundary_date + offset.days)
@@ -324,29 +326,35 @@ where
             // Check if any delayed rebalances are due
             // Move them to pending_weights for execution
             //
-            // Wide format behavior: find last trading day <= target_date
-            // This happens when current date crosses target_date (date > target_date)
-            // At that point, prev_date is the last trading day <= target_date
-            // Use prev_date's weights (from today_weights) as the signal weights
-            // This matches Wide format's forward-fill behavior
+            // Wide format behavior with offset:
+            // - _resample_position shifts boundary dates forward by offset
+            // - The weights used are from the SIGNAL date, not boundary date
+            // - This is because _resample_position samples position at shifted date
+            //
+            // When date > target_date:
+            // - prev_date is the signal date (last trading day <= target_date)
+            // - Use prev_date's weights (from today_weights)
             let mut delayed_triggered_first_signal = false;
             while let Some(delayed) = delayed_rebalances.front() {
                 if date > delayed.target_date {
-                    // date crossed target_date, prev_date is last trading day <= target_date
-                    let _ = delayed_rebalances.pop_front();
-                    // Use active_weights (forward-filled from boundary) for rebalance
-                    // This matches Wide format where position is forward-filled to signal date
-                    // NOT today_weights, because Wide format uses the boundary weights
-                    // that were captured and forward-filled
-                    if !active_weights.is_empty() {
+                    // date crossed target_date, prev_date is the signal date
+                    let _delayed = delayed_rebalances.pop_front().unwrap();
+
+                    // Normalize signal date's weights (from today_weights)
+                    let signal_weights = normalize_weights(
+                        &today_weights,
+                        &stopped_stocks,
+                        config.position_limit,
+                    );
+
+                    if !signal_weights.is_empty() {
                         // Track if this is the first signal (for skipping immediate execution)
                         if !has_first_signal {
                             delayed_triggered_first_signal = true;
                         }
-                        // First signal is when delayed rebalance triggers (not at boundary)
-                        // This matches Wide format where creturn starts from signal date
+                        // First signal is when delayed rebalance triggers
                         has_first_signal = true;
-                        pending_weights = Some(active_weights.clone());
+                        pending_weights = Some(signal_weights);
                         pending_signal_date = Some(prev_date);
                     }
                     // Only process one delayed rebalance per day
@@ -476,11 +484,11 @@ where
             };
 
             if should_rebalance {
-                if offset_days > 0 && has_signals {
+                if offset_days > 0 {
                     // Delay the rebalance by offset_days
                     // target_date = prev_date + offset_days (calendar days)
                     // When date > target_date, prev_date becomes the signal date
-                    // and its weights will be used (matching Wide format forward-fill)
+                    // Signal date's weights will be used (not boundary weights)
                     delayed_rebalances.push_back(DelayedRebalance {
                         target_date: prev_date + offset_days,
                     });
