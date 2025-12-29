@@ -266,7 +266,7 @@ class BacktestNamespace:
         # Check if we can use Rust path
         # Supported resample: D, W, W-MON..W-SUN, M, MS, Q, QS, Y, None
         # Note: resample_offset requires Python path to match Wide format behavior
-        # (Rust offset implementation differs from Python's _resample_position)
+        # (Rust offset implementation has different semantics - TODO: unify later)
         resample_supported = resample in (
             None, "D",
             "W", "W-MON", "W-TUE", "W-WED", "W-THU", "W-FRI", "W-SAT", "W-SUN",

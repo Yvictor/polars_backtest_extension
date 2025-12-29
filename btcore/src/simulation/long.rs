@@ -170,14 +170,13 @@ impl ResampleOffset {
 }
 
 /// Delayed rebalance entry for offset support
-#[derive(Debug, Clone)]
+///
+/// Only stores the target date. When triggered, uses the weights from that day
+/// (prev_date when date > target_date), matching Wide format's forward-fill behavior.
+#[derive(Debug, Clone, Copy)]
 struct DelayedRebalance {
-    /// Target weights to apply
-    weights: HashMap<String, f64>,
-    /// The signal date (when boundary was detected)
-    signal_date: i32,
-    /// The target execution date (signal_date + offset.days)
-    /// pending_weights will be set when we reach this date
+    /// The target date to trigger rebalance (boundary_date + offset.days)
+    /// When date > target_date, prev_date becomes the signal date
     target_date: i32,
 }
 
@@ -328,14 +327,28 @@ where
             // Wide format behavior: find last trading day <= target_date
             // This happens when current date crosses target_date (date > target_date)
             // At that point, prev_date is the last trading day <= target_date
-            // Use prev_date as the new signal date, then T+1 execution happens naturally
+            // Use prev_date's weights (from today_weights) as the signal weights
+            // This matches Wide format's forward-fill behavior
+            let mut delayed_triggered_first_signal = false;
             while let Some(delayed) = delayed_rebalances.front() {
                 if date > delayed.target_date {
                     // date crossed target_date, prev_date is last trading day <= target_date
-                    let delayed = delayed_rebalances.pop_front().unwrap();
-                    pending_weights = Some(delayed.weights);
-                    // Use prev_date as signal date (matching Wide format behavior)
-                    pending_signal_date = Some(prev_date);
+                    let _ = delayed_rebalances.pop_front();
+                    // Use active_weights (forward-filled from boundary) for rebalance
+                    // This matches Wide format where position is forward-filled to signal date
+                    // NOT today_weights, because Wide format uses the boundary weights
+                    // that were captured and forward-filled
+                    if !active_weights.is_empty() {
+                        // Track if this is the first signal (for skipping immediate execution)
+                        if !has_first_signal {
+                            delayed_triggered_first_signal = true;
+                        }
+                        // First signal is when delayed rebalance triggers (not at boundary)
+                        // This matches Wide format where creturn starts from signal date
+                        has_first_signal = true;
+                        pending_weights = Some(active_weights.clone());
+                        pending_signal_date = Some(prev_date);
+                    }
                     // Only process one delayed rebalance per day
                     break;
                 } else {
@@ -344,7 +357,12 @@ where
             }
 
             // STEP 3: Execute pending rebalance
-            if let Some(target_weights) = pending_weights.take() {
+            // Skip if this is the first signal from delayed rebalance (will execute on T+1)
+            // This matches Wide format where signal_date has creturn=1.0, trade executes on T+1
+            if delayed_triggered_first_signal {
+                // Keep pending_weights for next day (T+1 execution)
+                // Don't take() so it stays in pending_weights
+            } else if let Some(target_weights) = pending_weights.take() {
                 let sig_date = pending_signal_date.take().unwrap_or(prev_date);
                 execute_rebalance_impl(
                     &mut portfolio,
@@ -375,20 +393,26 @@ where
             // Check if prev_date is a specific weekday (for WeeklyOn)
             let prev_weekday = weekday_of_i32(prev_date);
 
+            // When offset > 0, has_first_signal is set when delayed rebalance triggers
+            // (already handled above), not at boundary. This matches Wide format behavior.
+            let set_first_signal_at_boundary = offset_days == 0;
+
+            // Track if we have signals for later use
+            let has_signals = !normalized.is_empty();
+
             match resample {
                 ResampleFreq::Daily => {
-                    if !normalized.is_empty() {
+                    if has_signals && set_first_signal_at_boundary {
                         has_first_signal = true;
                     }
                     if has_first_signal {
-                        active_weights = normalized;
+                        active_weights = normalized.clone();
                     }
                 }
                 ResampleFreq::Weekly => {
                     if is_week_end {
-                        let has_signals = !normalized.is_empty();
-                        active_weights = normalized;
-                        if has_signals {
+                        active_weights = normalized.clone();
+                        if has_signals && set_first_signal_at_boundary {
                             has_first_signal = true;
                         }
                     }
@@ -396,9 +420,8 @@ where
                 ResampleFreq::WeeklyOn(weekday) => {
                     // Rebalance on specific weekday (0=Mon, ..., 6=Sun)
                     if prev_weekday == weekday {
-                        let has_signals = !normalized.is_empty();
-                        active_weights = normalized;
-                        if has_signals {
+                        active_weights = normalized.clone();
+                        if has_signals && set_first_signal_at_boundary {
                             has_first_signal = true;
                         }
                     }
@@ -406,9 +429,8 @@ where
                 ResampleFreq::Monthly | ResampleFreq::MonthStart => {
                     // Both trigger at month boundary (end of one month / start of next)
                     if is_month_end {
-                        let has_signals = !normalized.is_empty();
-                        active_weights = normalized;
-                        if has_signals {
+                        active_weights = normalized.clone();
+                        if has_signals && set_first_signal_at_boundary {
                             has_first_signal = true;
                         }
                     }
@@ -416,24 +438,22 @@ where
                 ResampleFreq::Quarterly | ResampleFreq::QuarterStart => {
                     // Both trigger at quarter boundary
                     if is_quarter_end {
-                        let has_signals = !normalized.is_empty();
-                        active_weights = normalized;
-                        if has_signals {
+                        active_weights = normalized.clone();
+                        if has_signals && set_first_signal_at_boundary {
                             has_first_signal = true;
                         }
                     }
                 }
                 ResampleFreq::Yearly => {
                     if is_year_end {
-                        let has_signals = !normalized.is_empty();
-                        active_weights = normalized;
-                        if has_signals {
+                        active_weights = normalized.clone();
+                        if has_signals && set_first_signal_at_boundary {
                             has_first_signal = true;
                         }
                     }
                 }
                 ResampleFreq::PositionChange => {
-                    if !normalized.is_empty() {
+                    if has_signals && set_first_signal_at_boundary {
                         has_first_signal = true;
                     }
                     position_changed = weights_differ(&active_weights, &normalized);
@@ -441,39 +461,42 @@ where
                 }
             }
 
-            // STEP 5: Check rebalance (only after first signal)
-            if has_first_signal {
-                let should_rebalance = match resample {
-                    ResampleFreq::Monthly | ResampleFreq::MonthStart => is_month_end,
-                    ResampleFreq::Weekly => is_week_end,
-                    ResampleFreq::WeeklyOn(weekday) => prev_weekday == weekday,
-                    ResampleFreq::Quarterly | ResampleFreq::QuarterStart => is_quarter_end,
-                    ResampleFreq::Yearly => is_year_end,
-                    ResampleFreq::Daily => true,
-                    ResampleFreq::PositionChange => position_changed,
-                };
+            // STEP 5: Check rebalance
+            // When offset > 0: push to delayed queue even before has_first_signal
+            // (has_first_signal will be set when delayed rebalance triggers)
+            // When offset = 0: only rebalance after first signal (normal behavior)
+            let should_rebalance = match resample {
+                ResampleFreq::Monthly | ResampleFreq::MonthStart => is_month_end,
+                ResampleFreq::Weekly => is_week_end,
+                ResampleFreq::WeeklyOn(weekday) => prev_weekday == weekday,
+                ResampleFreq::Quarterly | ResampleFreq::QuarterStart => is_quarter_end,
+                ResampleFreq::Yearly => is_year_end,
+                ResampleFreq::Daily => true,
+                ResampleFreq::PositionChange => position_changed,
+            };
 
-                if should_rebalance {
-                    if offset_days > 0 {
-                        // Delay the rebalance by offset_days
-                        // target_date = prev_date + offset_days means:
-                        // - boundary on D, offset=1d -> execute on D+2 (T+1+offset)
-                        delayed_rebalances.push_back(DelayedRebalance {
-                            weights: active_weights.clone(),
-                            signal_date: prev_date,
-                            target_date: prev_date + offset_days,
-                        });
-                    } else {
-                        // No offset: set pending_weights for next day (T+1)
-                        pending_weights = Some(active_weights.clone());
-                        pending_signal_date = Some(prev_date);
-                    }
+            if should_rebalance {
+                if offset_days > 0 && has_signals {
+                    // Delay the rebalance by offset_days
+                    // target_date = prev_date + offset_days (calendar days)
+                    // When date > target_date, prev_date becomes the signal date
+                    // and its weights will be used (matching Wide format forward-fill)
+                    delayed_rebalances.push_back(DelayedRebalance {
+                        target_date: prev_date + offset_days,
+                    });
+                } else if has_first_signal {
+                    // No offset: set pending_weights for next day (T+1)
+                    pending_weights = Some(active_weights.clone());
+                    pending_signal_date = Some(prev_date);
                 }
             }
 
-            // STEP 6: Record date and creturn
-            dates.push(prev_date);
-            creturn.push(portfolio.balance());
+            // STEP 6: Record date and creturn (only after first signal)
+            // This matches Wide format behavior where creturn starts from first signal date
+            if has_first_signal {
+                dates.push(prev_date);
+                creturn.push(portfolio.balance());
+            }
 
             today_prices.clear();
             today_weights.clear();
@@ -549,8 +572,11 @@ where
                 );
             }
 
-            dates.push(last_date);
-            creturn.push(portfolio.balance());
+            // Only record if we have first signal (consistent with main loop)
+            if has_first_signal {
+                dates.push(last_date);
+                creturn.push(portfolio.balance());
+            }
         }
     }
 
