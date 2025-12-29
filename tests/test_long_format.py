@@ -206,6 +206,11 @@ def run_comparison(
         pl.col("date").cast(pl.Date)
     )
 
+    print(f"\n=== {test_name} ===")
+    print(f"Wide rows: {len(wide_creturn)}, Long rows: {len(long_creturn)}")
+    print(f"Wide final: {wide_creturn.get_column('creturn')[-1]:.6f}")
+    print(f"Long final: {long_creturn.get_column('creturn_long')[-1]:.6f}")
+
     df_cmp = wide_creturn.join(long_creturn, on="date", how="inner")
 
     max_diff = df_cmp.select(
@@ -214,9 +219,6 @@ def run_comparison(
 
     df_ne = df_cmp.filter(pl.col("creturn").round(6) != pl.col("creturn_long").round(6))
 
-    print(f"\n=== {test_name} ===")
-    print(f"Wide final: {wide_creturn.get_column('creturn')[-1]:.6f}")
-    print(f"Long final: {long_creturn.get_column('creturn_long')[-1]:.6f}")
     print(f"Max diff: {max_diff:.2e}")
     if not df_ne.is_empty():
         print(f"Differences:\n{df_ne.head(5)}")
@@ -855,21 +857,19 @@ def run_touched_exit_comparison(
 
     # Compare creturn
     wide_creturn = wide_report.creturn.with_columns(pl.col("date").cast(pl.Date))
-    long_creturn_list = long_report.creturn
+    long_creturn = long_report.creturn.rename({"creturn": "creturn_long"})
 
-    # Get dates from long format result
-    dates = (
-        df_long.select("date")
-        .unique()
-        .sort("date")
-        .get_column("date")
+    print(f"\n=== {test_name} ===")
+    print(f"Wide rows: {len(wide_creturn)}, Long rows: {len(long_creturn)}")
+    print(f"Wide final: {wide_creturn.get_column('creturn')[-1]:.6f}")
+    print(f"Long final: {long_creturn.get_column('creturn_long')[-1]:.6f}")
+    print(f"Wide trades: {len(wide_report.trades)}")
+    print(f"Long trades: {len(long_report.trades)}")
+
+    # Check row counts match (long format should filter leading 1.0s like wide format)
+    assert len(wide_creturn) == len(long_creturn), (
+        f"Row count mismatch: wide={len(wide_creturn)}, long={len(long_creturn)}"
     )
-
-    # Build long creturn DataFrame
-    long_creturn = pl.DataFrame({
-        "date": dates[:len(long_creturn_list)],
-        "creturn_long": long_creturn_list,
-    })
 
     df_cmp = wide_creturn.join(long_creturn, on="date", how="inner")
 
@@ -879,12 +879,7 @@ def run_touched_exit_comparison(
 
     df_ne = df_cmp.filter(pl.col("creturn").round(6) != pl.col("creturn_long").round(6))
 
-    print(f"\n=== {test_name} ===")
-    print(f"Wide final: {wide_creturn.get_column('creturn')[-1]:.6f}")
-    print(f"Long final: {long_creturn.get_column('creturn_long')[-1]:.6f}")
     print(f"Max diff: {max_diff:.2e}")
-    print(f"Wide trades: {len(wide_report.trades)}")
-    print(f"Long trades: {len(long_report.trades)}")
     if not df_ne.is_empty():
         print(f"Differences:\n{df_ne.head(5)}")
 

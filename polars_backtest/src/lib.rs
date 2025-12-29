@@ -356,13 +356,18 @@ fn trades_to_dataframe(trades: &[LongTradeRecord]) -> PolarsResult<DataFrame> {
 #[pyclass(name = "BacktestReport")]
 #[derive(Clone)]
 pub struct PyBacktestReport {
-    #[pyo3(get)]
-    pub creturn: Vec<f64>,
+    creturn_df: DataFrame,
     trades_df: DataFrame,
 }
 
 #[pymethods]
 impl PyBacktestReport {
+    /// Get cumulative returns as a Polars DataFrame with date column
+    #[getter]
+    fn creturn(&self) -> PyDataFrame {
+        PyDataFrame(self.creturn_df.clone())
+    }
+
     /// Get trades as a Polars DataFrame
     #[getter]
     fn trades(&self) -> PyDataFrame {
@@ -372,7 +377,7 @@ impl PyBacktestReport {
     fn __repr__(&self) -> String {
         format!(
             "BacktestReport(creturn_len={}, trades_count={})",
-            self.creturn.len(), self.trades_df.height(),
+            self.creturn_df.height(), self.trades_df.height(),
         )
     }
 }
@@ -1059,10 +1064,48 @@ fn backtest_with_report(
     let trades_df = trades_to_dataframe(&result.trades)
         .map_err(|e| PyValueError::new_err(format!("Failed to create trades DataFrame: {}", e)))?;
 
+    // Get unique dates for creturn DataFrame
+    // The dates are already sorted (either by input or by our sort)
+    let unique_dates = df.column(date)
+        .map_err(|e| PyValueError::new_err(format!("Failed to get date column: {}", e)))?
+        .unique()
+        .map_err(|e| PyValueError::new_err(format!("Failed to get unique dates: {}", e)))?
+        .sort(Default::default())
+        .map_err(|e| PyValueError::new_err(format!("Failed to sort dates: {}", e)))?;
+
+    // Find first index where creturn != 1.0 (first actual return change)
+    // Wide format keeps the signal day (where creturn is still 1.0) before the first change
+    // So we start from first_change_idx - 1 to include the signal day
+    let first_change_idx = result.creturn.iter()
+        .position(|&v| (v - 1.0).abs() > 1e-10)
+        .unwrap_or(0);
+
+    // Start one day before first change (the signal day), but not less than 0
+    let first_active_idx = if first_change_idx > 0 { first_change_idx - 1 } else { 0 };
+
+    // Slice creturn and dates from first active index
+    let sliced_creturn: Vec<f64> = result.creturn[first_active_idx..].to_vec();
+    let sliced_dates = unique_dates.slice(first_active_idx as i64, sliced_creturn.len());
+
+    // Normalize creturn to start at 1.0 (divide by first value)
+    let normalized_creturn: Vec<f64> = if !sliced_creturn.is_empty() && sliced_creturn[0] != 0.0 {
+        let normalizer = sliced_creturn[0];
+        sliced_creturn.iter().map(|&v| v / normalizer).collect()
+    } else {
+        sliced_creturn
+    };
+
+    // Build creturn DataFrame with date and creturn columns
+    let creturn_series = Column::new("creturn".into(), normalized_creturn);
+    let creturn_df = DataFrame::new(vec![
+        sliced_dates.into_column(),
+        creturn_series,
+    ]).map_err(|e| PyValueError::new_err(format!("Failed to create creturn DataFrame: {}", e)))?;
+
     eprintln!("[PROFILE] backtest_with_report: {} rows, {} trades", n_rows, result.trades.len());
 
     Ok(PyBacktestReport {
-        creturn: result.creturn,
+        creturn_df,
         trades_df,
     })
 }
