@@ -18,7 +18,6 @@ from dotenv import load_dotenv
 from polars_backtest import (
     backtest_with_report_wide,
     backtest_with_trades_long,
-    backtest_with_report_long,
     BacktestConfig,
 )
 from polars.testing import assert_frame_equal
@@ -286,12 +285,17 @@ def run_trades_comparison(
     # Run wide format backtest (reference)
     wide_report = backtest_with_report_wide(df_adj, df_position, **kwargs)
 
-    # Parse resample for long format (backtest_with_report_long uses None for daily)
+    # Parse resample for long format (backtest_with_report uses None for daily)
     resample = kwargs.get("resample", "D")
     resample_long = None if resample == "D" else resample
 
-    # Build config
-    config = BacktestConfig(
+    # Run long format backtest with report (trades as DataFrame from Rust)
+    # Use pl_bt.backtest_with_report which uses Rust long format directly
+    long_report = pl_bt.backtest_with_report(
+        df_long,
+        trade_at_price="adj_close",
+        position="weight",
+        resample=resample_long,
         fee_ratio=kwargs.get("fee_ratio", 0.001425),
         tax_ratio=kwargs.get("tax_ratio", 0.003),
         stop_loss=kwargs.get("stop_loss", 1.0),
@@ -300,16 +304,6 @@ def run_trades_comparison(
         position_limit=kwargs.get("position_limit", 1.0),
         retain_cost_when_rebalance=kwargs.get("retain_cost_when_rebalance", False),
         stop_trading_next_period=kwargs.get("stop_trading_next_period", True),
-        finlab_mode=True,
-    )
-
-    # Run long format backtest with report (trades as DataFrame from Rust)
-    long_report = backtest_with_report_long(
-        df_long,
-        trade_at_price="adj_close",
-        position="weight",
-        resample=resample_long,
-        config=config,
     )
 
     print(f"\n=== {test_name} (trades) ===")

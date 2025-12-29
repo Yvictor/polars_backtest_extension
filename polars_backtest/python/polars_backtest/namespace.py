@@ -16,8 +16,10 @@ ColumnSpec = Union[str, pl.Expr]
 from polars_backtest._polars_backtest import (
     BacktestConfig,
     BacktestResult,
+    BacktestReport,
     # Main API (long format, zero-copy)
     backtest as _rust_backtest,
+    backtest_with_report as _rust_backtest_with_report,
     # Wide format API (for validation)
     backtest_wide as _backtest_wide_rust,
     backtest_with_trades_wide as _backtest_with_trades_wide,
@@ -413,11 +415,7 @@ class BacktestNamespace:
         position: ColumnSpec = "weight",
         date: ColumnSpec = "date",
         symbol: ColumnSpec = "symbol",
-        open: ColumnSpec | None = None,
-        high: ColumnSpec | None = None,
-        low: ColumnSpec | None = None,
         resample: str | None = "D",
-        resample_offset: str | None = None,
         fee_ratio: float = 0.001425,
         tax_ratio: float = 0.003,
         stop_loss: float = 1.0,
@@ -426,20 +424,17 @@ class BacktestNamespace:
         position_limit: float = 1.0,
         retain_cost_when_rebalance: bool = False,
         stop_trading_next_period: bool = True,
-        touched_exit: bool = False,
-    ) -> Report:
-        """Run backtest with trade tracking, returning a Report object.
+    ) -> BacktestReport:
+        """Run backtest with trade tracking, returning a BacktestReport object.
+
+        Uses the Rust long format implementation directly for performance.
 
         Args:
             trade_at_price: Price column name or Expr (default: "close")
             position: Position/weight column name or Expr (default: "weight")
             date: Date column name or Expr (default: "date")
             symbol: Symbol column name or Expr (default: "symbol")
-            open: Open price column name or Expr (optional)
-            high: High price column name or Expr (optional)
-            low: Low price column name or Expr (optional)
-            resample: Rebalance frequency
-            resample_offset: Optional offset for rebalance dates
+            resample: Rebalance frequency ('D', 'W', 'M', or None)
             fee_ratio: Transaction fee ratio
             tax_ratio: Transaction tax ratio
             stop_loss: Stop loss threshold
@@ -448,10 +443,9 @@ class BacktestNamespace:
             position_limit: Maximum weight per stock
             retain_cost_when_rebalance: Retain costs when rebalancing
             stop_trading_next_period: Stop trading after stop triggered
-            touched_exit: Use OHLC for intraday stop detection
 
         Returns:
-            Report object with creturn, position, and trades
+            BacktestReport object with creturn (list) and trades (DataFrame)
         """
         df = self._df
 
@@ -461,28 +455,11 @@ class BacktestNamespace:
         df, price_col = _resolve_column(df, trade_at_price, "_bt_price")
         df, position_col = _resolve_column(df, position, "_bt_position")
 
-        # Resolve optional OHLC columns
-        open_col: str | None = None
-        high_col: str | None = None
-        low_col: str | None = None
-        if open is not None:
-            df, open_col = _resolve_column(df, open, "_bt_open")
-        if high is not None:
-            df, high_col = _resolve_column(df, high, "_bt_high")
-        if low is not None:
-            df, low_col = _resolve_column(df, low, "_bt_low")
-
         # Validate columns exist
         required = [date_col, symbol_col, price_col, position_col]
         missing = [c for c in required if c not in df.columns]
         if missing:
             raise ValueError(f"Missing required columns: {missing}")
-
-        if touched_exit:
-            if not all([open_col, high_col, low_col]):
-                raise ValueError(
-                    "touched_exit=True requires open, high, and low"
-                )
 
         # Check if position column is boolean (signals)
         position_dtype = df.get_column(position_col).dtype
@@ -496,125 +473,7 @@ class BacktestNamespace:
         else:
             df = df.with_columns(pl.col(position_col).fill_null(0.0))
 
-        # Check if we can use Rust path (no OHLC, basic resample, no offset)
-        use_rust = (
-            not touched_exit
-            and resample in (None, "D", "W", "M")
-            and resample_offset is None
-        )
-
-        # Get resample helpers (lazy import)
-        _resample_position, _filter_changed_positions, Report = _get_resample_helpers()
-
-        if use_rust:
-            # Use fast Rust long format path (zero-copy, no trades tracking)
-            config = BacktestConfig(
-                fee_ratio=fee_ratio,
-                tax_ratio=tax_ratio,
-                stop_loss=stop_loss,
-                take_profit=take_profit,
-                trail_stop=trail_stop,
-                position_limit=position_limit,
-                retain_cost_when_rebalance=retain_cost_when_rebalance,
-                stop_trading_next_period=stop_trading_next_period,
-                finlab_mode=True,  # Use Finlab mode for report
-            )
-
-            # Check if already sorted
-            skip_sort = df.get_column(date_col).is_sorted()
-
-            result = _rust_backtest(
-                df,
-                date_col,
-                symbol_col,
-                price_col,
-                position_col,
-                resample,
-                config,
-                skip_sort,
-            )
-
-            # Get dates from DataFrame
-            dates = (
-                df.select(date_col)
-                .unique()
-                .sort(date_col)
-                .get_column(date_col)
-                .to_list()
-            )
-
-            # Find where creturn starts changing (first actual trade)
-            first_trade_idx = 0
-            for i, c in enumerate(result.creturn):
-                if c != 1.0:
-                    first_trade_idx = max(0, i - 1)
-                    break
-
-            # Get stock columns (unique symbols in data)
-            stock_columns = df.get_column(symbol_col).unique().sort().to_list()
-
-            # Keep position in long format (no pivot needed!)
-            position_long = df.select([date_col, symbol_col, position_col]).sort([date_col, symbol_col])
-
-            return Report(
-                creturn=result.creturn,
-                trades=[],  # Long format path doesn't track trades (use wide format for trades)
-                dates=dates,
-                stock_columns=stock_columns,
-                position=position_long,  # Long format position
-                fee_ratio=fee_ratio,
-                tax_ratio=tax_ratio,
-                first_signal_index=first_trade_idx,
-            )
-
-        # Fallback to Python path for complex cases (touched_exit, complex resample)
-        # Convert to wide format
-        wide_data = self._prepare_wide_data(
-            date_col, symbol_col, price_col, position_col,
-            open_col, high_col, low_col,
-            df=df,
-        )
-        prices_wide = wide_data["prices"]
-        position_wide = wide_data["position"]
-        price_dates = wide_data["price_dates"]
-
-        stock_cols = [c for c in prices_wide.columns if c != date_col]
-
-        # Apply resample
-        if resample is None:
-            position_wide = _filter_changed_positions(position_wide)
-        elif resample != "D":
-            position_wide = _resample_position(
-                position_wide, price_dates, resample, resample_offset
-            )
-
-        # Align columns
-        position_stock_cols = [c for c in position_wide.columns if c in stock_cols]
-        if not position_stock_cols:
-            raise ValueError("No common stock columns between prices and position")
-
-        prices_data = prices_wide.select(position_stock_cols)
-        position_data = position_wide.select(position_stock_cols).cast(pl.Float64)
-
-        # Calculate rebalance indices
-        pos_date_col = position_wide.columns[0]
-        position_dates = position_wide.select(pos_date_col).to_series().to_list()
-
-        rebalance_indices = []
-        for pos_d in position_dates:
-            try:
-                idx = price_dates.index(pos_d)
-                rebalance_indices.append(idx)
-            except ValueError:
-                pass
-
-        if not rebalance_indices:
-            raise ValueError("No matching dates between prices and position")
-
-        # Find first signal index
-        first_signal_index = rebalance_indices[0] if rebalance_indices else 0
-
-        # Create config
+        # Build config
         config = BacktestConfig(
             fee_ratio=fee_ratio,
             tax_ratio=tax_ratio,
@@ -625,43 +484,21 @@ class BacktestNamespace:
             retain_cost_when_rebalance=retain_cost_when_rebalance,
             stop_trading_next_period=stop_trading_next_period,
             finlab_mode=True,  # Use Finlab mode for report
-            touched_exit=touched_exit,
         )
 
-        # Prepare OHLC data if needed
-        open_data = wide_data.get("open")
-        high_data = wide_data.get("high")
-        low_data = wide_data.get("low")
+        # Check if already sorted
+        skip_sort = df.get_column(date_col).is_sorted()
 
-        if open_data is not None:
-            open_data = open_data.select(position_stock_cols)
-        if high_data is not None:
-            high_data = high_data.select(position_stock_cols)
-        if low_data is not None:
-            low_data = low_data.select(position_stock_cols)
-
-        # Run backtest with trades (wide format API)
-        # Note: Using adjusted prices for both adj and original (no factor available)
-        result = _backtest_with_trades_wide(
-            adj_prices=prices_data,
-            original_prices=prices_data,  # Same as adj without factor
-            weights=position_data,
-            rebalance_indices=rebalance_indices,
-            config=config,
-            open_prices=open_data,
-            high_prices=high_data,
-            low_prices=low_data,
-        )
-
-        return Report(
-            creturn=result.creturn,
-            trades=result.trades,
-            dates=price_dates,
-            stock_columns=position_stock_cols,
-            position=position_wide,
-            fee_ratio=fee_ratio,
-            tax_ratio=tax_ratio,
-            first_signal_index=first_signal_index,
+        # Use Rust backtest_with_report directly (returns BacktestReport with trades DataFrame)
+        return _rust_backtest_with_report(
+            df,
+            date_col,
+            symbol_col,
+            price_col,
+            position_col,
+            resample,
+            config,
+            skip_sort,
         )
 
 
@@ -740,11 +577,7 @@ def backtest_with_report(
     position: ColumnSpec = "weight",
     date: ColumnSpec = "date",
     symbol: ColumnSpec = "symbol",
-    open: ColumnSpec | None = None,
-    high: ColumnSpec | None = None,
-    low: ColumnSpec | None = None,
     resample: str | None = "D",
-    resample_offset: str | None = None,
     fee_ratio: float = 0.001425,
     tax_ratio: float = 0.003,
     stop_loss: float = 1.0,
@@ -753,9 +586,10 @@ def backtest_with_report(
     position_limit: float = 1.0,
     retain_cost_when_rebalance: bool = False,
     stop_trading_next_period: bool = True,
-    touched_exit: bool = False,
-) -> "Report":
+) -> BacktestReport:
     """Run backtest with trade tracking on long format DataFrame.
+
+    Uses the Rust long format implementation directly for performance.
 
     Args:
         df: Long format DataFrame with date, symbol, price, position columns
@@ -763,11 +597,7 @@ def backtest_with_report(
         position: Position/weight column name or Expr (default: "weight")
         date: Date column name or Expr (default: "date")
         symbol: Symbol column name or Expr (default: "symbol")
-        open: Open price column name or Expr (optional)
-        high: High price column name or Expr (optional)
-        low: Low price column name or Expr (optional)
-        resample: Rebalance frequency
-        resample_offset: Optional offset for rebalance dates
+        resample: Rebalance frequency ('D', 'W', 'M', or None)
         fee_ratio: Transaction fee ratio
         tax_ratio: Transaction tax ratio
         stop_loss: Stop loss threshold
@@ -776,27 +606,22 @@ def backtest_with_report(
         position_limit: Maximum weight per stock
         retain_cost_when_rebalance: Retain costs when rebalancing
         stop_trading_next_period: Stop trading after stop triggered
-        touched_exit: Use OHLC for intraday stop detection
 
     Returns:
-        Report object with creturn, position, and trades
+        BacktestReport object with creturn (list) and trades (DataFrame)
 
     Example:
         >>> import polars_backtest as pl_bt
         >>> report = pl_bt.backtest_with_report(df, trade_at_price="close", position="weight")
-        >>> report.creturn  # DataFrame
-        >>> report.trades   # DataFrame
+        >>> report.creturn  # list of cumulative returns
+        >>> report.trades   # DataFrame with trade records
     """
     return df.bt.backtest_with_report(
         trade_at_price=trade_at_price,
         position=position,
         date=date,
         symbol=symbol,
-        open=open,
-        high=high,
-        low=low,
         resample=resample,
-        resample_offset=resample_offset,
         fee_ratio=fee_ratio,
         tax_ratio=tax_ratio,
         stop_loss=stop_loss,
@@ -805,5 +630,4 @@ def backtest_with_report(
         position_limit=position_limit,
         retain_cost_when_rebalance=retain_cost_when_rebalance,
         stop_trading_next_period=stop_trading_next_period,
-        touched_exit=touched_exit,
     )
