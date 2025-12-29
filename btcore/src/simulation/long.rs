@@ -76,6 +76,10 @@ pub enum ResampleFreq {
     Weekly,
     /// Monthly rebalancing (end of month)
     Monthly,
+    /// Quarterly rebalancing (end of quarter)
+    Quarterly,
+    /// Yearly rebalancing (end of year)
+    Yearly,
     /// Only rebalance when position changes (Finlab default, resample=None)
     PositionChange,
 }
@@ -87,6 +91,8 @@ impl ResampleFreq {
             Some("M") | Some("ME") => Self::Monthly,
             Some("W") | Some("W-FRI") => Self::Weekly,
             Some("D") => Self::Daily,
+            Some("Q") | Some("QE") => Self::Quarterly,
+            Some("Y") | Some("YE") | Some("A") => Self::Yearly,
             None => Self::PositionChange,
             _ => Self::Daily,
         }
@@ -254,6 +260,8 @@ where
             // Check if prev_date is a rebalance boundary
             let is_month_end = is_month_end_i32(prev_date, date);
             let is_week_end = is_week_end_i32(prev_date, date);
+            let is_quarter_end = is_quarter_end_i32(prev_date, date);
+            let is_year_end = is_year_end_i32(prev_date, date);
 
             match resample {
                 ResampleFreq::Daily => {
@@ -282,6 +290,24 @@ where
                         }
                     }
                 }
+                ResampleFreq::Quarterly => {
+                    if is_quarter_end {
+                        let has_signals = !normalized.is_empty();
+                        active_weights = normalized;
+                        if has_signals {
+                            has_first_signal = true;
+                        }
+                    }
+                }
+                ResampleFreq::Yearly => {
+                    if is_year_end {
+                        let has_signals = !normalized.is_empty();
+                        active_weights = normalized;
+                        if has_signals {
+                            has_first_signal = true;
+                        }
+                    }
+                }
                 ResampleFreq::PositionChange => {
                     if !normalized.is_empty() {
                         has_first_signal = true;
@@ -296,6 +322,8 @@ where
                 let should_rebalance = match resample {
                     ResampleFreq::Monthly => is_month_end,
                     ResampleFreq::Weekly => is_week_end,
+                    ResampleFreq::Quarterly => is_quarter_end,
+                    ResampleFreq::Yearly => is_year_end,
                     ResampleFreq::Daily => true,
                     ResampleFreq::PositionChange => position_changed,
                 };
@@ -635,6 +663,26 @@ fn is_week_end_i32(prev_days: i32, next_days: i32) -> bool {
     let prev_week = (prev_days + 3) / 7; // +3 to shift Thursday to Sunday position
     let next_week = (next_days + 3) / 7;
     prev_week != next_week
+}
+
+/// Check if prev_date is a quarter-end using i32 dates (days since 1970-01-01)
+///
+/// Returns true if prev_date and next_date are in different quarters.
+fn is_quarter_end_i32(prev_days: i32, next_days: i32) -> bool {
+    let (prev_year, prev_month) = days_to_year_month(prev_days);
+    let (next_year, next_month) = days_to_year_month(next_days);
+    let prev_quarter = (prev_year, (prev_month - 1) / 3);
+    let next_quarter = (next_year, (next_month - 1) / 3);
+    prev_quarter != next_quarter
+}
+
+/// Check if prev_date is a year-end using i32 dates (days since 1970-01-01)
+///
+/// Returns true if prev_date and next_date are in different years.
+fn is_year_end_i32(prev_days: i32, next_days: i32) -> bool {
+    let (prev_year, _) = days_to_year_month(prev_days);
+    let (next_year, _) = days_to_year_month(next_days);
+    prev_year != next_year
 }
 
 /// Convert days since 1970-01-01 to (year, month)

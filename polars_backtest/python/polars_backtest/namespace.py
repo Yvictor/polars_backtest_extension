@@ -265,7 +265,7 @@ class BacktestNamespace:
 
         # Check if we can use Rust path (basic resample, no offset)
         use_rust = (
-            resample in (None, "D", "W", "M")
+            resample in (None, "D", "W", "M", "Q", "Y")
             and resample_offset is None
         )
 
