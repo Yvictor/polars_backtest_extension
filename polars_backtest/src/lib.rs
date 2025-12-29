@@ -7,8 +7,9 @@
 //! # API Overview
 //!
 //! - `backtest()` - Main API for long format data (zero-copy, fastest)
+//! - `backtest_with_report()` - Long format with full report (trades tracking)
 //! - `backtest_wide()` - Wide format API (for validation/compatibility)
-//! - `backtest_with_trades_wide()` - Wide format with trade tracking
+//! - `backtest_with_report_wide_impl()` - Wide format with full report
 //!
 //! # Profiling
 //!
@@ -42,7 +43,7 @@ use btcore::{
     run_backtest, run_backtest_with_trades, BacktestConfig, BacktestResult, PriceData,
     SimTradeRecord,
     simulation::{
-        backtest_long_arrow, backtest_with_trades_long_arrow,
+        backtest_long_arrow, backtest_with_report_long_arrow,
         LongBacktestResult, LongFormatArrowInput, LongTradeRecord, ResampleFreq,
     },
 };
@@ -945,8 +946,8 @@ fn backtest_with_report(
         low_prices: low_rs.as_ref(),
     };
 
-    // Run backtest with trades using btcore
-    let result = backtest_with_trades_long_arrow(&input, resample_freq, &cfg);
+    // Run backtest with report using btcore
+    let result = backtest_with_report_long_arrow(&input, resample_freq, &cfg);
 
     // Convert trades to DataFrame
     let trades_df = trades_to_dataframe(&result.trades)
@@ -1053,7 +1054,7 @@ fn backtest_wide(
 ///     WideBacktestResult with creturn (Vec<f64>) and trades
 #[pyfunction]
 #[pyo3(signature = (adj_prices, original_prices, weights, rebalance_indices, config=None, open_prices=None, high_prices=None, low_prices=None))]
-fn backtest_with_trades_wide(
+fn backtest_with_report_wide_impl(
     adj_prices: PyDataFrame,
     original_prices: PyDataFrame,
     weights: PyDataFrame,
@@ -1170,6 +1171,6 @@ fn _polars_backtest(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(backtest_with_report, m)?)?;
     // Wide format API (for validation)
     m.add_function(wrap_pyfunction!(backtest_wide, m)?)?;
-    m.add_function(wrap_pyfunction!(backtest_with_trades_wide, m)?)?;
+    m.add_function(wrap_pyfunction!(backtest_with_report_wide_impl, m)?)?;
     Ok(())
 }

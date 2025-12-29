@@ -259,7 +259,7 @@ from polars_backtest._polars_backtest import (
     backtest as backtest_long,
     # Wide format API (for validation)
     backtest_wide as _backtest_wide_rust,
-    backtest_with_trades_wide as _backtest_with_trades_wide,
+    backtest_with_report_wide_impl as _backtest_with_report_wide_impl,
 )
 
 __all__ = [
@@ -1298,10 +1298,10 @@ def backtest_with_report_wide(
         high_data = high.select(position_stock_cols)
         low_data = low.select(position_stock_cols)
 
-    # Run backtest with trades tracking
+    # Run backtest with report (trades tracking)
     # close_data: adjusted prices for return calculation
     # original_prices_data: original prices for trade records
-    result = _backtest_with_trades_wide(
+    result = _backtest_with_report_wide_impl(
         close_data,
         original_prices_data,
         position_data,

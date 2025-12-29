@@ -26,7 +26,7 @@ pub use long::{
     backtest_long_arrow,
     backtest_long_slice,
     backtest_with_accessor,
-    backtest_with_trades_long_arrow,
+    backtest_with_report_long_arrow,
     // Types
     LongFormatArrowInput,
     Portfolio,

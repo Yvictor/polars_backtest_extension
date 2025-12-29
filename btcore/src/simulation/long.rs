@@ -1093,12 +1093,12 @@ fn normalize_weights(
 // Backtest with trade tracking
 // ============================================================================
 
-/// Run backtest on Arrow arrays with trade tracking
+/// Run backtest on Arrow arrays with full report (trades tracking)
 ///
 /// Delegates to `backtest_impl` with `SymbolTracker` for trade tracking.
 /// Same as `backtest_long_arrow` but returns trade records as well.
 /// Supports touched_exit mode when OHLC data is provided in input.
-pub fn backtest_with_trades_long_arrow(
+pub fn backtest_with_report_long_arrow(
     input: &LongFormatArrowInput,
     resample: ResampleFreq,
     config: &BacktestConfig,

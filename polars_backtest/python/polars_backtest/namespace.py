@@ -22,7 +22,6 @@ from polars_backtest._polars_backtest import (
     backtest_with_report as _rust_backtest_with_report,
     # Wide format API (for validation)
     backtest_wide as _backtest_wide_rust,
-    backtest_with_trades_wide as _backtest_with_trades_wide,
 )
 
 if TYPE_CHECKING:
