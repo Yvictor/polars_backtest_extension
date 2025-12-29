@@ -31,6 +31,7 @@ pub use long::{
     LongFormatArrowInput,
     Portfolio,
     ResampleFreq,
+    ResampleOffset,
 };
 
 // Re-export from other modules for convenience

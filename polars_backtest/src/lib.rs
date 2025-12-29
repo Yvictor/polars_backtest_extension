@@ -44,7 +44,7 @@ use btcore::{
     PriceData, TradeRecord, WideTradeRecord,
     simulation::{
         backtest_long_arrow, backtest_with_report_long_arrow,
-        LongFormatArrowInput, ResampleFreq,
+        LongFormatArrowInput, ResampleFreq, ResampleOffset,
     },
 };
 
@@ -430,6 +430,7 @@ impl PyBacktestReport {
     high="high",
     low="low",
     resample=None,
+    resample_offset=None,
     config=None,
     skip_sort=false
 ))]
@@ -443,6 +444,7 @@ fn backtest(
     high: &str,
     low: &str,
     resample: Option<&str>,
+    resample_offset: Option<&str>,
     config: Option<PyBacktestConfig>,
     skip_sort: bool,
 ) -> PyResult<PyBacktestResult> {
@@ -658,8 +660,9 @@ fn backtest(
     profile!("[PROFILE] OHLC processing: {:?}", step_start.elapsed());
     step_start = Instant::now();
 
-    // Parse resample frequency
+    // Parse resample frequency and offset
     let resample_freq = ResampleFreq::from_str(resample);
+    let offset = ResampleOffset::from_str(resample_offset);
 
     // Build arrow input for btcore
     let input = LongFormatArrowInput {
@@ -673,7 +676,7 @@ fn backtest(
     };
 
     // Run backtest using btcore with arrow-rs arrays
-    let result = backtest_long_arrow(&input, resample_freq, &cfg);
+    let result = backtest_long_arrow(&input, resample_freq, offset, &cfg);
 
     profile!("[PROFILE] Backtest (btcore): {:?}", step_start.elapsed());
     step_start = Instant::now();
@@ -741,6 +744,7 @@ fn backtest(
 ///     high: Name of high price column (default: "high", for touched_exit)
 ///     low: Name of low price column (default: "low", for touched_exit)
 ///     resample: Rebalancing frequency ("D", "W", "M", or None for daily)
+///     resample_offset: Optional offset for rebalance dates (e.g., "1d", "2d", "1W")
 ///     config: BacktestConfig (optional)
 ///     skip_sort: Skip sorting if data is already sorted by date (default: false)
 ///
@@ -757,6 +761,7 @@ fn backtest(
     high="high",
     low="low",
     resample=None,
+    resample_offset=None,
     config=None,
     skip_sort=false
 ))]
@@ -770,6 +775,7 @@ fn backtest_with_report(
     high: &str,
     low: &str,
     resample: Option<&str>,
+    resample_offset: Option<&str>,
     config: Option<PyBacktestConfig>,
     skip_sort: bool,
 ) -> PyResult<PyBacktestReport> {
@@ -963,8 +969,9 @@ fn backtest_with_report(
         (None, None, None)
     };
 
-    // Parse resample frequency
+    // Parse resample frequency and offset
     let resample_freq = ResampleFreq::from_str(resample);
+    let offset = ResampleOffset::from_str(resample_offset);
 
     // Build arrow input for btcore
     let input = LongFormatArrowInput {
@@ -978,7 +985,7 @@ fn backtest_with_report(
     };
 
     // Run backtest with report using btcore
-    let result = backtest_with_report_long_arrow(&input, resample_freq, &cfg);
+    let result = backtest_with_report_long_arrow(&input, resample_freq, offset, &cfg);
 
     // Convert trades to DataFrame
     let trades_df = trades_to_dataframe(&result.trades)

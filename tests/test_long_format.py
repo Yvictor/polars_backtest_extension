@@ -176,8 +176,9 @@ def run_comparison(
     # Run wide format backtest (reference)
     wide_report = backtest_with_report_wide(df_adj, df_position, **kwargs)
 
-    # Parse resample for long format
+    # Parse resample and resample_offset for long format
     resample = kwargs.get("resample", "D")
+    resample_offset = kwargs.get("resample_offset", None)
 
     # Run long format backtest
     long_result = pl_bt.backtest(
@@ -185,6 +186,7 @@ def run_comparison(
         trade_at_price="adj_close",
         position="weight",
         resample=resample,
+        resample_offset=resample_offset,
         fee_ratio=kwargs.get("fee_ratio", 0.001425),
         tax_ratio=kwargs.get("tax_ratio", 0.003),
         stop_loss=kwargs.get("stop_loss", 1.0),
@@ -467,6 +469,35 @@ def test_resample(wide_format_df, long_format_df, position_bool, resample):
         df_position,
         f"resample={resample}",
         resample=resample,
+    )
+
+
+@pytest.mark.parametrize(
+    "resample,resample_offset",
+    [
+        ("W", "1D"),
+        ("W", "2D"),
+        ("M", "1D"),
+        ("M", "2D"),
+        ("M", "1W"),
+        ("Q", "1D"),
+    ],
+)
+def test_resample_offset(wide_format_df, long_format_df, position_bool, resample, resample_offset):
+    """Test resample_offset with different frequencies and offsets."""
+    df_adj, df_close = wide_format_df
+    df_long = long_format_df
+
+    df_position = wide_position_to_pl(position_bool)
+    df_long_with_weight = add_weight_to_long(df_long)
+
+    run_comparison(
+        df_long_with_weight,
+        df_adj,
+        df_position,
+        f"resample={resample}+offset={resample_offset}",
+        resample=resample,
+        resample_offset=resample_offset,
     )
 
 

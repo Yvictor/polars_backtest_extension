@@ -263,11 +263,20 @@ class BacktestNamespace:
         else:
             df = df.with_columns(pl.col(position_col).fill_null(0.0))
 
-        # Check if we can use Rust path (basic resample, no offset)
-        use_rust = (
-            resample in (None, "D", "W", "M", "Q", "Y")
-            and resample_offset is None
+        # Check if we can use Rust path
+        # Supported resample: D, W, W-MON..W-SUN, M, MS, Q, QS, Y, None
+        # Note: resample_offset requires Python path to match Wide format behavior
+        # (Rust offset implementation differs from Python's _resample_position)
+        resample_supported = resample in (
+            None, "D",
+            "W", "W-MON", "W-TUE", "W-WED", "W-THU", "W-FRI", "W-SAT", "W-SUN",
+            "M", "ME", "MS",
+            "Q", "QE", "QS",
+            "Y", "YE", "A",
         )
+        # When offset is provided, use Python path to ensure consistent behavior
+        # with Wide format's _resample_position logic
+        use_rust = resample_supported and resample_offset is None
 
         if use_rust:
             # Use Rust backtest directly (does pivot internally)
@@ -298,6 +307,7 @@ class BacktestNamespace:
                 high_col,
                 low_col,
                 resample,
+                resample_offset,
                 config,
                 skip_sort,
             )
@@ -314,6 +324,16 @@ class BacktestNamespace:
         prices_wide = wide_data["prices"]
         position_wide = wide_data["position"]
         price_dates = wide_data["price_dates"]
+
+        # Convert dates to string format for compatibility with _resample_position
+        # (_resample_position uses string dates internally)
+        prices_wide = prices_wide.with_columns(
+            pl.col(date_col).cast(pl.Utf8).alias(date_col)
+        )
+        position_wide = position_wide.with_columns(
+            pl.col(date_col).cast(pl.Utf8).alias(date_col)
+        )
+        price_dates = [str(d) for d in price_dates]
 
         # Get stock columns (all except date)
         stock_cols = [c for c in prices_wide.columns if c != date_col]
@@ -531,6 +551,7 @@ class BacktestNamespace:
             high_col if high_col else "high",
             low_col if low_col else "low",
             resample,
+            None,  # resample_offset not supported for backtest_with_report yet
             config,
             skip_sort,
         )

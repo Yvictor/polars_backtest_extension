@@ -11,7 +11,7 @@
 //! - Zero-copy access to price/weight data
 //! - Only processes active stocks per day O(k) instead of O(n_stocks)
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 
 use arrow::array::{Float64Array, Int32Array, StringViewArray};
 
@@ -72,12 +72,18 @@ pub struct LongFormatArrowInput<'a> {
 pub enum ResampleFreq {
     /// Daily rebalancing
     Daily,
-    /// Weekly rebalancing (end of week)
+    /// Weekly rebalancing (end of week, Friday)
     Weekly,
+    /// Weekly on specific weekday (0=Mon, 1=Tue, ..., 6=Sun)
+    WeeklyOn(u8),
     /// Monthly rebalancing (end of month)
     Monthly,
+    /// Monthly rebalancing (start of month)
+    MonthStart,
     /// Quarterly rebalancing (end of quarter)
     Quarterly,
+    /// Quarterly rebalancing (start of quarter)
+    QuarterStart,
     /// Yearly rebalancing (end of year)
     Yearly,
     /// Only rebalance when position changes (Finlab default, resample=None)
@@ -89,14 +95,90 @@ impl ResampleFreq {
     pub fn from_str(s: Option<&str>) -> Self {
         match s {
             Some("M") | Some("ME") => Self::Monthly,
+            Some("MS") => Self::MonthStart,
             Some("W") | Some("W-FRI") => Self::Weekly,
+            Some("W-MON") => Self::WeeklyOn(0),
+            Some("W-TUE") => Self::WeeklyOn(1),
+            Some("W-WED") => Self::WeeklyOn(2),
+            Some("W-THU") => Self::WeeklyOn(3),
+            Some("W-SAT") => Self::WeeklyOn(5),
+            Some("W-SUN") => Self::WeeklyOn(6),
             Some("D") => Self::Daily,
             Some("Q") | Some("QE") => Self::Quarterly,
+            Some("QS") => Self::QuarterStart,
             Some("Y") | Some("YE") | Some("A") => Self::Yearly,
             None => Self::PositionChange,
             _ => Self::Daily,
         }
     }
+}
+
+/// Resample offset for delaying rebalance execution
+///
+/// Positive values delay execution by N days after the boundary.
+/// For example, with Monthly resample and offset of 1 day:
+/// - Boundary detected: Jan 31 (month end)
+/// - Normal execution: Feb 1 (T+1)
+/// - With offset 1d: Feb 2 (T+1+offset)
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct ResampleOffset {
+    /// Number of days to delay (positive only for now)
+    pub days: i32,
+}
+
+impl ResampleOffset {
+    /// Create a new offset with the given number of days
+    pub fn new(days: i32) -> Self {
+        Self { days: days.max(0) } // Only positive offsets supported
+    }
+
+    /// Parse from string like "1d", "2d", "1D", "1W", etc.
+    ///
+    /// Supported formats:
+    /// - "1d", "2d", "1D" - days
+    /// - "1W", "2W" - weeks (converted to days)
+    ///
+    /// Returns None if the string is None or cannot be parsed.
+    pub fn from_str(s: Option<&str>) -> Option<Self> {
+        let s = s?.trim();
+        if s.is_empty() {
+            return None;
+        }
+
+        // Try to parse as days (e.g., "1d", "2d", "1D")
+        if s.ends_with('d') || s.ends_with('D') {
+            let num_str = &s[..s.len() - 1];
+            if let Ok(days) = num_str.parse::<i32>() {
+                if days >= 0 {
+                    return Some(Self { days });
+                }
+            }
+        }
+
+        // Try to parse as weeks (e.g., "1W", "2W")
+        if s.ends_with('W') || s.ends_with('w') {
+            let num_str = &s[..s.len() - 1];
+            if let Ok(weeks) = num_str.parse::<i32>() {
+                if weeks >= 0 {
+                    return Some(Self { days: weeks * 7 });
+                }
+            }
+        }
+
+        None
+    }
+}
+
+/// Delayed rebalance entry for offset support
+#[derive(Debug, Clone)]
+struct DelayedRebalance {
+    /// Target weights to apply
+    weights: HashMap<String, f64>,
+    /// The signal date (when boundary was detected)
+    signal_date: i32,
+    /// The target execution date (signal_date + offset.days)
+    /// pending_weights will be set when we reach this date
+    target_date: i32,
 }
 
 /// Optional OHLC getters for touched_exit mode
@@ -126,6 +208,7 @@ where
 /// * `get_price` - Closure to get price at index
 /// * `get_weight` - Closure to get weight at index (NaN = no signal)
 /// * `resample` - Rebalancing frequency
+/// * `offset` - Optional resample offset for delaying execution
 /// * `config` - Backtest configuration
 /// * `tracker` - Trade tracker (use NoopSymbolTracker::default() for no tracking)
 /// * `ohlc` - Optional OHLC getters for touched_exit mode
@@ -136,6 +219,7 @@ fn backtest_impl<'a, FD, FS, FP, FW, T, FO, FH, FL>(
     get_price: FP,
     get_weight: FW,
     resample: ResampleFreq,
+    offset: Option<ResampleOffset>,
     config: &BacktestConfig,
     tracker: &mut T,
     ohlc: Option<OhlcGetters<FO, FH, FL>>,
@@ -167,6 +251,10 @@ where
     let mut current_date: Option<i32> = None;
     let mut today_prices: HashMap<&str, f64> = HashMap::new();
     let mut today_weights: HashMap<&str, f64> = HashMap::new();
+
+    // Delayed rebalance queue for offset support
+    let mut delayed_rebalances: VecDeque<DelayedRebalance> = VecDeque::new();
+    let offset_days = offset.map(|o| o.days).unwrap_or(0);
 
     // OHLC data for touched_exit mode
     let mut today_open: HashMap<&str, f64> = HashMap::new();
@@ -234,6 +322,27 @@ where
             // This ensures touched_exit uses the correct previous_price for ratio calculations
             update_previous_prices(&mut portfolio, &today_prices);
 
+            // Check if any delayed rebalances are due
+            // Move them to pending_weights for execution
+            //
+            // Wide format behavior: find last trading day <= target_date
+            // This happens when current date crosses target_date (date > target_date)
+            // At that point, prev_date is the last trading day <= target_date
+            // Use prev_date as the new signal date, then T+1 execution happens naturally
+            while let Some(delayed) = delayed_rebalances.front() {
+                if date > delayed.target_date {
+                    // date crossed target_date, prev_date is last trading day <= target_date
+                    let delayed = delayed_rebalances.pop_front().unwrap();
+                    pending_weights = Some(delayed.weights);
+                    // Use prev_date as signal date (matching Wide format behavior)
+                    pending_signal_date = Some(prev_date);
+                    // Only process one delayed rebalance per day
+                    break;
+                } else {
+                    break;
+                }
+            }
+
             // STEP 3: Execute pending rebalance
             if let Some(target_weights) = pending_weights.take() {
                 let sig_date = pending_signal_date.take().unwrap_or(prev_date);
@@ -263,6 +372,9 @@ where
             let is_quarter_end = is_quarter_end_i32(prev_date, date);
             let is_year_end = is_year_end_i32(prev_date, date);
 
+            // Check if prev_date is a specific weekday (for WeeklyOn)
+            let prev_weekday = weekday_of_i32(prev_date);
+
             match resample {
                 ResampleFreq::Daily => {
                     if !normalized.is_empty() {
@@ -281,7 +393,18 @@ where
                         }
                     }
                 }
-                ResampleFreq::Monthly => {
+                ResampleFreq::WeeklyOn(weekday) => {
+                    // Rebalance on specific weekday (0=Mon, ..., 6=Sun)
+                    if prev_weekday == weekday {
+                        let has_signals = !normalized.is_empty();
+                        active_weights = normalized;
+                        if has_signals {
+                            has_first_signal = true;
+                        }
+                    }
+                }
+                ResampleFreq::Monthly | ResampleFreq::MonthStart => {
+                    // Both trigger at month boundary (end of one month / start of next)
                     if is_month_end {
                         let has_signals = !normalized.is_empty();
                         active_weights = normalized;
@@ -290,7 +413,8 @@ where
                         }
                     }
                 }
-                ResampleFreq::Quarterly => {
+                ResampleFreq::Quarterly | ResampleFreq::QuarterStart => {
+                    // Both trigger at quarter boundary
                     if is_quarter_end {
                         let has_signals = !normalized.is_empty();
                         active_weights = normalized;
@@ -320,17 +444,30 @@ where
             // STEP 5: Check rebalance (only after first signal)
             if has_first_signal {
                 let should_rebalance = match resample {
-                    ResampleFreq::Monthly => is_month_end,
+                    ResampleFreq::Monthly | ResampleFreq::MonthStart => is_month_end,
                     ResampleFreq::Weekly => is_week_end,
-                    ResampleFreq::Quarterly => is_quarter_end,
+                    ResampleFreq::WeeklyOn(weekday) => prev_weekday == weekday,
+                    ResampleFreq::Quarterly | ResampleFreq::QuarterStart => is_quarter_end,
                     ResampleFreq::Yearly => is_year_end,
                     ResampleFreq::Daily => true,
                     ResampleFreq::PositionChange => position_changed,
                 };
 
                 if should_rebalance {
-                    pending_weights = Some(active_weights.clone());
-                    pending_signal_date = Some(prev_date);
+                    if offset_days > 0 {
+                        // Delay the rebalance by offset_days
+                        // target_date = prev_date + offset_days means:
+                        // - boundary on D, offset=1d -> execute on D+2 (T+1+offset)
+                        delayed_rebalances.push_back(DelayedRebalance {
+                            weights: active_weights.clone(),
+                            signal_date: prev_date,
+                            target_date: prev_date + offset_days,
+                        });
+                    } else {
+                        // No offset: set pending_weights for next day (T+1)
+                        pending_weights = Some(active_weights.clone());
+                        pending_signal_date = Some(prev_date);
+                    }
                 }
             }
 
@@ -429,6 +566,7 @@ where
 /// * `get_price` - Closure to get price at index
 /// * `get_weight` - Closure to get weight at index (NaN = no signal)
 /// * `resample` - Rebalancing frequency
+/// * `offset` - Optional resample offset for delaying execution
 /// * `config` - Backtest configuration
 pub fn backtest_with_accessor<'a, FD, FS, FP, FW, FO, FH, FL>(
     n_rows: usize,
@@ -438,6 +576,7 @@ pub fn backtest_with_accessor<'a, FD, FS, FP, FW, FO, FH, FL>(
     get_weight: FW,
     ohlc_accessors: Option<(FO, FH, FL)>,
     resample: ResampleFreq,
+    offset: Option<ResampleOffset>,
     config: &BacktestConfig,
 ) -> BacktestResult
 where
@@ -465,6 +604,7 @@ where
             get_price,
             get_weight,
             resample,
+            offset,
             config,
             &mut tracker,
             ohlc,
@@ -478,6 +618,7 @@ where
             get_price,
             get_weight,
             resample,
+            offset,
             config,
             &mut tracker,
             ohlc,
@@ -499,6 +640,7 @@ where
 /// # Arguments
 /// * `input` - Arrow arrays containing long format data (must be sorted by date)
 /// * `resample` - Rebalancing frequency
+/// * `offset` - Optional resample offset for delaying execution
 /// * `config` - Backtest configuration
 ///
 /// # Returns
@@ -506,6 +648,7 @@ where
 pub fn backtest_long_arrow(
     input: &LongFormatArrowInput,
     resample: ResampleFreq,
+    offset: Option<ResampleOffset>,
     config: &BacktestConfig,
 ) -> BacktestResult {
     // Build OHLC accessors if data is available
@@ -533,6 +676,7 @@ pub fn backtest_long_arrow(
         |i| input.weights.value(i),
         ohlc_accessors,
         resample,
+        offset,
         config,
     )
 }
@@ -549,6 +693,7 @@ pub fn backtest_long_slice(
     high_prices: Option<&[f64]>,
     low_prices: Option<&[f64]>,
     resample: ResampleFreq,
+    offset: Option<ResampleOffset>,
     config: &BacktestConfig,
 ) -> BacktestResult {
     // Build OHLC accessors if data is available
@@ -574,6 +719,7 @@ pub fn backtest_long_slice(
         |i| weights[i],
         ohlc_accessors,
         resample,
+        offset,
         config,
     )
 }
@@ -591,6 +737,7 @@ pub fn backtest_long_slice(
 pub fn backtest_with_report_long_arrow(
     input: &LongFormatArrowInput,
     resample: ResampleFreq,
+    offset: Option<ResampleOffset>,
     config: &BacktestConfig,
 ) -> BacktestResult {
     let mut tracker = SymbolTracker::new();
@@ -618,6 +765,7 @@ pub fn backtest_with_report_long_arrow(
             |i| input.prices.value(i),
             |i| input.weights.value(i),
             resample,
+            offset,
             config,
             &mut tracker,
             ohlc,
@@ -631,6 +779,7 @@ pub fn backtest_with_report_long_arrow(
             |i| input.prices.value(i),
             |i| input.weights.value(i),
             resample,
+            offset,
             config,
             &mut tracker,
             ohlc,
@@ -683,6 +832,16 @@ fn is_year_end_i32(prev_days: i32, next_days: i32) -> bool {
     let (prev_year, _) = days_to_year_month(prev_days);
     let (next_year, _) = days_to_year_month(next_days);
     prev_year != next_year
+}
+
+/// Get weekday of a date (days since 1970-01-01)
+///
+/// Returns 0=Monday, 1=Tuesday, ..., 6=Sunday (ISO 8601 weekday)
+/// 1970-01-01 was a Thursday (weekday 3)
+#[inline]
+fn weekday_of_i32(days: i32) -> u8 {
+    // rem_euclid handles negative days correctly
+    ((days.rem_euclid(7) + 3) % 7) as u8
 }
 
 /// Convert days since 1970-01-01 to (year, month)
@@ -1312,7 +1471,7 @@ mod tests {
         let weights = Float64Array::from(Vec::<f64>::new());
 
         let input = make_input(&dates, &symbols, &prices, &weights);
-        let result = backtest_long_arrow(&input, ResampleFreq::Daily, &BacktestConfig::default());
+        let result = backtest_long_arrow(&input, ResampleFreq::Daily, None, &BacktestConfig::default());
 
         assert!(result.creturn.is_empty());
     }
@@ -1343,7 +1502,7 @@ mod tests {
             ..Default::default()
         };
 
-        let result = backtest_long_arrow(&input, ResampleFreq::Daily, &config);
+        let result = backtest_long_arrow(&input, ResampleFreq::Daily, None, &config);
 
         assert_eq!(result.creturn.len(), 4);
         assert!((result.creturn[0] - 1.0).abs() < 1e-10, "Day 0: {}", result.creturn[0]);
@@ -1371,7 +1530,7 @@ mod tests {
             ..Default::default()
         };
 
-        let result = backtest_long_arrow(&input, ResampleFreq::Daily, &config);
+        let result = backtest_long_arrow(&input, ResampleFreq::Daily, None, &config);
 
         assert_eq!(result.creturn.len(), 3);
         assert!((result.creturn[0] - 1.0).abs() < 1e-10);
@@ -1399,7 +1558,7 @@ mod tests {
             ..Default::default()
         };
 
-        let result = backtest_long_arrow(&input, ResampleFreq::Daily, &config);
+        let result = backtest_long_arrow(&input, ResampleFreq::Daily, None, &config);
 
         // Day 1: Entry with 1% fee = 0.99
         assert!((result.creturn[1] - 0.99).abs() < 1e-6, "Day 1: {}", result.creturn[1]);
@@ -1426,7 +1585,7 @@ mod tests {
             ..Default::default()
         };
 
-        let result = backtest_long_arrow(&input, ResampleFreq::Monthly, &config);
+        let result = backtest_long_arrow(&input, ResampleFreq::Monthly, None, &config);
 
         assert_eq!(result.creturn.len(), 4);
         // Jan 31 is month-end, so signal triggers entry on Feb 1
@@ -1453,7 +1612,7 @@ mod tests {
             ..Default::default()
         };
 
-        let result = backtest_long_slice(&dates, &symbols, &prices, &weights, None, None, None, ResampleFreq::Daily, &config);
+        let result = backtest_long_slice(&dates, &symbols, &prices, &weights, None, None, None, ResampleFreq::Daily, None, &config);
 
         assert_eq!(result.creturn.len(), 3);
         assert!((result.creturn[2] - 1.1).abs() < 1e-10);
