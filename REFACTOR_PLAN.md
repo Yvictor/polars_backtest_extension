@@ -233,7 +233,7 @@ struct StandardMode;
 
 ## Phase 4: Cleanup (Low Priority)
 
-**Status**: 4.1 Complete, 4.3 Deferred
+**Status**: Complete
 
 ### 4.1 Remove or Integrate rebalance.rs
 
@@ -286,8 +286,8 @@ type SymbolTracker = TradeTrackerImpl<String, i32>;
 | 3.1 | Split simulate_backtest | Medium | -100 | Done |
 | 4.1 | Remove rebalance.rs | Low | -188 | Done |
 | 4.2 | Simplify balance_finlab | Low | ~-5 | Done |
-| 4.3 | Generic TradeTracker | Low | ~-50 | Deferred |
-| **Total** | | | **~-500** | |
+| 4.3 | Generic TradeTracker | Low | +36 | Done |
+| **Total** | | | **~-450** | |
 
 ---
 
