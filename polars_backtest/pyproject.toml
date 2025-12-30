@@ -59,5 +59,6 @@ dev = [
     "finlab>=1.5.5",
     "ipykernel>=6.31.0",
     "pandas>=2.3.3",
+    "patchelf>=0.17.2.4; sys_platform == 'linux'",
     "pytest>=8.4.2",
 ]
