@@ -5,7 +5,7 @@ import pytest
 import polars as pl
 
 import polars_backtest as pl_bt
-from polars_backtest.namespace import _long_to_wide
+from polars_backtest.utils import long_to_wide
 
 
 @pytest.fixture(scope="module")
@@ -251,7 +251,7 @@ def test_long_to_wide_conversion():
         "close": [100.0, 200.0, 102.0, 198.0],
     })
 
-    wide = _long_to_wide(df, "close")
+    wide = long_to_wide(df, "close")
 
     assert "date" in wide.columns
     assert "AAPL" in wide.columns
