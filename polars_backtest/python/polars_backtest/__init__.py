@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 import polars as pl
+from polars.plugins import register_plugin_function
 
 if TYPE_CHECKING:
     from polars.type_aliases import IntoExpr
@@ -62,11 +63,6 @@ __all__ = [
 _LIB_PATH = Path(__file__).parent
 
 
-def _get_lib_path() -> str:
-    """Get the path to the shared library for plugin registration."""
-    return str(_LIB_PATH)
-
-
 def daily_returns(expr: IntoExpr) -> pl.Expr:
     """Calculate daily returns from a price series.
 
@@ -79,9 +75,10 @@ def daily_returns(expr: IntoExpr) -> pl.Expr:
     Example:
         >>> df.with_columns(pl_daily_returns=daily_returns("close"))
     """
-    return pl.col(expr).register_plugin(
-        lib=_get_lib_path(),
-        symbol="pl_daily_returns",
+    return register_plugin_function(
+        plugin_path=_LIB_PATH,
+        function_name="pl_daily_returns",
+        args=[expr],
         is_elementwise=False,
     )
 
@@ -98,9 +95,10 @@ def cumulative_returns(expr: IntoExpr) -> pl.Expr:
     Example:
         >>> df.with_columns(creturn=cumulative_returns("daily_return"))
     """
-    return pl.col(expr).register_plugin(
-        lib=_get_lib_path(),
-        symbol="pl_cumulative_returns",
+    return register_plugin_function(
+        plugin_path=_LIB_PATH,
+        function_name="pl_cumulative_returns",
+        args=[expr],
         is_elementwise=False,
     )
 
@@ -119,9 +117,10 @@ def sharpe_ratio(expr: IntoExpr) -> pl.Expr:
     Example:
         >>> df.select(sharpe=sharpe_ratio("daily_return"))
     """
-    return pl.col(expr).register_plugin(
-        lib=_get_lib_path(),
-        symbol="pl_sharpe_ratio",
+    return register_plugin_function(
+        plugin_path=_LIB_PATH,
+        function_name="pl_sharpe_ratio",
+        args=[expr],
         is_elementwise=False,
     )
 
@@ -141,9 +140,10 @@ def sortino_ratio(expr: IntoExpr) -> pl.Expr:
     Example:
         >>> df.select(sortino=sortino_ratio("daily_return"))
     """
-    return pl.col(expr).register_plugin(
-        lib=_get_lib_path(),
-        symbol="pl_sortino_ratio",
+    return register_plugin_function(
+        plugin_path=_LIB_PATH,
+        function_name="pl_sortino_ratio",
+        args=[expr],
         is_elementwise=False,
     )
 
@@ -160,9 +160,10 @@ def max_drawdown(expr: IntoExpr) -> pl.Expr:
     Example:
         >>> df.select(mdd=max_drawdown("creturn"))
     """
-    return pl.col(expr).register_plugin(
-        lib=_get_lib_path(),
-        symbol="pl_max_drawdown",
+    return register_plugin_function(
+        plugin_path=_LIB_PATH,
+        function_name="pl_max_drawdown",
+        args=[expr],
         is_elementwise=False,
     )
 
@@ -179,9 +180,10 @@ def drawdown_series(expr: IntoExpr) -> pl.Expr:
     Example:
         >>> df.with_columns(dd=drawdown_series("creturn"))
     """
-    return pl.col(expr).register_plugin(
-        lib=_get_lib_path(),
-        symbol="pl_drawdown_series",
+    return register_plugin_function(
+        plugin_path=_LIB_PATH,
+        function_name="pl_drawdown_series",
+        args=[expr],
         is_elementwise=False,
     )
 
@@ -199,11 +201,11 @@ def portfolio_return(weights: IntoExpr, returns: IntoExpr) -> pl.Expr:
     Example:
         >>> df.select(port_ret=portfolio_return("weights", "returns"))
     """
-    return pl.col(weights).register_plugin(
-        lib=_get_lib_path(),
-        symbol="pl_portfolio_return",
+    return register_plugin_function(
+        plugin_path=_LIB_PATH,
+        function_name="pl_portfolio_return",
+        args=[weights, returns],
         is_elementwise=False,
-        args=[pl.col(returns)],
     )
 
 
@@ -219,8 +221,9 @@ def equal_weights(expr: IntoExpr) -> pl.Expr:
     Example:
         >>> df.with_columns(weight=equal_weights("signal"))
     """
-    return pl.col(expr).register_plugin(
-        lib=_get_lib_path(),
-        symbol="pl_equal_weights",
+    return register_plugin_function(
+        plugin_path=_LIB_PATH,
+        function_name="pl_equal_weights",
+        args=[expr],
         is_elementwise=False,
     )
