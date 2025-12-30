@@ -9,21 +9,22 @@ from typing import TYPE_CHECKING, Union, cast
 
 import polars as pl
 
+from polars_backtest._polars_backtest import (
+    BacktestConfig,
+    BacktestReport,
+)
+from polars_backtest._polars_backtest import (
+    backtest as _rust_backtest,
+)
+from polars_backtest._polars_backtest import (
+    backtest_with_report as _rust_backtest_with_report,
+)
+
 if TYPE_CHECKING:
     from polars_backtest.polars_backtest import DataFrame as ExtDataFrame
 
 # Type alias for column specification (str or Expr)
 ColumnSpec = Union[str, pl.Expr]
-
-# Import from internal module to avoid circular imports
-from polars_backtest._polars_backtest import (
-    BacktestConfig,
-    BacktestResult,
-    BacktestReport,
-    # Main API (long format, zero-copy)
-    backtest as _rust_backtest,
-    backtest_with_report as _rust_backtest_with_report,
-)
 
 
 def _resolve_column(

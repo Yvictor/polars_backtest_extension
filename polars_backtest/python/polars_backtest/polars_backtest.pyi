@@ -4,7 +4,6 @@ import polars as pl
 
 from polars_backtest.namespace import BacktestNamespace
 
-
 class DataFrame(pl.DataFrame):
     """Extended DataFrame with bt namespace."""
 
