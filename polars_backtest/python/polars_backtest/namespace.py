@@ -245,7 +245,7 @@ class BacktestNamespace:
             skip_sort,
         )
 
-        return result.creturn.rename({result.creturn.columns[0]: date_col})
+        return result.creturn
 
     def backtest_with_report(
         self,
