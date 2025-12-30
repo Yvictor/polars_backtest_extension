@@ -277,6 +277,20 @@ FINLAB_API_TOKEN=your_token_here
 POLARS_BACKTEST_PROFILE=1 python your_script.py
 ```
 
+## Finlab Compatibility Notes
+
+Key findings from reverse-engineering Finlab's `backtest.sim()`:
+
+| Topic | Implementation |
+|-------|----------------|
+| creturn | `entry_value * (price[t] / entry_price)` - no compounding |
+| Rebalance fee | `2 * fee_ratio + tax_ratio` = 0.585% |
+| Stop loss | Cumulative multiplication `cr *= (today/yesterday)` |
+| NaN prices | Don't update `previous_price`; use `last_market_value` |
+| Weight normalization | Rescale remaining weights after stop: `original_sum / remaining_sum` |
+
+Reference: `btcore/src/simulation/wide.rs`, `btcore/src/stops.rs`
+
 ## License
 
 MIT
