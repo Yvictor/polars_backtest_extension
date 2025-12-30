@@ -28,6 +28,13 @@ from polars_backtest.namespace import (
     backtest_with_report,
 )
 
+# Type-safe DataFrame with bt namespace (for type checking only)
+# Usage: df: DataFrame = pl.DataFrame(...); df.bt.backtest(...)
+if TYPE_CHECKING:
+    from polars_backtest.polars_backtest import DataFrame
+else:
+    DataFrame = pl.DataFrame
+
 # Wide format API (optional, for Finlab compatibility)
 from polars_backtest.wide import (
     Report,
@@ -41,6 +48,7 @@ __all__ = [
     "BacktestConfig",
     "BacktestReport",
     "BacktestNamespace",
+    "DataFrame",  # Type-safe DataFrame with bt namespace
     # Main API (long format)
     "backtest",
     "backtest_with_report",
