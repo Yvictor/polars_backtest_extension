@@ -97,36 +97,29 @@ cargo fmt -- --check           # Check format only
 
 ## Python Development
 
-> Working directory: `polars_backtest_extension/polars_backtest/`
+> Working directory: `polars_backtest_extension/` (project root, using `just`)
 
 ### Setup
 
 ```bash
-cd polars_backtest
-uv sync
+just sync
 ```
 
 ### Build Extension
 
 ```bash
-uv run maturin develop              # Debug build
-uv run maturin develop --release    # Release build (recommended)
+just build-debug    # Debug build
+just build          # Release build (recommended)
 ```
 
 ### Test
 
 ```bash
-uv run pytest tests/ -v                       # Fast tests only (default)
-uv run pytest tests/ -v -m slow               # Slow tests only (finlab data)
-uv run pytest tests/ -v -m ''                 # All tests (fast + slow)
-uv run pytest tests/test_wide_vs_finlab.py -v # Wide vs Finlab comparison
-uv run pytest tests/test_long_vs_wide.py -v   # Long vs Wide comparison
-```
-
-### Run Scripts
-
-```bash
-uv run python your_script.py
+just test           # Fast tests only (default)
+just test-slow      # Slow tests only (finlab data)
+just test-all       # All tests (fast + slow)
+just test-wide      # Wide vs Finlab comparison
+just test-long      # Long vs Wide comparison
 ```
 
 ---
@@ -139,15 +132,17 @@ uv run python your_script.py
 #    - polars_backtest/src/lib.rs (Python bindings)
 
 # 2. Check & test Rust
-cargo check
-cargo test -p btcore
+just check
+just test-rust
 
 # 3. Rebuild Python extension
-cd polars_backtest
-uv run maturin develop --release
+just build
 
 # 4. Test Python
-uv run pytest tests/ -v
+just test
+
+# Or run full CI
+just ci
 ```
 
 ---
@@ -160,7 +155,7 @@ Long format DataFrames work natively with Polars operations.
 
 ```python
 import polars as pl
-import polars_backtest as pb
+import polars_backtest as pl_bt
 
 # Long format data: one row per (date, symbol)
 df = pl.DataFrame({
@@ -171,7 +166,7 @@ df = pl.DataFrame({
 })
 
 # Function API
-result = pb.backtest(df, trade_at_price="close", position="weight")
+result = pl_bt.backtest(df, trade_at_price="close", position="weight")
 
 # Or use DataFrame namespace
 result = df.bt.backtest(trade_at_price="close", position="weight")
@@ -192,7 +187,7 @@ result = df.bt.backtest(
 ### Backtest with Report
 
 ```python
-report = pb.backtest_with_report(
+report = pl_bt.backtest_with_report(
     df,
     trade_at_price="close",
     position="weight",
