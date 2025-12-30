@@ -5,7 +5,7 @@ Provides df.bt.backtest() API for long format DataFrames.
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Union
+from typing import Union
 
 import polars as pl
 
@@ -20,18 +20,7 @@ from polars_backtest._polars_backtest import (
     # Main API (long format, zero-copy)
     backtest as _rust_backtest,
     backtest_with_report as _rust_backtest_with_report,
-    # Wide format API (for validation)
-    backtest_wide as _backtest_wide_rust,
 )
-
-if TYPE_CHECKING:
-    from polars_backtest import Report
-
-
-def _get_resample_helpers():
-    """Lazy import of resample helpers to avoid circular imports."""
-    import polars_backtest as pb
-    return pb._resample_position, pb._filter_changed_positions, pb.Report
 
 
 def _resolve_column(
@@ -113,60 +102,6 @@ class BacktestNamespace:
         missing = [c for c in required if c not in self._df.columns]
         if missing:
             raise ValueError(f"Missing required columns: {missing}")
-
-    def _prepare_wide_data(
-        self,
-        date_col: str,
-        symbol_col: str,
-        price_col: str,
-        weight_col: str,
-        open_col: str | None = None,
-        high_col: str | None = None,
-        low_col: str | None = None,
-        df: pl.DataFrame | None = None,
-    ) -> dict:
-        """Convert long format data to wide format for Rust backend.
-
-        Args:
-            df: DataFrame to use (defaults to self._df if not provided)
-
-        Returns:
-            Dict with wide format DataFrames:
-            - prices: price DataFrame
-            - position: weight DataFrame
-            - open/high/low: optional OHLC DataFrames
-        """
-        if df is None:
-            df = self._df
-
-        # Get unique dates from prices
-        price_dates = (
-            df.select(date_col)
-            .unique()
-            .sort(date_col)
-            .get_column(date_col)
-            .to_list()
-        )
-
-        # Convert to wide format
-        prices_wide = _long_to_wide(df, price_col, date_col, symbol_col)
-        position_wide = _long_to_wide(df, weight_col, date_col, symbol_col)
-
-        result = {
-            "prices": prices_wide,
-            "position": position_wide,
-            "price_dates": price_dates,
-        }
-
-        # Optional OHLC
-        if open_col and open_col in df.columns:
-            result["open"] = _long_to_wide(df, open_col, date_col, symbol_col)
-        if high_col and high_col in df.columns:
-            result["high"] = _long_to_wide(df, high_col, date_col, symbol_col)
-        if low_col and low_col in df.columns:
-            result["low"] = _long_to_wide(df, low_col, date_col, symbol_col)
-
-        return result
 
     def backtest(
         self,
@@ -263,115 +198,20 @@ class BacktestNamespace:
         else:
             df = df.with_columns(pl.col(position_col).fill_null(0.0))
 
-        # Check if we can use Rust path
-        # Supported resample: D, W, W-MON..W-SUN, M, MS, Q, QS, Y, None
-        # Rust now fully supports resample_offset with correct T+1 execution timing
-        resample_supported = resample in (
+        # Validate resample parameter
+        # Supported: D, W, W-MON..W-SUN, M, MS, Q, QS, Y, None
+        supported_resample = (
             None, "D",
             "W", "W-MON", "W-TUE", "W-WED", "W-THU", "W-FRI", "W-SAT", "W-SUN",
             "M", "ME", "MS",
             "Q", "QE", "QS",
             "Y", "YE", "A",
         )
-        use_rust = resample_supported
-
-        if use_rust:
-            # Use Rust backtest directly (does pivot internally)
-            config = BacktestConfig(
-                fee_ratio=fee_ratio,
-                tax_ratio=tax_ratio,
-                stop_loss=stop_loss,
-                take_profit=take_profit,
-                trail_stop=trail_stop,
-                position_limit=position_limit,
-                retain_cost_when_rebalance=retain_cost_when_rebalance,
-                stop_trading_next_period=stop_trading_next_period,
-                finlab_mode=finlab_mode,
-                touched_exit=touched_exit,
+        if resample not in supported_resample:
+            raise ValueError(
+                f"Unsupported resample '{resample}'. "
+                f"Supported values: {', '.join(str(s) for s in supported_resample)}"
             )
-
-            # Check if already sorted by date (pyo3-polars loses this flag during transfer)
-            # skip_sort = df[date_col].flags.get("SORTED_ASC", False)
-            skip_sort = df.get_column(date_col).is_sorted()
-
-            result = _rust_backtest(
-                df,
-                date_col,
-                symbol_col,
-                price_col,
-                position_col,
-                open_col,
-                high_col,
-                low_col,
-                resample,
-                resample_offset,
-                config,
-                skip_sort,
-            )
-
-            # Rust now returns creturn as DataFrame with date and creturn columns
-            # Filtering and normalization is done in Rust
-            return result.creturn.rename({result.creturn.columns[0]: date_col})
-
-        # Fallback to Python path for complex resample patterns
-        # Convert to wide format (using df with nulls filled)
-        wide_data = self._prepare_wide_data(
-            date_col, symbol_col, price_col, position_col, df=df
-        )
-        prices_wide = wide_data["prices"]
-        position_wide = wide_data["position"]
-        price_dates = wide_data["price_dates"]
-
-        # Convert dates to string format for compatibility with _resample_position
-        # (_resample_position uses string dates internally)
-        prices_wide = prices_wide.with_columns(
-            pl.col(date_col).cast(pl.Utf8).alias(date_col)
-        )
-        position_wide = position_wide.with_columns(
-            pl.col(date_col).cast(pl.Utf8).alias(date_col)
-        )
-        price_dates = [str(d) for d in price_dates]
-
-        # Get stock columns (all except date)
-        stock_cols = [c for c in prices_wide.columns if c != date_col]
-
-        # Get resample helpers (lazy import)
-        _resample_position, _filter_changed_positions, _ = _get_resample_helpers()
-
-        # Apply resample
-        if resample is None:
-            position_wide = _filter_changed_positions(position_wide)
-        elif resample != "D":
-            position_wide = _resample_position(
-                position_wide, price_dates, resample, resample_offset
-            )
-
-        # Align columns
-        position_stock_cols = [c for c in position_wide.columns if c in stock_cols]
-        if not position_stock_cols:
-            raise ValueError("No common stock columns between prices and position")
-
-        prices_data = prices_wide.select(position_stock_cols)
-        position_data = position_wide.select(position_stock_cols)
-
-        # Determine signal type
-        first_col_dtype = position_data.dtypes[0]
-        is_bool = first_col_dtype == pl.Boolean
-
-        # Calculate rebalance indices
-        pos_date_col = position_wide.columns[0]
-        position_dates = position_wide.select(pos_date_col).to_series().to_list()
-
-        rebalance_indices = []
-        for pos_d in position_dates:
-            try:
-                idx = price_dates.index(pos_d)
-                rebalance_indices.append(idx)
-            except ValueError:
-                pass
-
-        if not rebalance_indices:
-            raise ValueError("No matching dates between prices and position")
 
         # Create config
         config = BacktestConfig(
@@ -387,47 +227,25 @@ class BacktestNamespace:
             touched_exit=touched_exit,
         )
 
-        # Run backtest (convert bool to float if needed)
-        if is_bool:
-            position_data = position_data.cast(pl.Float64)
-        else:
-            position_data = position_data.cast(pl.Float64)
+        # Check if already sorted by date
+        skip_sort = df.get_column(date_col).is_sorted()
 
-        # Note: Wide format backtest doesn't support touched_exit yet
-        # Would need to pass OHLC data as well
-        creturn = _backtest_wide_rust(
-            prices_data, position_data, rebalance_indices, config
+        result = _rust_backtest(
+            df,
+            date_col,
+            symbol_col,
+            price_col,
+            position_col,
+            open_col,
+            high_col,
+            low_col,
+            resample,
+            resample_offset,
+            config,
+            skip_sort,
         )
 
-        # Find first rebalance index with any non-zero signals (like Finlab)
-        first_signal_rebalance_idx = 0
-        for i in range(len(position_data)):
-            row = position_data[i]
-            # Check if any value in this row is non-zero (True or > 0)
-            has_signal = any(
-                row[col][0] is not None and row[col][0] > 0
-                for col in position_data.columns
-            )
-            if has_signal:
-                first_signal_rebalance_idx = i
-                break
-
-        # Get first signal date index in price data
-        first_signal_idx = rebalance_indices[first_signal_rebalance_idx] if rebalance_indices else 0
-
-        # Slice from first signal date and normalize creturn to start at 1.0
-        sliced_creturn = creturn[first_signal_idx:]
-        if len(sliced_creturn) > 0 and sliced_creturn[0] != 0:
-            normalizer = sliced_creturn[0]
-            sliced_creturn = [c / normalizer for c in sliced_creturn]
-
-        dates = prices_wide.get_column(date_col)
-
-        # Build result
-        return pl.DataFrame({
-            date_col: dates[first_signal_idx:],
-            "creturn": sliced_creturn,
-        })
+        return result.creturn.rename({result.creturn.columns[0]: date_col})
 
     def backtest_with_report(
         self,
