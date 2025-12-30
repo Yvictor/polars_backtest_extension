@@ -1,6 +1,6 @@
 # Polars Backtest Extension
 
-High-performance portfolio backtesting extension for Polars. Rust-powered with zero-copy Arrow FFI.
+High-performance portfolio backtesting extension for Polars. Rust-powered with Arrow.
 
 ## Quick Start
 
@@ -22,12 +22,24 @@ result = df.bt.backtest(trade_at_price="close", position="weight")
 
 ## Performance
 
-| Data Size | Time |
-|-----------|------|
-| 5,000 rows | ~3.5ms |
-| 100,000 rows | ~60ms |
-| 500,000 rows | ~300ms |
-| 2,000,000 rows | ~1.2s |
+**300-day breakout strategy** (~2000 stocks, 17 years daily data):
+
+```python
+# Finlab
+position = close >= close.rolling(300).max()
+report = backtest.sim(position)
+
+# polars_backtest
+df = df.with_columns(
+    (pl.col("close") >= pl.col("close").rolling_max(300)).alias("position")
+)
+report = df.bt.backtest_with_report(position="position")
+```
+
+| | Finlab | polars_backtest |
+|---|--------|-----------------|
+| Time | ~45s | ~0.8s |
+| Speedup | 1x | **~56x faster** |
 
 ```bash
 just bench  # Run benchmarks
@@ -35,7 +47,7 @@ just bench  # Run benchmarks
 
 ## Features
 
-- **Rust Core** - Pure Rust implementation with zero-copy Arrow FFI
+- **Rust Core** - Pure Rust implementation with Arrow
 - **Native Polars** - Works with long format DataFrames, supports Polars expressions
 - **T+1 Execution** - Realistic trading simulation
 - **Risk Management** - Stop loss, take profit, trailing stop, touched exit (OHLC)
