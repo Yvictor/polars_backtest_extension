@@ -45,6 +45,10 @@ module-name = "polars_backtest._polars_backtest"
 testpaths = ["tests"]
 python_files = ["test_*.py"]
 python_functions = ["test_*"]
+markers = [
+    "slow: marks tests as slow (requires finlab data, deselect with '-m \"not slow\"')",
+]
+addopts = "-m 'not slow'"
 
 [tool.ruff]
 line-length = 100

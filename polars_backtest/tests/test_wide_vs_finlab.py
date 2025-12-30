@@ -21,6 +21,9 @@ import polars as pl
 from dotenv import load_dotenv
 load_dotenv()
 
+# Mark all tests in this file as slow (requires finlab data)
+pytestmark = pytest.mark.slow
+
 import finlab
 finlab.login(os.getenv('FINLAB_API_TOKEN'))
 

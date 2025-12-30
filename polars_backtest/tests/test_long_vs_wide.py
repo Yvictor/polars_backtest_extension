@@ -20,6 +20,9 @@ from polars.testing import assert_frame_equal
 
 load_dotenv()
 
+# Mark all tests in this file as slow (requires finlab data)
+pytestmark = pytest.mark.slow
+
 
 CRETURN_RTOL = 1e-6
 

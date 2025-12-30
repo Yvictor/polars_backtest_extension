@@ -43,18 +43,19 @@ polars_backtest_extension/
 │   │   ├── lib.rs                # PyO3 bindings (main API)
 │   │   ├── ffi_convert.rs        # FFI conversion (zero-copy Arrow)
 │   │   └── expressions.rs        # Polars expression registration
-│   └── python/
-│       └── polars_backtest/
-│           ├── __init__.py       # Package exports
-│           └── namespace.py      # df.bt namespace API
-├── tests/
-│   ├── test_vs_finlab.py         # Finlab compatibility (gold standard)
-│   ├── test_namespace.py         # df.bt namespace tests
-│   ├── test_long_format.py       # Long format backtest tests
-│   └── python/
-│       ├── test_resample.py
-│       ├── test_resample_polars.py
-│       └── test_trades_tracking.py
+│   ├── python/
+│   │   └── polars_backtest/
+│   │       ├── __init__.py       # Package exports
+│   │       ├── namespace.py      # df.bt namespace API
+│   │       ├── wide.py           # Wide format API (Finlab compatible)
+│   │       └── utils.py          # Utility functions (resample, offset)
+│   └── tests/
+│       ├── test_namespace.py     # df.bt namespace tests
+│       ├── test_wide.py          # Wide format API tests
+│       ├── test_resample_polars.py  # Resample functionality tests
+│       ├── test_utils.py         # Utility function tests
+│       ├── test_wide_vs_finlab.py   # Wide vs Finlab.sim (slow)
+│       └── test_long_vs_wide.py     # Long vs Wide format (slow)
 ├── benchmarks/
 │   └── bench_backtest.py         # Performance benchmarks
 └── devnb/                        # Development notebooks
@@ -115,10 +116,11 @@ uv run maturin develop --release    # Release build (recommended)
 ### Test
 
 ```bash
-uv run pytest ../tests/ -v                                      # All tests
-uv run pytest ../tests/python/test_finlab_comparison.py -v      # Specific file
-uv run pytest ../tests/test_vs_finlab.py -v                     # Finlab comparison
-uv run pytest ../tests/ --tb=short                              # Short traceback
+uv run pytest tests/ -v                       # Fast tests only (default)
+uv run pytest tests/ -v -m slow               # Slow tests only (finlab data)
+uv run pytest tests/ -v -m ''                 # All tests (fast + slow)
+uv run pytest tests/test_wide_vs_finlab.py -v # Wide vs Finlab comparison
+uv run pytest tests/test_long_vs_wide.py -v   # Long vs Wide comparison
 ```
 
 ### Run Scripts
@@ -145,7 +147,7 @@ cd polars_backtest
 uv run maturin develop --release
 
 # 4. Test Python
-uv run pytest ../tests/ -v
+uv run pytest tests/ -v
 ```
 
 ---
