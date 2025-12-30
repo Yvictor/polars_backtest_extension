@@ -5,6 +5,7 @@
 //! (using cr/maxcr cumulative tracking).
 
 use crate::config::BacktestConfig;
+use crate::is_valid_price;
 use crate::position::Position;
 use std::collections::HashMap;
 
@@ -105,7 +106,7 @@ pub fn detect_stops_finlab(
             let current_price = prices[stock_id];
             let stop_entry = pos.stop_entry_price;
 
-            if stop_entry <= 0.0 || current_price.is_nan() || current_price <= 0.0 {
+            if stop_entry <= 0.0 || !is_valid_price(current_price) {
                 return None;
             }
 

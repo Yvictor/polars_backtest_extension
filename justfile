@@ -50,11 +50,11 @@ test-all:
 
 # Run Wide vs Finlab comparison
 test-wide:
-    cd polars_backtest && uv run pytest tests/test_wide_vs_finlab.py -v
+    cd polars_backtest && uv run pytest tests/test_wide_vs_finlab.py -v -m slow
 
 # Run Long vs Wide comparison
 test-long:
-    cd polars_backtest && uv run pytest tests/test_long_vs_wide.py -v
+    cd polars_backtest && uv run pytest tests/test_long_vs_wide.py -v -m slow
 
 # Run specific test file
 test-file FILE:

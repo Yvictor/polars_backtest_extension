@@ -6,6 +6,7 @@
 
 use std::collections::HashMap;
 
+use crate::is_valid_price;
 use crate::position::Position;
 
 /// Portfolio state during simulation
@@ -43,26 +44,14 @@ impl PortfolioState {
     /// We use last_market_value which is updated via cumulative multiplication (pos *= r)
     /// This matches Finlab's floating point behavior exactly
     #[allow(dead_code)]
-    pub fn balance_finlab(&self, prices: &[f64]) -> f64 {
+    pub fn balance_finlab(&self, _prices: &[f64]) -> f64 {
         // Finlab: balance = cash + Σ(pos[sid])
         // where pos[sid] is updated daily via pos *= r (cumulative multiplication)
         // We track this as last_market_value, updated in update_max_prices
         let pos_value: f64 = self
             .positions
-            .iter()
-            .map(|(&stock_id, p)| {
-                if stock_id < prices.len() {
-                    let close_price = prices[stock_id];
-                    // If current price is NaN, use last valid market value
-                    if close_price > 0.0 && !close_price.is_nan() {
-                        p.last_market_value
-                    } else {
-                        p.last_market_value
-                    }
-                } else {
-                    p.last_market_value
-                }
-            })
+            .values()
+            .map(|p| p.last_market_value)
             .sum();
         self.cash + pos_value
     }
@@ -84,7 +73,7 @@ impl PortfolioState {
         for (&stock_id, pos) in self.positions.iter_mut() {
             if stock_id < prices.len() {
                 let close_price = prices[stock_id];
-                if close_price > 0.0 && !close_price.is_nan() && pos.previous_price > 0.0 {
+                if is_valid_price(close_price) && pos.previous_price > 0.0 {
                     // Valid price: use cumulative multiplication (Finlab: pos *= r)
                     let r = close_price / pos.previous_price;
                     pos.last_market_value *= r;
@@ -115,7 +104,7 @@ impl PortfolioState {
                 let current_price = prices[stock_id];
 
                 // Skip if price is invalid
-                if current_price.is_nan() || current_price <= 0.0 {
+                if !is_valid_price(current_price) {
                     continue;
                 }
 
@@ -150,7 +139,7 @@ impl PortfolioState {
         for (&stock_id, pos) in self.positions.iter_mut() {
             if stock_id < prices.len() {
                 let current_price = prices[stock_id];
-                if !current_price.is_nan() && current_price > 0.0 {
+                if is_valid_price(current_price) {
                     pos.previous_price = current_price;
                 }
             }
@@ -183,8 +172,8 @@ impl PortfolioState {
             let prev_price = prev_prices[stock_id];
 
             // Skip if either price is invalid or NaN
-            let curr_valid = curr_price > 0.0 && !curr_price.is_nan();
-            let prev_valid = prev_price > 0.0 && !prev_price.is_nan();
+            let curr_valid = is_valid_price(curr_price);
+            let prev_valid = is_valid_price(prev_price);
 
             if curr_valid && prev_valid {
                 let stock_return = (curr_price - prev_price) / prev_price;

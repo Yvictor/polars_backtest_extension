@@ -24,6 +24,15 @@
 /// - Finlab compatibility (matches their precision handling)
 pub const FLOAT_EPSILON: f64 = 1e-10;
 
+/// Check if a price is valid for calculations.
+///
+/// A price is valid if it is positive and not NaN.
+/// Used for filtering out missing data (NaN) and invalid prices (<=0).
+#[inline]
+pub fn is_valid_price(price: f64) -> bool {
+    price > 0.0 && !price.is_nan()
+}
+
 pub mod config;
 pub mod portfolio;
 pub mod position;

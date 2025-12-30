@@ -18,7 +18,7 @@ use arrow::array::{Float64Array, Int32Array, StringViewArray};
 use crate::config::BacktestConfig;
 use crate::position::Position;
 use crate::tracker::{BacktestResult, TradeRecord, NoopSymbolTracker, SymbolTracker, TradeTracker};
-use crate::FLOAT_EPSILON;
+use crate::{is_valid_price, FLOAT_EPSILON};
 
 /// Portfolio with string symbol keys (for zero-copy backtest)
 pub struct Portfolio {
@@ -561,7 +561,7 @@ where
         }
 
         current_date = Some(date);
-        if price > 0.0 && !price.is_nan() {
+        if is_valid_price(price) {
             today_prices.insert(symbol, price);
         }
         if !weight.is_nan() && weight.abs() > FLOAT_EPSILON {
@@ -1116,7 +1116,7 @@ fn last_day_of_year_i32(days: i32) -> i32 {
 fn update_positions(portfolio: &mut Portfolio, prices: &HashMap<&str, f64>) {
     for (sym, pos) in portfolio.positions.iter_mut() {
         if let Some(&curr_price) = prices.get(sym.as_str()) {
-            if curr_price > 0.0 && !curr_price.is_nan() {
+            if is_valid_price(curr_price) {
                 if pos.previous_price > 0.0 {
                     let r = curr_price / pos.previous_price;
                     pos.cr *= r;
@@ -1140,7 +1140,7 @@ fn update_positions(portfolio: &mut Portfolio, prices: &HashMap<&str, f64>) {
 fn update_previous_prices(portfolio: &mut Portfolio, prices: &HashMap<&str, f64>) {
     for (sym, pos) in portfolio.positions.iter_mut() {
         if let Some(&curr_price) = prices.get(sym.as_str()) {
-            if curr_price > 0.0 && !curr_price.is_nan() {
+            if is_valid_price(curr_price) {
                 pos.previous_price = curr_price;
             }
         }
@@ -1210,7 +1210,7 @@ fn detect_stops_unified(
 
         // Get current close price
         let close_price = close_prices.get(sym_str).copied().unwrap_or(0.0);
-        if close_price <= 0.0 || close_price.is_nan() {
+        if !is_valid_price(close_price) {
             continue;
         }
 
@@ -1474,7 +1474,7 @@ where
 
         // Get price and check validity
         let price_opt = today_prices.get(sym.as_str()).copied();
-        let price_valid = price_opt.map_or(false, |p| p > 0.0 && !p.is_nan());
+        let price_valid = price_opt.map_or(false, |p| is_valid_price(p));
 
         // Target position value (scaled by ratio)
         let target_value = target_weight * ratio;

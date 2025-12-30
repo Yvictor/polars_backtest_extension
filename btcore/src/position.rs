@@ -2,6 +2,8 @@
 //!
 //! This module contains the Position struct that tracks the state of a single stock position.
 
+use crate::is_valid_price;
+
 /// Position in a single stock
 ///
 /// Tracks all state needed for:
@@ -77,7 +79,7 @@ impl Position {
     /// Updates: cr, last_market_value, maxcr
     /// Does NOT update previous_price (call update_previous_price separately)
     pub fn update_with_return(&mut self, current_price: f64) {
-        if current_price.is_nan() || current_price <= 0.0 {
+        if !is_valid_price(current_price) {
             return;
         }
 
@@ -100,7 +102,7 @@ impl Position {
 
     /// Update previous_price after return calculation
     pub fn update_previous_price(&mut self, price: f64) {
-        if !price.is_nan() && price > 0.0 {
+        if is_valid_price(price) {
             self.previous_price = price;
         }
     }

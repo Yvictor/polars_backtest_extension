@@ -16,7 +16,7 @@ use crate::position::Position;
 use crate::stops::{detect_stops, detect_stops_finlab, detect_touched_exit};
 use crate::tracker::{WideBacktestResult, NoopIndexTracker, IndexTracker, TradeTracker};
 use crate::weights::{normalize_weights_finlab, IntoWeights};
-use crate::FLOAT_EPSILON;
+use crate::{is_valid_price, FLOAT_EPSILON};
 
 // ============================================================================
 // Unified Simulation Engine
@@ -547,7 +547,7 @@ fn update_entry_prices_after_nan(
         }
 
         let curr_price = current_prices[stock_id];
-        let curr_is_valid = !curr_price.is_nan() && curr_price > 0.0;
+        let curr_is_valid = is_valid_price(curr_price);
 
         if !curr_is_valid {
             continue;
@@ -684,7 +684,7 @@ fn execute_finlab_rebalance(
         }
 
         let price = prices[stock_id];
-        let price_valid = price > 0.0 && !price.is_nan();
+        let price_valid = is_valid_price(price);
 
         // Target position value (scaled by ratio)
         let target_value = target_weight * ratio;
