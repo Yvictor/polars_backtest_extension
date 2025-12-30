@@ -191,4 +191,6 @@ polars_backtest_extension/
 
 ## License
 
-MIT
+PolyForm Noncommercial 1.0.0
+
+For commercial use, please contact the author to obtain a commercial license.

@@ -102,4 +102,6 @@ uv run pytest tests/test_long_vs_wide.py -v   # Long vs Wide
 
 ## License
 
-MIT
+PolyForm Noncommercial 1.0.0
+
+For commercial use, please contact the author to obtain a commercial license.
