@@ -60,6 +60,10 @@ test-long:
 test-file FILE:
     cd polars_backtest && uv run pytest tests/{{FILE}} -v
 
+# Run benchmarks
+bench:
+    cd polars_backtest && uv run python benchmarks/bench_backtest.py
+
 # Lint Python code
 lint:
     cd polars_backtest && uv run ruff check python/

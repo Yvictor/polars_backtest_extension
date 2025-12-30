@@ -5,11 +5,12 @@ Usage:
     uv run python benchmarks/bench_backtest.py
 """
 
-import time
 import os
-import polars as pl
-import numpy as np
+import time
 from datetime import date, timedelta
+
+import numpy as np
+import polars as pl
 
 os.environ["POLARS_VERBOSE"] = "0"
 
@@ -46,7 +47,7 @@ def benchmark(func, df: pl.DataFrame, n_runs: int = 5) -> dict:
     times = []
     for _ in range(n_runs):
         start = time.perf_counter()
-        result = func(df)
+        func(df)
         end = time.perf_counter()
         times.append(end - start)
 
@@ -60,7 +61,7 @@ def benchmark(func, df: pl.DataFrame, n_runs: int = 5) -> dict:
 
 def run_benchmarks():
     """Run benchmarks with different data sizes."""
-    import polars_backtest as pl_bt
+    import polars_backtest  # noqa: F401 - registers df.bt namespace
 
     sizes = [
         ("Small", 100, 50),       # 5,000 rows
