@@ -22,24 +22,25 @@ result = df.bt.backtest(trade_at_price="close", position="weight")
 
 ## Performance
 
-**300-day breakout strategy** (~2000 stocks, 17 years daily data):
+**300-day breakout strategy** (~2000 stocks, 17 years daily data, 12M rows):
 
 ```python
 # Finlab
 position = close >= close.rolling(300).max()
-report = backtest.sim(position)
+report = backtest.sim(position, resample="M")
 
 # polars_backtest
 df = df.with_columns(
-    (pl.col("close") >= pl.col("close").rolling_max(300)).alias("position")
+    (pl.col("close") >= pl.col("close").rolling_max(300).over("symbol"))
+    .alias("weight")
 )
-report = df.bt.backtest_with_report(position="position")
+report = df.bt.backtest_with_report(position="weight", resample="M")
 ```
 
 | | Finlab | polars_backtest |
 |---|--------|-----------------|
-| Time | ~45s | ~0.8s |
-| Speedup | 1x | **~56x faster** |
+| Time | 3.7s | 244ms |
+| Speedup | 1x | **15x faster** |
 
 ```bash
 just bench  # Run benchmarks
@@ -97,17 +98,6 @@ print(report.creturn)   # DataFrame with date, creturn
 print(report.trades)    # DataFrame with trade records
 ```
 
-### Resample Options
-
-| Value | Description |
-|-------|-------------|
-| `None` | Only rebalance when position changes |
-| `'D'` | Daily |
-| `'W'` | Weekly (last trading day) |
-| `'W-FRI'` | Weekly on Friday |
-| `'M'` | Monthly (last trading day) |
-| `'Q'` | Quarterly |
-| `'Y'` | Yearly |
 
 ### Parameters
 
@@ -120,10 +110,22 @@ print(report.trades)    # DataFrame with trade records
 | `tax_ratio` | `0.003` | Transaction tax |
 | `stop_loss` | `1.0` | Stop loss threshold (1.0 = disabled) |
 | `take_profit` | `inf` | Take profit threshold |
-| `trail_stop` | `inf` | Trailing stop threshold |
+| `trail_stop` | `inf` | Trailing stop: exit when `maxcr - cr >= trail_stop` |
 | `touched_exit` | `False` | Use OHLC for intraday stop detection |
 
 ---
+
+### Resample Options
+
+| Value | Description |
+|-------|-------------|
+| `None` | Only rebalance when position changes |
+| `'D'` | Daily |
+| `'W'` | Weekly (last trading day) |
+| `'W-FRI'` | Weekly on Friday |
+| `'M'` | Monthly (last trading day) |
+| `'Q'` | Quarterly |
+| `'Y'` | Yearly |
 
 ## Development
 
