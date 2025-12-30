@@ -10,7 +10,7 @@ from typing import TYPE_CHECKING, Union, cast
 import polars as pl
 
 if TYPE_CHECKING:
-    from polars_backtest._polars_ext import DataFrame as ExtDataFrame
+    from polars_backtest.polars_backtest import DataFrame as ExtDataFrame
 
 # Type alias for column specification (str or Expr)
 ColumnSpec = Union[str, pl.Expr]
