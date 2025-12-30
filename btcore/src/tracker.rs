@@ -254,91 +254,86 @@ pub type NoopIndexTracker = NoopTracker<usize, usize, WideTradeRecord>;
 pub type NoopSymbolTracker = NoopTracker<String, i32, TradeRecord>;
 
 // ============================================================================
-// IndexTracker - Wide format (usize keys)
+// Generic TradeTracker Implementation
 // ============================================================================
 
-/// Open position tracking for wide format
+/// Generic open trade info - shared by IndexTracker and SymbolTracker
 #[derive(Debug, Clone)]
-struct IndexOpenTrade {
-    entry_index: usize,
-    entry_sig_index: usize,
+struct OpenTradeInfo<K: Clone, D: Copy> {
+    key: K,
+    entry_date: D,
+    signal_date: D,
     weight: f64,
     entry_price: f64,
 }
 
-/// Trade tracker for wide format - uses usize indices
-pub struct IndexTracker {
-    open_trades: HashMap<usize, IndexOpenTrade>,
-    completed_trades: Vec<WideTradeRecord>,
-}
+/// Trait for building trade records from generic open trade info
+pub trait RecordBuilder: Sized {
+    type Key: Clone + Eq + Hash;
+    type Date: Copy;
 
-impl TradeTracker for IndexTracker {
-    type Key = usize;
-    type Date = usize;
-    type Record = WideTradeRecord;
-
-    fn new() -> Self {
-        Self {
-            open_trades: HashMap::new(),
-            completed_trades: Vec::new(),
-        }
-    }
-
-    fn open_trade(
-        &mut self,
-        key: usize,
-        entry_date: usize,
-        signal_date: usize,
-        entry_price: f64,
+    /// Build a completed trade record
+    fn build_completed(
+        key: Self::Key,
+        entry_date: Self::Date,
+        exit_date: Self::Date,
+        signal_date: Self::Date,
+        exit_sig_date: Option<Self::Date>,
         weight: f64,
-    ) {
-        self.open_trades.insert(
-            key,
-            IndexOpenTrade {
-                entry_index: entry_date,
-                entry_sig_index: signal_date,
-                weight,
-                entry_price,
-            },
-        );
-    }
-
-    fn close_trade(
-        &mut self,
-        key: &usize,
-        exit_date: usize,
-        exit_sig_date: Option<usize>,
+        entry_price: f64,
         exit_price: f64,
         fee_ratio: f64,
         tax_ratio: f64,
-    ) {
-        if let Some(open_trade) = self.open_trades.remove(key) {
-            let trade = WideTradeRecord {
-                stock_id: *key,
-                entry_index: Some(open_trade.entry_index),
-                exit_index: Some(exit_date),
-                entry_sig_index: open_trade.entry_sig_index,
-                exit_sig_index: exit_sig_date,
-                position_weight: open_trade.weight,
-                entry_price: open_trade.entry_price,
-                exit_price: Some(exit_price),
-                trade_return: None,
-            };
-            let trade_return = trade.calculate_return(fee_ratio, tax_ratio);
+    ) -> Self;
 
-            self.completed_trades.push(WideTradeRecord {
-                trade_return,
-                ..trade
-            });
+    /// Build a pending entry record (signal given but not executed)
+    fn build_pending(key: Self::Key, signal_date: Self::Date, weight: f64) -> Self;
+
+    /// Build an open position record (entry executed but not exited)
+    fn build_open(
+        key: Self::Key,
+        entry_date: Self::Date,
+        signal_date: Self::Date,
+        weight: f64,
+        entry_price: f64,
+    ) -> Self;
+}
+
+impl RecordBuilder for WideTradeRecord {
+    type Key = usize;
+    type Date = usize;
+
+    fn build_completed(
+        key: usize,
+        entry_date: usize,
+        exit_date: usize,
+        signal_date: usize,
+        exit_sig_date: Option<usize>,
+        weight: f64,
+        entry_price: f64,
+        exit_price: f64,
+        fee_ratio: f64,
+        tax_ratio: f64,
+    ) -> Self {
+        let trade = Self {
+            stock_id: key,
+            entry_index: Some(entry_date),
+            exit_index: Some(exit_date),
+            entry_sig_index: signal_date,
+            exit_sig_index: exit_sig_date,
+            position_weight: weight,
+            entry_price,
+            exit_price: Some(exit_price),
+            trade_return: None,
+        };
+        Self {
+            trade_return: trade.calculate_return(fee_ratio, tax_ratio),
+            ..trade
         }
     }
 
-    fn has_open_trade(&self, key: &usize) -> bool {
-        self.open_trades.contains_key(key)
-    }
-
-    fn add_pending_entry(&mut self, key: usize, signal_date: usize, weight: f64) {
-        self.completed_trades.push(WideTradeRecord {
+    fn build_pending(key: usize, signal_date: usize, weight: f64) -> Self {
+        Self {
             stock_id: key,
             entry_index: None,
             exit_index: None,
@@ -348,52 +343,108 @@ impl TradeTracker for IndexTracker {
             entry_price: f64::NAN,
             exit_price: None,
             trade_return: None,
-        });
-    }
-
-    fn finalize(mut self, _fee_ratio: f64, _tax_ratio: f64) -> Vec<WideTradeRecord> {
-        // Report open positions as still open (like Finlab: exit_date=NaT)
-        for (stock_id, open_trade) in self.open_trades.drain() {
-            self.completed_trades.push(WideTradeRecord {
-                stock_id,
-                entry_index: Some(open_trade.entry_index),
-                exit_index: None,
-                entry_sig_index: open_trade.entry_sig_index,
-                exit_sig_index: None,
-                position_weight: open_trade.weight,
-                entry_price: open_trade.entry_price,
-                exit_price: None,
-                trade_return: None,
-            });
         }
-        self.completed_trades
+    }
+
+    fn build_open(
+        key: usize,
+        entry_date: usize,
+        signal_date: usize,
+        weight: f64,
+        entry_price: f64,
+    ) -> Self {
+        Self {
+            stock_id: key,
+            entry_index: Some(entry_date),
+            exit_index: None,
+            entry_sig_index: signal_date,
+            exit_sig_index: None,
+            position_weight: weight,
+            entry_price,
+            exit_price: None,
+            trade_return: None,
+        }
     }
 }
 
-// ============================================================================
-// SymbolTracker - Long format (String keys)
-// ============================================================================
-
-/// Open position tracking for long format
-#[derive(Debug, Clone)]
-struct SymbolOpenTrade {
-    symbol: String,
-    entry_date: i32,
-    entry_sig_date: i32,
-    weight: f64,
-    entry_price: f64,
-}
-
-/// Trade tracker for long format - uses String symbols and i32 dates
-pub struct SymbolTracker {
-    open_trades: HashMap<String, SymbolOpenTrade>,
-    completed_trades: Vec<TradeRecord>,
-}
-
-impl TradeTracker for SymbolTracker {
+impl RecordBuilder for TradeRecord {
     type Key = String;
     type Date = i32;
-    type Record = TradeRecord;
+
+    fn build_completed(
+        key: String,
+        entry_date: i32,
+        exit_date: i32,
+        signal_date: i32,
+        exit_sig_date: Option<i32>,
+        weight: f64,
+        entry_price: f64,
+        exit_price: f64,
+        fee_ratio: f64,
+        tax_ratio: f64,
+    ) -> Self {
+        let trade = Self {
+            symbol: key,
+            entry_date: Some(entry_date),
+            exit_date: Some(exit_date),
+            entry_sig_date: signal_date,
+            exit_sig_date,
+            position_weight: weight,
+            entry_price,
+            exit_price: Some(exit_price),
+            trade_return: None,
+        };
+        Self {
+            trade_return: trade.calculate_return(fee_ratio, tax_ratio),
+            ..trade
+        }
+    }
+
+    fn build_pending(key: String, signal_date: i32, weight: f64) -> Self {
+        Self {
+            symbol: key,
+            entry_date: None,
+            exit_date: None,
+            entry_sig_date: signal_date,
+            exit_sig_date: None,
+            position_weight: weight,
+            entry_price: f64::NAN,
+            exit_price: None,
+            trade_return: None,
+        }
+    }
+
+    fn build_open(
+        key: String,
+        entry_date: i32,
+        signal_date: i32,
+        weight: f64,
+        entry_price: f64,
+    ) -> Self {
+        Self {
+            symbol: key,
+            entry_date: Some(entry_date),
+            exit_date: None,
+            entry_sig_date: signal_date,
+            exit_sig_date: None,
+            position_weight: weight,
+            entry_price,
+            exit_price: None,
+            trade_return: None,
+        }
+    }
+}
+
+/// Generic trade tracker - unified implementation for both formats
+pub struct GenericTracker<R: RecordBuilder> {
+    open_trades: HashMap<R::Key, OpenTradeInfo<R::Key, R::Date>>,
+    completed_trades: Vec<R>,
+}
+
+impl<R: RecordBuilder> TradeTracker for GenericTracker<R> {
+    type Key = R::Key;
+    type Date = R::Date;
+    type Record = R;
 
     fn new() -> Self {
         Self {
@@ -404,18 +455,18 @@ impl TradeTracker for SymbolTracker {
 
     fn open_trade(
         &mut self,
-        key: String,
-        entry_date: i32,
-        signal_date: i32,
+        key: Self::Key,
+        entry_date: Self::Date,
+        signal_date: Self::Date,
         entry_price: f64,
         weight: f64,
     ) {
         self.open_trades.insert(
             key.clone(),
-            SymbolOpenTrade {
-                symbol: key,
+            OpenTradeInfo {
+                key,
                 entry_date,
-                entry_sig_date: signal_date,
+                signal_date,
                 weight,
                 entry_price,
             },
@@ -424,70 +475,55 @@ impl TradeTracker for SymbolTracker {
 
     fn close_trade(
         &mut self,
-        key: &String,
-        exit_date: i32,
-        exit_sig_date: Option<i32>,
+        key: &Self::Key,
+        exit_date: Self::Date,
+        exit_sig_date: Option<Self::Date>,
         exit_price: f64,
         fee_ratio: f64,
         tax_ratio: f64,
     ) {
         if let Some(open_trade) = self.open_trades.remove(key) {
-            let trade = TradeRecord {
-                symbol: open_trade.symbol,
-                entry_date: Some(open_trade.entry_date),
-                exit_date: Some(exit_date),
-                entry_sig_date: open_trade.entry_sig_date,
+            self.completed_trades.push(R::build_completed(
+                open_trade.key,
+                open_trade.entry_date,
+                exit_date,
+                open_trade.signal_date,
                 exit_sig_date,
-                position_weight: open_trade.weight,
-                entry_price: open_trade.entry_price,
-                exit_price: Some(exit_price),
-                trade_return: None,
-            };
-            let trade_return = trade.calculate_return(fee_ratio, tax_ratio);
-
-            self.completed_trades.push(TradeRecord {
-                trade_return,
-                ..trade
-            });
+                open_trade.weight,
+                open_trade.entry_price,
+                exit_price,
+                fee_ratio,
+                tax_ratio,
+            ));
         }
     }
 
-    fn has_open_trade(&self, key: &String) -> bool {
+    fn has_open_trade(&self, key: &Self::Key) -> bool {
         self.open_trades.contains_key(key)
     }
 
-    fn add_pending_entry(&mut self, key: String, signal_date: i32, weight: f64) {
-        self.completed_trades.push(TradeRecord {
-            symbol: key,
-            entry_date: None,
-            exit_date: None,
-            entry_sig_date: signal_date,
-            exit_sig_date: None,
-            position_weight: weight,
-            entry_price: f64::NAN,
-            exit_price: None,
-            trade_return: None,
-        });
+    fn add_pending_entry(&mut self, key: Self::Key, signal_date: Self::Date, weight: f64) {
+        self.completed_trades
+            .push(R::build_pending(key, signal_date, weight));
     }
 
-    fn finalize(mut self, _fee_ratio: f64, _tax_ratio: f64) -> Vec<TradeRecord> {
-        // Report open positions as still open
-        for (_symbol, open_trade) in self.open_trades.drain() {
-            self.completed_trades.push(TradeRecord {
-                symbol: open_trade.symbol,
-                entry_date: Some(open_trade.entry_date),
-                exit_date: None,
-                entry_sig_date: open_trade.entry_sig_date,
-                exit_sig_date: None,
-                position_weight: open_trade.weight,
-                entry_price: open_trade.entry_price,
-                exit_price: None,
-                trade_return: None,
-            });
+    fn finalize(mut self, _fee_ratio: f64, _tax_ratio: f64) -> Vec<R> {
+        for (_, open_trade) in self.open_trades.drain() {
+            self.completed_trades.push(R::build_open(
+                open_trade.key,
+                open_trade.entry_date,
+                open_trade.signal_date,
+                open_trade.weight,
+                open_trade.entry_price,
+            ));
         }
         self.completed_trades
     }
 }
+
+// Type aliases for backward compatibility
+pub type IndexTracker = GenericTracker<WideTradeRecord>;
+pub type SymbolTracker = GenericTracker<TradeRecord>;
 
 // ============================================================================
 #[cfg(test)]
