@@ -7,9 +7,9 @@ User API (Long Format)
     ↓
 pl_bt.backtest() / df.bt.backtest()
     ↓
-Rust (partition_by, zero-copy)
+polars-arrow → arrow-rs (FFI, zero-copy)
     ↓
-btcore (pure Rust, no polars dependency)
+btcore::backtest_long_arrow (pure Rust)
 ```
 
 ## API
