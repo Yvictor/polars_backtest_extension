@@ -37,53 +37,6 @@ report = df.bt.backtest_with_report(trade_at_price="close", position="weight")
 
 ---
 
-## Completed Stages
-
-### Stage 1-3: Long Format API ✓
-- `df.bt` namespace
-- Long → Wide conversion in Python
-- Validated against Finlab
-
-### Stage 4: Native Long Format in Rust ✓
-- `partition_by` instead of pivot (1.5x faster)
-- Zero-copy with `cont_slice()`
-- All tests pass (81 fast + 86 slow)
-
-**Performance (real data ~10M rows):**
-| Method | Time |
-|--------|------|
-| Wide format | ~0.77s |
-| Long format (partition_by) | ~1.75s |
-
----
-
-## Remaining Work
-
-### Stage 5: Unify TradeTracker
-
-**Status**: 5.1 Complete, 5.2 Pending
-
-**5.1 ✓**: Unified `TradeTracker` trait with associated types
-```rust
-pub trait TradeTracker {
-    type Key: Clone + Eq + Hash;
-    type Date: Copy;
-    type Record;
-    // ...
-}
-```
-
-**5.2**: Eliminate duplicate code in `long.rs` (~400 lines)
-- [ ] Unify `execute_rebalance` / `execute_rebalance_with_tracker`
-- [ ] Unify `execute_pending_stops` / `execute_pending_stops_with_tracker`
-- [ ] Create `simulate_backtest_long<T: TradeTracker>` generic function
-
-### Known Issue: test_trades_match
-- Wide: 6430 trades vs Long: 5729 trades (10.9% diff)
-- Investigate after Stage 5.2
-
----
-
 ## Test Structure
 
 ```
