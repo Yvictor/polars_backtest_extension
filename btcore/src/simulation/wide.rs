@@ -16,6 +16,7 @@ use crate::position::Position;
 use crate::stops::{detect_stops, detect_stops_finlab, detect_touched_exit};
 use crate::tracker::{WideBacktestResult, NoopIndexTracker, IndexTracker, TradeTracker};
 use crate::weights::{normalize_weights_finlab, IntoWeights};
+use crate::FLOAT_EPSILON;
 
 // ============================================================================
 // Unified Simulation Engine
@@ -171,7 +172,7 @@ fn simulate_backtest<T: TradeTracker<Key = usize, Date = usize>>(
                         .iter()
                         .filter(|&&stock_id| {
                             if let Some(ref weights) = pending_weights {
-                                let has_nonzero_weight = stock_id < weights.len() && weights[stock_id].abs() > 1e-10;
+                                let has_nonzero_weight = stock_id < weights.len() && weights[stock_id].abs() > FLOAT_EPSILON;
                                 if config.stop_trading_next_period {
                                     true // Always process exit when stop_trading_next_period is true
                                 } else {
@@ -433,7 +434,7 @@ fn simulate_backtest<T: TradeTracker<Key = usize, Date = usize>>(
         let signal_index = pending_signal_index.unwrap_or(n_times.saturating_sub(1));
         for (stock_id, &weight) in weights.iter().enumerate() {
             // Only add pending entries for new positions (not already held)
-            if weight > 1e-10 && !portfolio.positions.contains_key(&stock_id) {
+            if weight > FLOAT_EPSILON && !portfolio.positions.contains_key(&stock_id) {
                 tracker.add_pending_entry(stock_id, signal_index, weight);
             }
         }
@@ -694,9 +695,9 @@ fn execute_finlab_rebalance(
         // The position value is set, and balance uses the value directly when price is NaN.
         if !price_valid {
             // If target is 0 and we have an old position, sell it using last market value
-            if target_weight.abs() < 1e-10 {
+            if target_weight.abs() < FLOAT_EPSILON {
                 if let Some(&market_value) = old_market_values.get(&stock_id) {
-                    if market_value.abs() > 1e-10 {
+                    if market_value.abs() > FLOAT_EPSILON {
                         let sell_fee = market_value.abs() * (config.fee_ratio + config.tax_ratio);
                         cash += market_value - sell_fee;
                     }
@@ -708,7 +709,7 @@ fn execute_finlab_rebalance(
             // Fees are calculated based on monetary amount difference, not price
             // - entry_price = 0 signals NaN entry, balance_finlab will use last_market_value
             // - When price becomes valid, update_entry_prices_after_nan will set entry_price
-            if target_value.abs() > 1e-10 {
+            if target_value.abs() > FLOAT_EPSILON {
                 // Same fee logic as valid price case
                 let amount = target_value - current_value;
                 let is_buy = amount > 0.0;
@@ -748,9 +749,9 @@ fn execute_finlab_rebalance(
         // Calculate trade amount (difference method)
         let amount = target_value - current_value;
 
-        if target_value.abs() < 1e-10 {
+        if target_value.abs() < FLOAT_EPSILON {
             // Exit position completely
-            if current_value.abs() > 1e-10 {
+            if current_value.abs() > FLOAT_EPSILON {
                 // Sell all: cash gets net of exit fee
                 let sell_fee = current_value.abs() * (config.fee_ratio + config.tax_ratio);
                 cash += current_value - sell_fee;
@@ -779,13 +780,13 @@ fn execute_finlab_rebalance(
             new_position_value = current_value - sell_amount;
         }
 
-        if new_position_value.abs() > 1e-10 {
+        if new_position_value.abs() > FLOAT_EPSILON {
             // Determine stop_entry_price, cr, maxcr based on retain_cost_when_rebalance
             // Finlab logic (lines 468-478 of restored_backtest_core.pyx):
             // - retain_cost=False: cr.fill(1); maxcr.fill(1); for ALL stocks
             // - retain_cost=True: only reset for NEW positions or DIRECTION CHANGE
             let old_value = old_positions.get(&stock_id).copied().unwrap_or(0.0);
-            let is_continuing = old_value.abs() > 1e-10 && old_value * target_weight > 0.0;
+            let is_continuing = old_value.abs() > FLOAT_EPSILON && old_value * target_weight > 0.0;
 
             let (stop_entry, max_price_val, cr_val, maxcr_val, prev_price) =
                 if config.retain_cost_when_rebalance && is_continuing {
@@ -820,7 +821,7 @@ fn execute_finlab_rebalance(
     // Step 5: Handle old positions that are OUTSIDE target_weights array
     // (positions within target_weights range are already handled in step 4)
     for (&stock_id, &old_value) in old_positions.iter() {
-        if stock_id >= target_weights.len() && old_value.abs() > 1e-10 {
+        if stock_id >= target_weights.len() && old_value.abs() > FLOAT_EPSILON {
             // This position is outside target_weights and should be sold
             let sell_fee = old_value.abs() * (config.fee_ratio + config.tax_ratio);
             cash += old_value - sell_fee;
@@ -933,13 +934,13 @@ fn rebalance_to_target_weights(
         if diff < 0.0 {
             let sell_amount = -diff;
             if let Some(pos) = portfolio.positions.get_mut(&stock_id) {
-                if pos.value >= sell_amount - 1e-10 {
+                if pos.value >= sell_amount - FLOAT_EPSILON {
                     let sell_value = sell_amount * (1.0 - config.fee_ratio - config.tax_ratio);
                     pos.value -= sell_amount;
                     portfolio.cash += sell_value;
 
                     // Remove position if value is near zero
-                    if pos.value < 1e-10 {
+                    if pos.value < FLOAT_EPSILON {
                         portfolio.positions.remove(&stock_id);
                     }
                 }
@@ -968,7 +969,7 @@ fn rebalance_to_target_weights(
         let target_position = target_allocation * (1.0 - config.fee_ratio);
         let diff = target_position - current_value;
 
-        if diff > 1e-10 {
+        if diff > FLOAT_EPSILON {
             // Finlab-style fee calculation:
             // - Spend `amount` from cash
             // - Position value = amount * (1 - fee_ratio)
@@ -976,7 +977,7 @@ fn rebalance_to_target_weights(
             let spend_needed = diff / (1.0 - config.fee_ratio);
             let actual_spend = spend_needed.min(portfolio.cash);
 
-            if actual_spend > 1e-10 {
+            if actual_spend > FLOAT_EPSILON {
                 // Position value after fee deduction (Finlab style)
                 let position_value = actual_spend * (1.0 - config.fee_ratio);
                 portfolio.cash -= actual_spend;
@@ -992,7 +993,7 @@ fn rebalance_to_target_weights(
                     previous_price: prices[stock_id],
                 });
                 // Update entry price only for new positions
-                if entry.value < 1e-10 {
+                if entry.value < FLOAT_EPSILON {
                     entry.entry_price = prices[stock_id];
                     entry.stop_entry_price = prices[stock_id];
                     entry.max_price = prices[stock_id];
@@ -1144,7 +1145,7 @@ mod tests {
 
         assert_eq!(creturn.len(), 3);
         // T+1 mode: Day 0 signal not yet executed = 1.0
-        assert!((creturn[0] - 1.0).abs() < 1e-10, "Day 0 should be 1.0, got {}", creturn[0]);
+        assert!((creturn[0] - 1.0).abs() < FLOAT_EPSILON, "Day 0 should be 1.0, got {}", creturn[0]);
         // Day 1: Executed with entry fee, price movement (+2% - 1%) / 2 = +0.5%, minus fees
         // Result could be above or below 1.0 depending on fee impact
         assert!(creturn[1] > 0.9 && creturn[1] < 1.1, "Day 1 should be reasonable, got {}", creturn[1]);
@@ -1173,8 +1174,8 @@ mod tests {
 
         // Should stay at 1.0 with no positions
         assert_eq!(creturn.len(), 2);
-        assert!((creturn[0] - 1.0).abs() < 1e-10);
-        assert!((creturn[1] - 1.0).abs() < 1e-10);
+        assert!((creturn[0] - 1.0).abs() < FLOAT_EPSILON);
+        assert!((creturn[1] - 1.0).abs() < FLOAT_EPSILON);
     }
 
     #[test]
@@ -1263,7 +1264,7 @@ mod tests {
 
         // After exit, portfolio should be flat
         assert!(
-            (creturn[4] - creturn[3]).abs() < 1e-10,
+            (creturn[4] - creturn[3]).abs() < FLOAT_EPSILON,
             "Portfolio should be flat after stop exit"
         );
 
@@ -1301,7 +1302,7 @@ mod tests {
 
         assert_eq!(creturn.len(), 3);
         // T+1 mode: Day 0 signal not yet executed = 1.0
-        assert!((creturn[0] - 1.0).abs() < 1e-10, "Day 0 should be 1.0, got {}", creturn[0]);
+        assert!((creturn[0] - 1.0).abs() < FLOAT_EPSILON, "Day 0 should be 1.0, got {}", creturn[0]);
         // Day 1: Executed with entry fee, price change could offset
         assert!(creturn[1] > 0.9 && creturn[1] < 1.1, "Day 1 should be reasonable, got {}", creturn[1]);
         assert!(creturn[2] > 0.0);
@@ -1330,9 +1331,9 @@ mod tests {
 
         assert_eq!(creturn.len(), 3);
         // Day 0: Signal not yet executed = 1.0
-        assert!((creturn[0] - 1.0).abs() < 1e-10, "Day 0 should be 1.0, got {}", creturn[0]);
+        assert!((creturn[0] - 1.0).abs() < FLOAT_EPSILON, "Day 0 should be 1.0, got {}", creturn[0]);
         // Day 1: Entry at Day 1's close, no return (same prices) = 1.0
-        assert!((creturn[1] - 1.0).abs() < 1e-10, "Day 1 should be 1.0, got {}", creturn[1]);
+        assert!((creturn[1] - 1.0).abs() < FLOAT_EPSILON, "Day 1 should be 1.0, got {}", creturn[1]);
         // Day 2: Return = 0.7 * 10% + 0.3 * 0% = 7%
         let expected_day2 = 1.0 + 0.07;
         assert!((creturn[2] - expected_day2).abs() < 0.001,
@@ -1362,8 +1363,8 @@ mod tests {
 
         assert_eq!(creturn.len(), 3);
         // Day 0 and Day 1: No return yet
-        assert!((creturn[0] - 1.0).abs() < 1e-10);
-        assert!((creturn[1] - 1.0).abs() < 1e-10);
+        assert!((creturn[0] - 1.0).abs() < FLOAT_EPSILON);
+        assert!((creturn[1] - 1.0).abs() < FLOAT_EPSILON);
         // Day 2: Normalized: 1.0/1.5 = 0.667, 0.5/1.5 = 0.333
         // Return: 0.667 * 10% + 0.333 * 0% = 6.67%
         let expected_day2 = 1.0 + (1.0 / 1.5) * 0.10;
@@ -1394,8 +1395,8 @@ mod tests {
 
         assert_eq!(creturn.len(), 3);
         // Day 0 and Day 1: No return yet
-        assert!((creturn[0] - 1.0).abs() < 1e-10);
-        assert!((creturn[1] - 1.0).abs() < 1e-10);
+        assert!((creturn[0] - 1.0).abs() < FLOAT_EPSILON);
+        assert!((creturn[1] - 1.0).abs() < FLOAT_EPSILON);
         // Day 2: Only 50% invested, so return is 0.5 * 10% = 5%
         let expected_day2 = 1.0 + 0.50 * 0.10;
         assert!((creturn[2] - expected_day2).abs() < 0.001,
@@ -1426,8 +1427,8 @@ mod tests {
 
         assert_eq!(creturn.len(), 3);
         // Day 0 and Day 1: No return yet
-        assert!((creturn[0] - 1.0).abs() < 1e-10);
-        assert!((creturn[1] - 1.0).abs() < 1e-10);
+        assert!((creturn[0] - 1.0).abs() < FLOAT_EPSILON);
+        assert!((creturn[1] - 1.0).abs() < FLOAT_EPSILON);
         // Day 2: Normalized: 0.8 / 1.0 = 0.8, clipped to 0.4
         //                   0.2 / 1.0 = 0.2, stays
         // Return: 0.4 * 10% + 0.2 * 0% = 4%
@@ -1460,7 +1461,7 @@ mod tests {
 
         assert_eq!(creturn_signals.len(), creturn_weights.len());
         for (cs, cw) in creturn_signals.iter().zip(creturn_weights.iter()) {
-            assert!((cs - cw).abs() < 1e-10,
+            assert!((cs - cw).abs() < FLOAT_EPSILON,
                 "Signal result {} != Weight result {}", cs, cw);
         }
     }
@@ -1496,8 +1497,8 @@ mod tests {
         let creturn = run_backtest(&prices, &weights, &rebalance_indices, &config);
 
         // With zero weights, should stay at 1.0
-        assert!((creturn[0] - 1.0).abs() < 1e-10);
-        assert!((creturn[1] - 1.0).abs() < 1e-10);
+        assert!((creturn[0] - 1.0).abs() < FLOAT_EPSILON);
+        assert!((creturn[1] - 1.0).abs() < FLOAT_EPSILON);
     }
 
     // T+1 Execution Mode Tests (default and only mode)
@@ -1531,12 +1532,12 @@ mod tests {
 
         assert_eq!(creturn.len(), 4);
         // Day 0: Signal given but not yet executed = 1.0
-        assert!((creturn[0] - 1.0).abs() < 1e-10, "Day 0 should be 1.0, got {}", creturn[0]);
+        assert!((creturn[0] - 1.0).abs() < FLOAT_EPSILON, "Day 0 should be 1.0, got {}", creturn[0]);
         // Day 1: Entry at Day 1's close = 1.0 (no return yet)
-        assert!((creturn[1] - 1.0).abs() < 1e-10, "Day 1 should be 1.0, got {}", creturn[1]);
+        assert!((creturn[1] - 1.0).abs() < FLOAT_EPSILON, "Day 1 should be 1.0, got {}", creturn[1]);
         // Day 2: First return from 100 to 105 = +5%
         let expected_day2 = 1.0 * (105.0 / 100.0);
-        assert!((creturn[2] - expected_day2).abs() < 1e-10,
+        assert!((creturn[2] - expected_day2).abs() < FLOAT_EPSILON,
             "Day 2: Expected {}, got {}", expected_day2, creturn[2]);
         // Day 3: From 105 to 110 = +4.76% additional
         let expected_day3 = expected_day2 * (110.0 / 105.0);
@@ -1567,7 +1568,7 @@ mod tests {
         let creturn = run_backtest(&prices, &signals, &rebalance_indices, &config);
 
         // Day 0: No trade yet = 1.0
-        assert!((creturn[0] - 1.0).abs() < 1e-10, "Day 0 should be 1.0, got {}", creturn[0]);
+        assert!((creturn[0] - 1.0).abs() < FLOAT_EPSILON, "Day 0 should be 1.0, got {}", creturn[0]);
 
         // Day 1: Entry fee applied. Finlab-style: value = 1 * (1 - fee_ratio)
         let expected_day1 = 1.0 * (1.0 - fee_ratio);
@@ -1599,8 +1600,8 @@ mod tests {
 
         assert_eq!(creturn.len(), 4);
         // Day 0 and Day 1: Signal and entry, no return yet = 1.0
-        assert!((creturn[0] - 1.0).abs() < 1e-10);
-        assert!((creturn[1] - 1.0).abs() < 1e-10);
+        assert!((creturn[0] - 1.0).abs() < FLOAT_EPSILON);
+        assert!((creturn[1] - 1.0).abs() < FLOAT_EPSILON);
         // Day 2: stock 0 rose 10%, 50% weight = +5%
         let expected_day2 = 1.0 + 0.5 * 0.10;
         assert!((creturn[2] - expected_day2).abs() < 0.001,
@@ -1638,9 +1639,9 @@ mod tests {
 
         assert_eq!(creturn.len(), 5);
         // Day 0: Signal, not executed = 1.0
-        assert!((creturn[0] - 1.0).abs() < 1e-10, "Day 0 should be 1.0, got {}", creturn[0]);
+        assert!((creturn[0] - 1.0).abs() < FLOAT_EPSILON, "Day 0 should be 1.0, got {}", creturn[0]);
         // Day 1: Entry at Day 1's close, no return yet = 1.0
-        assert!((creturn[1] - 1.0).abs() < 1e-10, "Day 1 should be 1.0, got {}", creturn[1]);
+        assert!((creturn[1] - 1.0).abs() < FLOAT_EPSILON, "Day 1 should be 1.0, got {}", creturn[1]);
         // Day 2: stock 0 +10%, then switch signal executes at Day 2's close
         assert!((creturn[2] - 1.10).abs() < 0.001, "Day 2: Expected 1.10, got {}", creturn[2]);
         // Day 3: Stock 0 sold at Day 2's close (1.10), stock 1 bought at Day 3's close

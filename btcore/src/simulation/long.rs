@@ -18,6 +18,7 @@ use arrow::array::{Float64Array, Int32Array, StringViewArray};
 use crate::config::BacktestConfig;
 use crate::position::Position;
 use crate::tracker::{BacktestResult, TradeRecord, NoopSymbolTracker, SymbolTracker, TradeTracker};
+use crate::FLOAT_EPSILON;
 
 /// Portfolio with string symbol keys (for zero-copy backtest)
 pub struct Portfolio {
@@ -563,7 +564,7 @@ where
         if price > 0.0 && !price.is_nan() {
             today_prices.insert(symbol, price);
         }
-        if !weight.is_nan() && weight.abs() > 1e-10 {
+        if !weight.is_nan() && weight.abs() > FLOAT_EPSILON {
             today_weights.insert(symbol, weight);
         }
         // Collect OHLC data AFTER date_changed processing (for correct date)
@@ -1483,9 +1484,9 @@ where
         if !price_valid {
             // If target is 0 and we have an old position, sell it using old market value
             // Note: close_trade was already called at the start for ALL positions
-            if target_weight.abs() < 1e-10 {
+            if target_weight.abs() < FLOAT_EPSILON {
                 if let Some(&old_mv) = old_market_values.get(sym) {
-                    if old_mv.abs() > 1e-10 {
+                    if old_mv.abs() > FLOAT_EPSILON {
                         let sell_fee = old_mv.abs() * (config.fee_ratio + config.tax_ratio);
                         cash += old_mv - sell_fee;
                     }
@@ -1494,7 +1495,7 @@ where
             }
 
             // Finlab behavior: Enter/modify position even with NaN price
-            if target_value.abs() > 1e-10 {
+            if target_value.abs() > FLOAT_EPSILON {
                 let amount = target_value - current_value;
                 let is_buy = amount > 0.0;
                 let is_entry =
@@ -1514,7 +1515,7 @@ where
                     current_value - sell_amount
                 };
 
-                if new_value.abs() > 1e-10 {
+                if new_value.abs() > FLOAT_EPSILON {
                     // Finlab behavior: Open trade for ALL positions after rebalance
                     tracker.open_trade(sym.clone(), current_date, signal_date, f64::NAN, target_weight);
                     portfolio.positions.insert(
@@ -1530,8 +1531,8 @@ where
 
         // Valid price case: exit position if target is 0
         // Note: close_trade was already called at the start for ALL positions
-        if target_weight.abs() < 1e-10 {
-            if current_value.abs() > 1e-10 {
+        if target_weight.abs() < FLOAT_EPSILON {
+            if current_value.abs() > FLOAT_EPSILON {
                 let sell_fee = current_value.abs() * (config.fee_ratio + config.tax_ratio);
                 cash += current_value - sell_fee;
             }
@@ -1557,14 +1558,14 @@ where
             current_value - sell_amount
         };
 
-        if new_position_value.abs() > 1e-10 {
+        if new_position_value.abs() > FLOAT_EPSILON {
             // Finlab behavior: Open trade for ALL positions after rebalance
             // (All trades were closed at the start of rebalance)
             tracker.open_trade(sym.clone(), current_date, signal_date, price, target_weight);
 
             // Determine if this is a continuing same-direction position
             let old_value = old_positions.get(sym).copied().unwrap_or(0.0);
-            let is_continuing = old_value.abs() > 1e-10 && old_value * target_weight > 0.0;
+            let is_continuing = old_value.abs() > FLOAT_EPSILON && old_value * target_weight > 0.0;
 
             let new_pos = if config.retain_cost_when_rebalance && is_continuing {
                 // Preserve stop tracking for continuing same-direction positions
@@ -1585,7 +1586,7 @@ where
     // Handle positions outside effective_weights (sell them)
     // Note: close_trade was already called at the start for ALL positions
     for (sym, &old_value) in old_positions.iter() {
-        if !effective_weights.contains_key(sym) && old_value.abs() > 1e-10 {
+        if !effective_weights.contains_key(sym) && old_value.abs() > FLOAT_EPSILON {
             let sell_fee = old_value.abs() * (config.fee_ratio + config.tax_ratio);
             cash += old_value - sell_fee;
         }
@@ -1598,7 +1599,7 @@ where
 ///
 /// Two weight maps differ if:
 /// 1. They have different keys (symbols)
-/// 2. Any corresponding weights differ by more than 1e-10
+/// 2. Any corresponding weights differ by more than FLOAT_EPSILON
 fn weights_differ(a: &HashMap<String, f64>, b: &HashMap<String, f64>) -> bool {
     // Different number of symbols
     if a.len() != b.len() {
@@ -1609,7 +1610,7 @@ fn weights_differ(a: &HashMap<String, f64>, b: &HashMap<String, f64>) -> bool {
     for (sym, &weight_a) in a.iter() {
         match b.get(sym) {
             Some(&weight_b) => {
-                if (weight_a - weight_b).abs() > 1e-10 {
+                if (weight_a - weight_b).abs() > FLOAT_EPSILON {
                     return true;
                 }
             }
@@ -1634,7 +1635,7 @@ fn normalize_weights(
             // stopped_stocks.get() takes &Q where String: Borrow<Q>
             // String: Borrow<str>, so we need to pass &str
             let is_stopped = stopped_stocks.get::<str>(*sym).copied().unwrap_or(false);
-            w.abs() > 1e-10 && !is_stopped
+            w.abs() > FLOAT_EPSILON && !is_stopped
         })
         .map(|(&sym, &w)| (sym, w))
         .collect();
@@ -1752,10 +1753,10 @@ mod tests {
         let result = backtest_long_arrow(&input, ResampleFreq::Daily, None, &config);
 
         assert_eq!(result.creturn.len(), 4);
-        assert!((result.creturn[0] - 1.0).abs() < 1e-10, "Day 0: {}", result.creturn[0]);
-        assert!((result.creturn[1] - 1.0).abs() < 1e-10, "Day 1: {}", result.creturn[1]);
-        assert!((result.creturn[2] - 1.1).abs() < 1e-10, "Day 2: {}", result.creturn[2]);
-        assert!((result.creturn[3] - 1.21).abs() < 1e-10, "Day 3: {}", result.creturn[3]);
+        assert!((result.creturn[0] - 1.0).abs() < FLOAT_EPSILON, "Day 0: {}", result.creturn[0]);
+        assert!((result.creturn[1] - 1.0).abs() < FLOAT_EPSILON, "Day 1: {}", result.creturn[1]);
+        assert!((result.creturn[2] - 1.1).abs() < FLOAT_EPSILON, "Day 2: {}", result.creturn[2]);
+        assert!((result.creturn[3] - 1.21).abs() < FLOAT_EPSILON, "Day 3: {}", result.creturn[3]);
     }
 
     #[test]
@@ -1780,10 +1781,10 @@ mod tests {
         let result = backtest_long_arrow(&input, ResampleFreq::Daily, None, &config);
 
         assert_eq!(result.creturn.len(), 3);
-        assert!((result.creturn[0] - 1.0).abs() < 1e-10);
-        assert!((result.creturn[1] - 1.0).abs() < 1e-10);
+        assert!((result.creturn[0] - 1.0).abs() < FLOAT_EPSILON);
+        assert!((result.creturn[1] - 1.0).abs() < FLOAT_EPSILON);
         // Day 2: 0.5 * 1.1 + 0.5 * 0.9 = 1.0
-        assert!((result.creturn[2] - 1.0).abs() < 1e-10);
+        assert!((result.creturn[2] - 1.0).abs() < FLOAT_EPSILON);
     }
 
     #[test]
@@ -1840,9 +1841,9 @@ mod tests {
         // creturn[1] = Feb 1 (entry day) = 1.0
         // creturn[2] = Feb 2 (+10%) = 1.1
         assert_eq!(result.creturn.len(), 3, "Expected 3 days from signal day onward");
-        assert!((result.creturn[0] - 1.0).abs() < 1e-10, "Jan 31 (signal): {}", result.creturn[0]);
-        assert!((result.creturn[1] - 1.0).abs() < 1e-10, "Feb 1 (entry): {}", result.creturn[1]);
-        assert!((result.creturn[2] - 1.1).abs() < 1e-10, "Feb 2 (+10%): {}", result.creturn[2]);
+        assert!((result.creturn[0] - 1.0).abs() < FLOAT_EPSILON, "Jan 31 (signal): {}", result.creturn[0]);
+        assert!((result.creturn[1] - 1.0).abs() < FLOAT_EPSILON, "Feb 1 (entry): {}", result.creturn[1]);
+        assert!((result.creturn[2] - 1.1).abs() < FLOAT_EPSILON, "Feb 2 (+10%): {}", result.creturn[2]);
     }
 
     #[test]
@@ -1866,6 +1867,6 @@ mod tests {
         let result = backtest_long_slice(&dates, &symbols, &prices, &weights, None, None, None, ResampleFreq::Daily, None, &config);
 
         assert_eq!(result.creturn.len(), 3);
-        assert!((result.creturn[2] - 1.1).abs() < 1e-10);
+        assert!((result.creturn[2] - 1.1).abs() < FLOAT_EPSILON);
     }
 }

@@ -16,6 +16,14 @@
 //! - Position limit per stock
 //! - Comprehensive statistics calculation
 
+/// Threshold for floating-point comparisons.
+///
+/// Used throughout the codebase for:
+/// - Checking if values are effectively zero
+/// - Comparing floating-point numbers for equality
+/// - Finlab compatibility (matches their precision handling)
+pub const FLOAT_EPSILON: f64 = 1e-10;
+
 pub mod config;
 pub mod portfolio;
 pub mod position;

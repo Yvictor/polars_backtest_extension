@@ -3,6 +3,8 @@
 //! This module provides the `IntoWeights` trait for converting signals to target weights,
 //! along with weight normalization functions that match Finlab's behavior.
 
+use crate::FLOAT_EPSILON;
+
 /// Trait for converting signals to target weights
 ///
 /// This trait allows `run_backtest` to accept both boolean signals and float weights.
@@ -77,13 +79,13 @@ pub fn normalize_weights_finlab(
         .sum();
 
     // If all remaining stocks are stopped, return zeros
-    if remaining_abs_weight < 1e-10 {
+    if remaining_abs_weight < FLOAT_EPSILON {
         return vec![0.0; weights.len()];
     }
 
     // Calculate scale factor: maintain original investment level
     // Scale up remaining weights to compensate for stopped stocks
-    let scale_factor = if original_abs_weight > 1e-10 {
+    let scale_factor = if original_abs_weight > FLOAT_EPSILON {
         original_abs_weight / remaining_abs_weight
     } else {
         1.0
