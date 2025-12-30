@@ -10,6 +10,19 @@ use crate::is_valid_price;
 /// - Value calculation (standard and Finlab mode)
 /// - Stop loss / take profit / trailing stop detection
 /// - Cumulative return tracking (cr/maxcr for Finlab mode)
+///
+/// # Update Order (Critical for Finlab compatibility)
+///
+/// The following sequence must be followed each day to match Finlab's behavior:
+/// 1. `r = close / previous_price`
+/// 2. `cr *= r`
+/// 3. `last_market_value *= r`
+/// 4. `maxcr = max(maxcr, cr)`
+/// 5. `max_price = max(max_price, close)`
+/// 6. `previous_price = close` (only after stop detection!)
+///
+/// Use [`update_with_return()`](Position::update_with_return) for steps 1-5,
+/// then [`update_previous_price()`](Position::update_previous_price) for step 6.
 #[derive(Debug, Clone)]
 pub struct Position {
     /// Current value of the position (as fraction of portfolio)
@@ -121,18 +134,18 @@ impl Position {
         self.previous_price = price;
     }
 
-    /// Create a new position preserving stop tracking from old position
+    /// Create a new position preserving stop tracking from snapshot
     /// Used when retain_cost_when_rebalance=True and continuing same direction
-    pub fn new_with_preserved_tracking(new_value: f64, current_price: f64, old_pos: &Position) -> Self {
+    pub fn new_from_snapshot(new_value: f64, current_price: f64, snapshot: &PositionSnapshot) -> Self {
         Self {
             value: new_value,
-            entry_price: current_price,  // Entry price uses current price
-            stop_entry_price: old_pos.stop_entry_price,  // Preserve stop tracking
-            max_price: old_pos.max_price,
+            entry_price: current_price,
+            stop_entry_price: snapshot.stop_entry_price,
+            max_price: snapshot.max_price,
             last_market_value: new_value,
-            cr: old_pos.cr,
-            maxcr: old_pos.maxcr,
-            previous_price: old_pos.previous_price,
+            cr: snapshot.cr,
+            maxcr: snapshot.maxcr,
+            previous_price: snapshot.previous_price,
         }
     }
 }
@@ -148,6 +161,35 @@ impl Default for Position {
             cr: 1.0,
             maxcr: 1.0,
             previous_price: 0.0,
+        }
+    }
+}
+
+/// Snapshot of position state for rebalancing calculations
+///
+/// Used to capture position state before clearing portfolio,
+/// avoiding 7 separate HashMap iterations.
+#[derive(Debug, Clone, Copy)]
+pub struct PositionSnapshot {
+    pub cost_basis: f64,
+    pub market_value: f64,
+    pub stop_entry_price: f64,
+    pub max_price: f64,
+    pub cr: f64,
+    pub maxcr: f64,
+    pub previous_price: f64,
+}
+
+impl From<&Position> for PositionSnapshot {
+    fn from(pos: &Position) -> Self {
+        Self {
+            cost_basis: pos.value,
+            market_value: pos.last_market_value,
+            stop_entry_price: pos.stop_entry_price,
+            max_price: pos.max_price,
+            cr: pos.cr,
+            maxcr: pos.maxcr,
+            previous_price: pos.previous_price,
         }
     }
 }

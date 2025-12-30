@@ -16,7 +16,7 @@ use std::collections::{HashMap, VecDeque};
 use arrow::array::{Float64Array, Int32Array, StringViewArray};
 
 use crate::config::BacktestConfig;
-use crate::position::Position;
+use crate::position::{Position, PositionSnapshot};
 use crate::tracker::{BacktestResult, TradeRecord, NoopSymbolTracker, SymbolTracker, TradeTracker};
 use crate::{is_valid_price, FLOAT_EPSILON};
 
@@ -1116,19 +1116,9 @@ fn last_day_of_year_i32(days: i32) -> i32 {
 fn update_positions(portfolio: &mut Portfolio, prices: &HashMap<&str, f64>) {
     for (sym, pos) in portfolio.positions.iter_mut() {
         if let Some(&curr_price) = prices.get(sym.as_str()) {
-            if is_valid_price(curr_price) {
-                if pos.previous_price > 0.0 {
-                    let r = curr_price / pos.previous_price;
-                    pos.cr *= r;
-                    pos.last_market_value *= r;
-                }
-                if curr_price > pos.max_price {
-                    pos.max_price = curr_price;
-                }
-                pos.maxcr = pos.maxcr.max(pos.cr);
-                // NOTE: previous_price is NOT updated here.
-                // Call update_previous_prices after detect_touched_exit.
-            }
+            pos.update_with_return(curr_price);
+            // NOTE: previous_price is NOT updated here.
+            // Call update_previous_prices after detect_touched_exit.
         }
     }
 }
@@ -1446,22 +1436,11 @@ where
 
     let ratio = balance / total_target_weight.max(1.0);
 
-    // Store old positions (cost basis, market value, and full Position for retain_cost)
-    let old_positions: HashMap<String, f64> = portfolio
+    // Store old positions as snapshots (single iteration instead of 3)
+    let old_snapshots: HashMap<String, PositionSnapshot> = portfolio
         .positions
         .iter()
-        .map(|(k, v)| (k.clone(), v.value))
-        .collect();
-    let old_market_values: HashMap<String, f64> = portfolio
-        .positions
-        .iter()
-        .map(|(k, v)| (k.clone(), v.last_market_value))
-        .collect();
-    // Store full Position for retain_cost_when_rebalance
-    let old_full_positions: HashMap<String, Position> = portfolio
-        .positions
-        .iter()
-        .map(|(k, v)| (k.clone(), v.clone()))
+        .map(|(k, v)| (k.clone(), PositionSnapshot::from(v)))
         .collect();
 
     // Clear and rebuild
@@ -1478,17 +1457,18 @@ where
 
         // Target position value (scaled by ratio)
         let target_value = target_weight * ratio;
-        let current_value = old_positions.get(sym).copied().unwrap_or(0.0);
+        let snapshot = old_snapshots.get(sym);
+        let current_value = snapshot.map(|s| s.cost_basis).unwrap_or(0.0);
 
         // Handle NaN price case (match Finlab behavior: enter even with NaN price)
         if !price_valid {
             // If target is 0 and we have an old position, sell it using old market value
             // Note: close_trade was already called at the start for ALL positions
             if target_weight.abs() < FLOAT_EPSILON {
-                if let Some(&old_mv) = old_market_values.get(sym) {
-                    if old_mv.abs() > FLOAT_EPSILON {
-                        let sell_fee = old_mv.abs() * (config.fee_ratio + config.tax_ratio);
-                        cash += old_mv - sell_fee;
+                if let Some(snap) = snapshot {
+                    if snap.market_value.abs() > FLOAT_EPSILON {
+                        let sell_fee = snap.market_value.abs() * (config.fee_ratio + config.tax_ratio);
+                        cash += snap.market_value - sell_fee;
                     }
                 }
                 continue;
@@ -1564,16 +1544,12 @@ where
             tracker.open_trade(sym.clone(), current_date, signal_date, price, target_weight);
 
             // Determine if this is a continuing same-direction position
-            let old_value = old_positions.get(sym).copied().unwrap_or(0.0);
-            let is_continuing = old_value.abs() > FLOAT_EPSILON && old_value * target_weight > 0.0;
+            let is_continuing = current_value.abs() > FLOAT_EPSILON && current_value * target_weight > 0.0;
 
             let new_pos = if config.retain_cost_when_rebalance && is_continuing {
                 // Preserve stop tracking for continuing same-direction positions
-                if let Some(old_pos) = old_full_positions.get(sym) {
-                    Position::new_with_preserved_tracking(new_position_value, price, old_pos)
-                } else {
-                    Position::new(new_position_value, price)
-                }
+                let snap = snapshot.unwrap(); // Safe: is_continuing implies snapshot exists
+                Position::new_from_snapshot(new_position_value, price, snap)
             } else {
                 // New position or direction change or retain_cost=False: reset all
                 Position::new(new_position_value, price)
@@ -1585,10 +1561,10 @@ where
 
     // Handle positions outside effective_weights (sell them)
     // Note: close_trade was already called at the start for ALL positions
-    for (sym, &old_value) in old_positions.iter() {
-        if !effective_weights.contains_key(sym) && old_value.abs() > FLOAT_EPSILON {
-            let sell_fee = old_value.abs() * (config.fee_ratio + config.tax_ratio);
-            cash += old_value - sell_fee;
+    for (sym, snap) in old_snapshots.iter() {
+        if !effective_weights.contains_key(sym) && snap.cost_basis.abs() > FLOAT_EPSILON {
+            let sell_fee = snap.cost_basis.abs() * (config.fee_ratio + config.tax_ratio);
+            cash += snap.cost_basis - sell_fee;
         }
     }
 

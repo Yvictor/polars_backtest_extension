@@ -52,5 +52,6 @@ pub use simulation::{
     PriceData, TradeRecord, WideTradeRecord,
 };
 pub use stats::{calc_cagr, max_drawdown, sharpe_ratio, sortino_ratio, BacktestStats};
+pub use position::PositionSnapshot;
 pub use trades::TradeRecord as TradeBookRecord;
 pub use weights::IntoWeights;

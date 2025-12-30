@@ -12,7 +12,7 @@
 // Import from refactored modules
 use crate::config::BacktestConfig;
 use crate::portfolio::PortfolioState;
-use crate::position::Position;
+use crate::position::{Position, PositionSnapshot};
 use crate::stops::{detect_stops, detect_stops_finlab, detect_touched_exit};
 use crate::tracker::{WideBacktestResult, NoopIndexTracker, IndexTracker, TradeTracker};
 use crate::weights::{normalize_weights_finlab, IntoWeights};
@@ -633,43 +633,11 @@ fn execute_finlab_rebalance(
     let ratio = balance / total_target_weight.max(1.0);
 
     // Step 4: Process each stock using Finlab's set_position logic
-    // Store old positions for reference (both cost_basis and last_market_value)
-    let old_positions: std::collections::HashMap<usize, f64> = portfolio
+    // Store old positions for reference (single snapshot instead of 7 HashMaps)
+    let old_snapshots: std::collections::HashMap<usize, PositionSnapshot> = portfolio
         .positions
         .iter()
-        .map(|(&k, v)| (k, v.value))
-        .collect();
-    let old_market_values: std::collections::HashMap<usize, f64> = portfolio
-        .positions
-        .iter()
-        .map(|(&k, v)| (k, v.last_market_value))
-        .collect();
-    // Store old stop_entry_price for retain_cost_when_rebalance logic
-    let old_stop_entries: std::collections::HashMap<usize, f64> = portfolio
-        .positions
-        .iter()
-        .map(|(&k, v)| (k, v.stop_entry_price))
-        .collect();
-    let old_max_prices: std::collections::HashMap<usize, f64> = portfolio
-        .positions
-        .iter()
-        .map(|(&k, v)| (k, v.max_price))
-        .collect();
-    // Store old cr and maxcr for retain_cost_when_rebalance logic
-    let old_cr: std::collections::HashMap<usize, f64> = portfolio
-        .positions
-        .iter()
-        .map(|(&k, v)| (k, v.cr))
-        .collect();
-    let old_maxcr: std::collections::HashMap<usize, f64> = portfolio
-        .positions
-        .iter()
-        .map(|(&k, v)| (k, v.maxcr))
-        .collect();
-    let old_previous_prices: std::collections::HashMap<usize, f64> = portfolio
-        .positions
-        .iter()
-        .map(|(&k, v)| (k, v.previous_price))
+        .map(|(&k, v)| (k, PositionSnapshot::from(v)))
         .collect();
 
     // Clear positions, keep track of initial cash, rebuild using Finlab's method
@@ -688,7 +656,8 @@ fn execute_finlab_rebalance(
 
         // Target position value (scaled by ratio)
         let target_value = target_weight * ratio;
-        let current_value = old_positions.get(&stock_id).copied().unwrap_or(0.0);
+        let snapshot = old_snapshots.get(&stock_id);
+        let current_value = snapshot.map(|s| s.cost_basis).unwrap_or(0.0);
 
         // Handle NaN price case:
         // Finlab enters positions even when price is NaN!
@@ -696,10 +665,10 @@ fn execute_finlab_rebalance(
         if !price_valid {
             // If target is 0 and we have an old position, sell it using last market value
             if target_weight.abs() < FLOAT_EPSILON {
-                if let Some(&market_value) = old_market_values.get(&stock_id) {
-                    if market_value.abs() > FLOAT_EPSILON {
-                        let sell_fee = market_value.abs() * (config.fee_ratio + config.tax_ratio);
-                        cash += market_value - sell_fee;
+                if let Some(snap) = snapshot {
+                    if snap.market_value.abs() > FLOAT_EPSILON {
+                        let sell_fee = snap.market_value.abs() * (config.fee_ratio + config.tax_ratio);
+                        cash += snap.market_value - sell_fee;
                     }
                 }
                 continue;
@@ -785,18 +754,14 @@ fn execute_finlab_rebalance(
             // Finlab logic (lines 468-478 of restored_backtest_core.pyx):
             // - retain_cost=False: cr.fill(1); maxcr.fill(1); for ALL stocks
             // - retain_cost=True: only reset for NEW positions or DIRECTION CHANGE
-            let old_value = old_positions.get(&stock_id).copied().unwrap_or(0.0);
+            let old_value = snapshot.map(|s| s.cost_basis).unwrap_or(0.0);
             let is_continuing = old_value.abs() > FLOAT_EPSILON && old_value * target_weight > 0.0;
 
             let (stop_entry, max_price_val, cr_val, maxcr_val, prev_price) =
                 if config.retain_cost_when_rebalance && is_continuing {
                     // Preserve old stop tracking for continuing same-direction positions
-                    let old_stop = old_stop_entries.get(&stock_id).copied().unwrap_or(price);
-                    let old_max = old_max_prices.get(&stock_id).copied().unwrap_or(price);
-                    let old_cr_val = old_cr.get(&stock_id).copied().unwrap_or(1.0);
-                    let old_maxcr_val = old_maxcr.get(&stock_id).copied().unwrap_or(1.0);
-                    let old_prev = old_previous_prices.get(&stock_id).copied().unwrap_or(price);
-                    (old_stop, old_max, old_cr_val, old_maxcr_val, old_prev)
+                    let snap = snapshot.unwrap(); // Safe: is_continuing implies snapshot exists
+                    (snap.stop_entry_price, snap.max_price, snap.cr, snap.maxcr, snap.previous_price)
                 } else {
                     // New position or direction change or retain_cost=False: reset all
                     (price, price, 1.0, 1.0, price)
@@ -820,11 +785,11 @@ fn execute_finlab_rebalance(
 
     // Step 5: Handle old positions that are OUTSIDE target_weights array
     // (positions within target_weights range are already handled in step 4)
-    for (&stock_id, &old_value) in old_positions.iter() {
-        if stock_id >= target_weights.len() && old_value.abs() > FLOAT_EPSILON {
+    for (&stock_id, snapshot) in old_snapshots.iter() {
+        if stock_id >= target_weights.len() && snapshot.cost_basis.abs() > FLOAT_EPSILON {
             // This position is outside target_weights and should be sold
-            let sell_fee = old_value.abs() * (config.fee_ratio + config.tax_ratio);
-            cash += old_value - sell_fee;
+            let sell_fee = snapshot.cost_basis.abs() * (config.fee_ratio + config.tax_ratio);
+            cash += snapshot.cost_basis - sell_fee;
         }
     }
 
