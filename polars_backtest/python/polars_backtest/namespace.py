@@ -405,7 +405,7 @@ def backtest(
         >>> import polars_backtest as pl_bt
         >>> result = pl_bt.backtest(df, trade_at_price="close", position="weight", resample="M")
     """
-    return df.bt.backtest(
+    return df.bt.backtest(  # type: ignore[attr-defined]
         trade_at_price=trade_at_price,
         position=position,
         date=date,
@@ -481,7 +481,7 @@ def backtest_with_report(
         >>> report.creturn  # list of cumulative returns
         >>> report.trades   # DataFrame with trade records
     """
-    return df.bt.backtest_with_report(
+    return df.bt.backtest_with_report(  # type: ignore[attr-defined]
         trade_at_price=trade_at_price,
         position=position,
         date=date,
