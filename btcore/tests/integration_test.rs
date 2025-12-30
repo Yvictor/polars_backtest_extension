@@ -734,3 +734,6 @@ fn test_retain_cost_when_rebalance_true() {
     assert!(creturn[5] < creturn[4] * 0.92,
         "Day 5 should show significant loss due to stop loss, got ratio: {}", creturn[5] / creturn[4]);
 }
+
+// Note: Long format tests moved to btcore/src/simulation/long.rs unit tests
+// and Python integration tests (tests/test_long_format.py)

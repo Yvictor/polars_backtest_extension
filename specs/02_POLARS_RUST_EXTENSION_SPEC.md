@@ -98,7 +98,7 @@ members = [
 [workspace.package]
 version = "0.1.0"
 edition = "2024"
-license = "MIT"
+license = "PolyForm-Noncommercial-1.0.0"
 repository = "https://github.com/Yvictor/polars_backtest_extension"
 
 [workspace.dependencies]
@@ -178,7 +178,7 @@ name = "polars-backtest"
 version = "0.1.0"
 description = "High-performance backtesting with Polars expressions"
 requires-python = ">=3.9"
-license = "MIT"
+license = "PolyForm-Noncommercial-1.0.0"
 dependencies = ["polars>=1.0.0"]
 
 [project.urls]

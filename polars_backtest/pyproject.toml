@@ -7,13 +7,13 @@ name = "polars_backtest"
 version = "0.1.0"
 description = "Polars extension for portfolio backtesting"
 readme = "README.md"
-license = { text = "MIT" }
+license = { text = "PolyForm Noncommercial 1.0.0" }
 requires-python = ">=3.9,<3.14"
 classifiers = [
     "Development Status :: 3 - Alpha",
     "Intended Audience :: Financial and Insurance Industry",
     "Intended Audience :: Science/Research",
-    "License :: OSI Approved :: MIT License",
+    "License :: Other/Proprietary License",
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3.9",
     "Programming Language :: Python :: 3.10",
@@ -45,6 +45,10 @@ module-name = "polars_backtest._polars_backtest"
 testpaths = ["tests"]
 python_files = ["test_*.py"]
 python_functions = ["test_*"]
+markers = [
+    "slow: marks tests as slow (requires finlab data, deselect with '-m \"not slow\"')",
+]
+addopts = "-m 'not slow'"
 
 [tool.ruff]
 line-length = 100
@@ -58,5 +62,8 @@ dev = [
     "dotenv>=0.9.9",
     "finlab>=1.5.5",
     "ipykernel>=6.31.0",
+    "pandas>=2.3.3",
+    "patchelf>=0.17.2.4; sys_platform == 'linux'",
     "pytest>=8.4.2",
+    "ruff>=0.14.10",
 ]
