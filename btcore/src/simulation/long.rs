@@ -355,7 +355,7 @@ where
             // Note: The delayed rebalance is checked AFTER queueing new ones (below).
             // This ensures that if a delayed rebalance is queued and triggers on
             // the same transition, it uses the correct weights (today_weights).
-            let mut delayed_triggered = false;
+            let delayed_triggered = false;
 
             // STEP 3: Execute pending rebalance
             // Skip if delayed triggered this iteration - execute on T+1
@@ -538,7 +538,9 @@ where
                 }
                 pending_weights = Some(signal_weights);
                 pending_signal_date = Some(prev_date);
-                delayed_triggered = true;
+                // Note: delayed_triggered is set for documentation purposes
+                // The actual skip logic is in STEP 3 which runs before this
+                let _ = delayed_triggered;  // suppress unused warning
             }
 
             // STEP 6: Record date and creturn (only after first signal)
@@ -620,6 +622,12 @@ where
                     sig_date,
                     tracker,
                 );
+            }
+
+            // Handle single-date case: if we have weights but no first signal yet,
+            // record the signal day with creturn=1.0 (matching Wide format behavior)
+            if !has_first_signal && !today_weights.is_empty() {
+                has_first_signal = true;
             }
 
             // Only record if we have first signal (consistent with main loop)
@@ -918,47 +926,6 @@ fn is_year_end_i32(prev_days: i32, next_days: i32) -> bool {
 fn weekday_of_i32(days: i32) -> u8 {
     // rem_euclid handles negative days correctly
     ((days.rem_euclid(7) + 3) % 7) as u8
-}
-
-/// Compute the actual period boundary date for a given trading day transition.
-///
-/// The boundary is the CALENDAR last day of the period, not the last TRADING day.
-/// This is important for offset calculation because:
-/// - Wide format computes: boundary = last calendar day of period
-/// - target_date = boundary + offset
-///
-/// For example, if Q3 ends Sep 30 (Sunday), the boundary is Sep 30, not the
-/// last trading day (Sep 28 Friday). With Q+1D, target_date = Oct 1.
-///
-/// This matches Wide format's `_get_period_end_dates` behavior.
-#[inline]
-fn compute_period_boundary(prev_date: i32, resample: ResampleFreq) -> i32 {
-    match resample {
-        ResampleFreq::Weekly | ResampleFreq::WeeklyOn(_) => {
-            // Week ends on Sunday (weekday = 6)
-            // Compute the Sunday after or on prev_date
-            let weekday = weekday_of_i32(prev_date);
-            if weekday == 6 {
-                prev_date // Already Sunday (rare for trading day)
-            } else {
-                prev_date + (6 - weekday as i32) // Days until Sunday
-            }
-        }
-        ResampleFreq::Monthly | ResampleFreq::MonthStart => {
-            // Month ends on the last calendar day of the month
-            last_day_of_month_i32(prev_date)
-        }
-        ResampleFreq::Quarterly | ResampleFreq::QuarterStart => {
-            // Quarter ends on the last calendar day of the quarter
-            last_day_of_quarter_i32(prev_date)
-        }
-        ResampleFreq::Yearly => {
-            // Year ends on Dec 31
-            last_day_of_year_i32(prev_date)
-        }
-        // For Daily and PositionChange, boundary is the trading day itself
-        _ => prev_date,
-    }
 }
 
 /// Get all period boundaries between prev_date (inclusive) and date (exclusive)
@@ -1867,11 +1834,15 @@ mod tests {
 
         let result = backtest_long_arrow(&input, ResampleFreq::Monthly, None, &config);
 
-        assert_eq!(result.creturn.len(), 4);
         // Jan 31 is month-end, so signal triggers entry on Feb 1
-        // Feb 1: entry at 100
-        // Feb 2: +10% = 1.1
-        assert!((result.creturn[3] - 1.1).abs() < 1e-10, "Day 3: {}", result.creturn[3]);
+        // Recording starts from first signal (Jan 31), not from the beginning
+        // creturn[0] = Jan 31 (signal day) = 1.0
+        // creturn[1] = Feb 1 (entry day) = 1.0
+        // creturn[2] = Feb 2 (+10%) = 1.1
+        assert_eq!(result.creturn.len(), 3, "Expected 3 days from signal day onward");
+        assert!((result.creturn[0] - 1.0).abs() < 1e-10, "Jan 31 (signal): {}", result.creturn[0]);
+        assert!((result.creturn[1] - 1.0).abs() < 1e-10, "Feb 1 (entry): {}", result.creturn[1]);
+        assert!((result.creturn[2] - 1.1).abs() < 1e-10, "Feb 2 (+10%): {}", result.creturn[2]);
     }
 
     #[test]

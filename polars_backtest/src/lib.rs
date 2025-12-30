@@ -681,6 +681,19 @@ fn backtest(
     profile!("[PROFILE] Backtest (btcore): {:?}", step_start.elapsed());
     step_start = Instant::now();
 
+    // Handle empty result case (e.g., no valid signals)
+    if result.dates.is_empty() {
+        let empty_dates = Series::new(date.into(), Vec::<i32>::new())
+            .cast(&DataType::Date)
+            .map_err(|e| PyValueError::new_err(format!("Failed to cast to Date: {}", e)))?;
+        let empty_creturn = Series::new("creturn".into(), Vec::<f64>::new());
+        let creturn_df = DataFrame::new(vec![
+            empty_dates.into_column(),
+            empty_creturn.into_column(),
+        ]).map_err(|e| PyValueError::new_err(format!("Failed to create empty DataFrame: {}", e)))?;
+        return Ok(PyBacktestResult { creturn_df });
+    }
+
     // Create unique_dates Series directly from btcore result (zero overhead)
     let unique_dates = Series::new(date.into(), &result.dates)
         .cast(&DataType::Date)
