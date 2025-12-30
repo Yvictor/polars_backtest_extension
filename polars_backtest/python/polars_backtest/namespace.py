@@ -5,9 +5,12 @@ Provides df.bt.backtest() API for long format DataFrames.
 
 from __future__ import annotations
 
-from typing import Union
+from typing import TYPE_CHECKING, Union, cast
 
 import polars as pl
+
+if TYPE_CHECKING:
+    from polars_backtest._polars_ext import DataFrame as ExtDataFrame
 
 # Type alias for column specification (str or Expr)
 ColumnSpec = Union[str, pl.Expr]
@@ -405,7 +408,7 @@ def backtest(
         >>> import polars_backtest as pl_bt
         >>> result = pl_bt.backtest(df, trade_at_price="close", position="weight", resample="M")
     """
-    return df.bt.backtest(  # type: ignore[attr-defined]
+    return cast("ExtDataFrame", df).bt.backtest(
         trade_at_price=trade_at_price,
         position=position,
         date=date,
@@ -481,7 +484,7 @@ def backtest_with_report(
         >>> report.creturn  # list of cumulative returns
         >>> report.trades   # DataFrame with trade records
     """
-    return df.bt.backtest_with_report(  # type: ignore[attr-defined]
+    return cast("ExtDataFrame", df).bt.backtest_with_report(
         trade_at_price=trade_at_price,
         position=position,
         date=date,
