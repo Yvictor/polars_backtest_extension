@@ -237,6 +237,7 @@ class BacktestNamespace:
         high: ColumnSpec = "high",
         low: ColumnSpec = "low",
         resample: str | None = "D",
+        resample_offset: str | None = None,
         fee_ratio: float = 0.001425,
         tax_ratio: float = 0.003,
         stop_loss: float = 1.0,
@@ -245,6 +246,7 @@ class BacktestNamespace:
         position_limit: float = 1.0,
         retain_cost_when_rebalance: bool = False,
         stop_trading_next_period: bool = True,
+        finlab_mode: bool = True,
         touched_exit: bool = False,
     ) -> BacktestReport:
         """Run backtest with trade tracking, returning a BacktestReport object.
@@ -260,7 +262,8 @@ class BacktestNamespace:
             open: Open price column name or Expr (default: "open", for touched_exit)
             high: High price column name or Expr (default: "high", for touched_exit)
             low: Low price column name or Expr (default: "low", for touched_exit)
-            resample: Rebalance frequency ('D', 'W', 'M', or None)
+            resample: Rebalance frequency ('D', 'W', 'M', 'Q', 'Y', None)
+            resample_offset: Optional offset for rebalance dates
             fee_ratio: Transaction fee ratio
             tax_ratio: Transaction tax ratio
             stop_loss: Stop loss threshold
@@ -269,6 +272,7 @@ class BacktestNamespace:
             position_limit: Maximum weight per stock
             retain_cost_when_rebalance: Retain costs when rebalancing
             stop_trading_next_period: Stop trading after stop triggered
+            finlab_mode: Use Finlab-compatible calculation (default True for report)
             touched_exit: Use OHLC for intraday stop detection (requires open/high/low)
 
         Returns:
@@ -327,7 +331,7 @@ class BacktestNamespace:
             position_limit=position_limit,
             retain_cost_when_rebalance=retain_cost_when_rebalance,
             stop_trading_next_period=stop_trading_next_period,
-            finlab_mode=True,  # Use Finlab mode for report
+            finlab_mode=finlab_mode,
             touched_exit=touched_exit,
         )
 
@@ -346,7 +350,7 @@ class BacktestNamespace:
             high_col if high_col else "high",
             low_col if low_col else "low",
             resample,
-            None,  # resample_offset not supported for backtest_with_report yet
+            resample_offset,
             config,
             skip_sort,
         )
@@ -442,6 +446,7 @@ def backtest_with_report(
     high: ColumnSpec = "high",
     low: ColumnSpec = "low",
     resample: str | None = "D",
+    resample_offset: str | None = None,
     fee_ratio: float = 0.001425,
     tax_ratio: float = 0.003,
     stop_loss: float = 1.0,
@@ -450,6 +455,7 @@ def backtest_with_report(
     position_limit: float = 1.0,
     retain_cost_when_rebalance: bool = False,
     stop_trading_next_period: bool = True,
+    finlab_mode: bool = True,
     touched_exit: bool = False,
 ) -> BacktestReport:
     """Run backtest with trade tracking on long format DataFrame.
@@ -465,7 +471,8 @@ def backtest_with_report(
         open: Open price column name or Expr (default: "open", for touched_exit)
         high: High price column name or Expr (default: "high", for touched_exit)
         low: Low price column name or Expr (default: "low", for touched_exit)
-        resample: Rebalance frequency ('D', 'W', 'M', or None)
+        resample: Rebalance frequency ('D', 'W', 'M', 'Q', 'Y', None)
+        resample_offset: Optional offset for rebalance dates
         fee_ratio: Transaction fee ratio
         tax_ratio: Transaction tax ratio
         stop_loss: Stop loss threshold
@@ -474,6 +481,7 @@ def backtest_with_report(
         position_limit: Maximum weight per stock
         retain_cost_when_rebalance: Retain costs when rebalancing
         stop_trading_next_period: Stop trading after stop triggered
+        finlab_mode: Use Finlab-compatible calculation (default True for report)
         touched_exit: Use OHLC for intraday stop detection (requires open/high/low)
 
     Returns:
@@ -494,6 +502,7 @@ def backtest_with_report(
         high=high,
         low=low,
         resample=resample,
+        resample_offset=resample_offset,
         fee_ratio=fee_ratio,
         tax_ratio=tax_ratio,
         stop_loss=stop_loss,
@@ -502,5 +511,6 @@ def backtest_with_report(
         position_limit=position_limit,
         retain_cost_when_rebalance=retain_cost_when_rebalance,
         stop_trading_next_period=stop_trading_next_period,
+        finlab_mode=finlab_mode,
         touched_exit=touched_exit,
     )
