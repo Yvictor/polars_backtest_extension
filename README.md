@@ -1,6 +1,19 @@
-# Polars Backtest Extension
+# polars-backtest
 
-High-performance portfolio backtesting extension for Polars. Rust-powered with Arrow.
+Blazingly fast portfolio backtesting for Polars
+
+- Blazingly fast, written in Rust with Arrow
+- Native Polars integration with `df.bt.backtest()` namespace
+- T+1 execution, stop loss, take profit, trailing stop
+- Touched exit with intraday OHLC detection
+
+## Installation
+
+```bash
+pip install polars-backtest
+# or
+uv add polars-backtest
+```
 
 ## Quick Start
 
