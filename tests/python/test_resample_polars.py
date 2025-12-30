@@ -16,35 +16,35 @@ class TestParseResampleFreq:
 
     def test_daily(self):
         """Test daily frequency."""
-        from polars_backtest import _parse_resample_freq
+        from polars_backtest.wide import _parse_resample_freq
         freq, weekday = _parse_resample_freq('D')
         assert freq == '1d'
         assert weekday is None
 
     def test_weekly_default(self):
         """Test weekly frequency defaults to Sunday."""
-        from polars_backtest import _parse_resample_freq
+        from polars_backtest.wide import _parse_resample_freq
         freq, weekday = _parse_resample_freq('W')
         assert freq == '1w'
         assert weekday == 7  # Sunday
 
     def test_weekly_friday(self):
         """Test W-FRI anchors to Friday."""
-        from polars_backtest import _parse_resample_freq
+        from polars_backtest.wide import _parse_resample_freq
         freq, weekday = _parse_resample_freq('W-FRI')
         assert freq == '1w'
         assert weekday == 5
 
     def test_weekly_monday(self):
         """Test W-MON anchors to Monday."""
-        from polars_backtest import _parse_resample_freq
+        from polars_backtest.wide import _parse_resample_freq
         freq, weekday = _parse_resample_freq('W-MON')
         assert freq == '1w'
         assert weekday == 1
 
     def test_monthly(self):
         """Test monthly frequency."""
-        from polars_backtest import _parse_resample_freq
+        from polars_backtest.wide import _parse_resample_freq
         for freq_str in ('M', 'ME'):
             freq, weekday = _parse_resample_freq(freq_str)
             assert freq == '1mo'
@@ -52,14 +52,14 @@ class TestParseResampleFreq:
 
     def test_monthly_start(self):
         """Test month start frequency."""
-        from polars_backtest import _parse_resample_freq
+        from polars_backtest.wide import _parse_resample_freq
         freq, weekday = _parse_resample_freq('MS')
         assert freq == '1mo_start'
         assert weekday is None
 
     def test_quarterly(self):
         """Test quarterly frequency."""
-        from polars_backtest import _parse_resample_freq
+        from polars_backtest.wide import _parse_resample_freq
         for freq_str in ('Q', 'QE'):
             freq, weekday = _parse_resample_freq(freq_str)
             assert freq == '3mo'
@@ -67,14 +67,14 @@ class TestParseResampleFreq:
 
     def test_quarterly_start(self):
         """Test quarter start frequency."""
-        from polars_backtest import _parse_resample_freq
+        from polars_backtest.wide import _parse_resample_freq
         freq, weekday = _parse_resample_freq('QS')
         assert freq == '3mo_start'
         assert weekday is None
 
     def test_yearly(self):
         """Test yearly frequency."""
-        from polars_backtest import _parse_resample_freq
+        from polars_backtest.wide import _parse_resample_freq
         for freq_str in ('Y', 'YE', 'A'):
             freq, weekday = _parse_resample_freq(freq_str)
             assert freq == '1y'
@@ -82,7 +82,7 @@ class TestParseResampleFreq:
 
     def test_invalid(self):
         """Test invalid frequency raises ValueError."""
-        from polars_backtest import _parse_resample_freq
+        from polars_backtest.wide import _parse_resample_freq
         with pytest.raises(ValueError, match="Invalid resample frequency"):
             _parse_resample_freq('X')
 
@@ -92,37 +92,37 @@ class TestParseOffset:
 
     def test_positive_days(self):
         """Test positive day offset."""
-        from polars_backtest import _parse_offset
+        from polars_backtest.wide import _parse_offset
         offset = _parse_offset('1D')
         assert offset == timedelta(days=1)
 
     def test_negative_days(self):
         """Test negative day offset."""
-        from polars_backtest import _parse_offset
+        from polars_backtest.wide import _parse_offset
         offset = _parse_offset('-1D')
         assert offset == timedelta(days=-1)
 
     def test_weeks(self):
         """Test week offset."""
-        from polars_backtest import _parse_offset
+        from polars_backtest.wide import _parse_offset
         offset = _parse_offset('2W')
         assert offset == timedelta(weeks=2)
 
     def test_hours(self):
         """Test hour offset."""
-        from polars_backtest import _parse_offset
+        from polars_backtest.wide import _parse_offset
         offset = _parse_offset('3H')
         assert offset == timedelta(hours=3)
 
     def test_empty(self):
         """Test empty offset returns zero timedelta."""
-        from polars_backtest import _parse_offset
+        from polars_backtest.wide import _parse_offset
         offset = _parse_offset('')
         assert offset == timedelta(0)
 
     def test_invalid(self):
         """Test invalid offset raises ValueError."""
-        from polars_backtest import _parse_offset
+        from polars_backtest.wide import _parse_offset
         with pytest.raises(ValueError, match="Invalid offset format"):
             _parse_offset('invalid')
 
@@ -132,7 +132,7 @@ class TestGetPeriodEndDates:
 
     def test_weekly_sunday(self):
         """Test weekly dates ending on Sunday."""
-        from polars_backtest import _get_period_end_dates
+        from polars_backtest.wide import _get_period_end_dates
         start = date(2024, 1, 1)  # Monday
         end = date(2024, 1, 31)
         dates = _get_period_end_dates(start, end, '1w', weekday=7)
@@ -144,7 +144,7 @@ class TestGetPeriodEndDates:
 
     def test_weekly_friday(self):
         """Test weekly dates ending on Friday."""
-        from polars_backtest import _get_period_end_dates
+        from polars_backtest.wide import _get_period_end_dates
         start = date(2024, 1, 1)  # Monday
         end = date(2024, 1, 31)
         dates = _get_period_end_dates(start, end, '1w', weekday=5)
@@ -156,7 +156,7 @@ class TestGetPeriodEndDates:
 
     def test_monthly_end(self):
         """Test monthly end dates."""
-        from polars_backtest import _get_period_end_dates
+        from polars_backtest.wide import _get_period_end_dates
         start = date(2024, 1, 1)
         end = date(2024, 6, 30)
         dates = _get_period_end_dates(start, end, '1mo')
@@ -174,7 +174,7 @@ class TestGetPeriodEndDates:
 
     def test_monthly_start(self):
         """Test monthly start dates."""
-        from polars_backtest import _get_period_end_dates
+        from polars_backtest.wide import _get_period_end_dates
         start = date(2024, 1, 15)  # Mid-January
         end = date(2024, 6, 15)
         dates = _get_period_end_dates(start, end, '1mo_start')
@@ -191,7 +191,7 @@ class TestGetPeriodEndDates:
 
     def test_quarterly_end(self):
         """Test quarterly end dates."""
-        from polars_backtest import _get_period_end_dates
+        from polars_backtest.wide import _get_period_end_dates
         start = date(2024, 1, 1)
         end = date(2024, 12, 31)
         dates = _get_period_end_dates(start, end, '3mo')
@@ -207,7 +207,7 @@ class TestGetPeriodEndDates:
 
     def test_yearly_end(self):
         """Test yearly end dates."""
-        from polars_backtest import _get_period_end_dates
+        from polars_backtest.wide import _get_period_end_dates
         start = date(2022, 6, 1)
         end = date(2024, 6, 30)
         dates = _get_period_end_dates(start, end, '1y')
