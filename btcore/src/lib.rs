@@ -36,7 +36,6 @@ pub fn is_valid_price(price: f64) -> bool {
 pub mod config;
 pub mod portfolio;
 pub mod position;
-pub mod rebalance;
 pub mod returns;
 pub mod simulation;
 pub mod stats;
