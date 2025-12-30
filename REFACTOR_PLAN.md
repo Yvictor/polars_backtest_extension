@@ -184,7 +184,7 @@ pub fn update_positions_with_prices(&mut self, prices: &[f64]) {
 
 ## Phase 3: Major Refactoring (Higher Risk)
 
-**Status**: Not Started
+**Status**: Complete
 
 ### 3.1 Split simulate_backtest() by Mode
 
@@ -283,7 +283,7 @@ type SymbolTracker = TradeTrackerImpl<String, i32>;
 | 2.1 | PositionSnapshot struct | Medium | -30 | Done |
 | 2.2 | Consolidate update logic | Medium | -10 | Done |
 | 2.3 | Position documentation | Low | +15 | Done |
-| 3.1 | Split simulate_backtest | Medium | +50 | Not Started |
+| 3.1 | Split simulate_backtest | Medium | -100 | Done |
 | 4.1 | Remove rebalance.rs | Low | ~-100 | Not Started |
 | 4.2 | Simplify balance_finlab | Low | ~-5 | Done |
 | **Total** | | | **~-400** | |
