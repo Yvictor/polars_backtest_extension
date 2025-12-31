@@ -841,5 +841,90 @@ def test_drawdown_details_match(price_data):
     assert rel_diff < 0.01, f"Max drawdown mismatch: F={max_dd_finlab}, P={max_dd_polars}"
 
 
+def test_get_metrics(price_data):
+    """Test get_metrics() returns single-row DataFrame with all metrics.
+
+    Known differences:
+    - startDate/endDate: Finlab returns timestamp, we return date string
+    - freq: Finlab returns "1d", we return "daily"
+    - stopLoss/takeProfit/trailStop: Finlab returns 1/inf/inf for defaults,
+      we return None when not explicitly set
+    """
+    close, adj_close = price_data
+    position = close >= close.rolling(300).max()
+    finlab_report, polars_report = run_comparison(
+        adj_close, position, "get_metrics", resample='M'
+    )
+
+    # Get metrics from both
+    polars_metrics = polars_report.get_metrics()  # Returns DataFrame
+    finlab_metrics = finlab_report.get_metrics()  # Returns dict
+
+    print("\n=== get_metrics() Comparison ===")
+    print(f"Polars metrics shape: {polars_metrics.shape}")
+    print(polars_metrics)
+
+    # Helper to get value from polars DataFrame
+    def get_p(col: str):
+        if col in polars_metrics.columns:
+            return polars_metrics[col][0]
+        return None
+
+    # Helper to get value from finlab dict
+    def get_f(section: str, key: str):
+        return finlab_metrics.get(section, {}).get(key)
+
+    # Metrics that MUST match exactly or within tight tolerance
+    must_match = [
+        # (finlab_section, finlab_key, polars_col, tolerance)
+        ("profitability", "annualReturn", "annualReturn", 0.001),
+        ("profitability", "avgNStock", "avgNStock", 0.001),
+        ("profitability", "maxNStock", "maxNStock", 0),
+        ("risk", "maxDrawdown", "maxDrawdown", 0.001),
+        ("risk", "avgDrawdown", "avgDrawdown", 0.001),
+        ("risk", "avgDrawdownDays", "avgDrawdownDays", 0.001),
+        ("risk", "valueAtRisk", "valueAtRisk", 0.02),
+        ("risk", "cvalueAtRisk", "cvalueAtRisk", 0.001),
+        ("ratio", "sharpeRatio", "sharpeRatio", 0.01),
+        ("ratio", "sortinoRatio", "sortinoRatio", 0.01),
+        ("ratio", "calmarRatio", "calmarRatio", 0.01),
+        ("ratio", "volatility", "volatility", 0.01),
+        ("ratio", "profitFactor", "profitFactor", 0.03),  # includes paper returns now
+        ("ratio", "tailRatio", "tailRatio", 0.01),
+        ("winrate", "winRate", "winRate", 0.01),
+        ("winrate", "expectancy", "expectancy", 0.05),  # paper return calc differs slightly
+        ("winrate", "mae", "mae", 0.01),
+        ("winrate", "mfe", "mfe", 0.01),
+    ]
+
+    failed = []
+
+    for f_section, f_key, p_col, tolerance in must_match:
+        f_val = get_f(f_section, f_key)
+        p_val = get_p(p_col)
+
+        if f_val is None or p_val is None:
+            print(f"  - {p_col}: F={f_val}, P={p_val}")
+            continue
+
+        if tolerance == 0:
+            match = f_val == p_val
+            status = "✓" if match else "✗"
+            print(f"  {status} {p_col}: F={f_val}, P={p_val}")
+            if not match:
+                failed.append((p_col, f_val, p_val, "exact"))
+        else:
+            if f_val != 0:
+                diff = abs(f_val - p_val) / abs(f_val)
+            else:
+                diff = abs(f_val - p_val)
+            status = "✓" if diff <= tolerance else "✗"
+            print(f"  {status} {p_col}: F={f_val:.6f}, P={p_val:.6f}, diff={diff:.2e}")
+            if diff > tolerance:
+                failed.append((p_col, f_val, p_val, diff))
+
+    assert len(failed) == 0, f"Metrics failed: {failed}"
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v", "-s"])

@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from datetime import date, timedelta
 from functools import cached_property
+from typing import Literal
 
 import polars as pl
 
@@ -28,6 +29,11 @@ from polars_backtest.utils import (
     _parse_resample_freq,
 )
 
+# Metrics section types
+MetricsSection = Literal["backtest", "profitability", "risk", "ratio", "winrate"]
+ALL_SECTIONS: list[MetricsSection] = [
+    "backtest", "profitability", "risk", "ratio", "winrate"
+]
 
 def _resample_position(
     position: pl.DataFrame,
@@ -364,6 +370,12 @@ class Report:
         fee_ratio: float,
         tax_ratio: float,
         first_signal_index: int = 0,
+        # Additional backtest parameters for get_metrics()
+        resample: str | None = None,
+        trade_at: str = "close",
+        stop_loss: float | None = None,
+        take_profit: float | None = None,
+        trail_stop: float | None = None,
     ):
         """Initialize Report."""
         self._creturn_list = creturn
@@ -374,6 +386,12 @@ class Report:
         self.fee_ratio = fee_ratio
         self.tax_ratio = tax_ratio
         self._first_signal_index = first_signal_index
+        # Store backtest config
+        self.resample = resample
+        self.trade_at = trade_at
+        self.stop_loss = stop_loss
+        self.take_profit = take_profit
+        self.trail_stop = trail_stop
 
     @property
     def creturn(self) -> pl.DataFrame:
@@ -745,6 +763,206 @@ class Report:
             .alias("nday_return")
         )
 
+    def get_metrics(
+        self,
+        sections: list[MetricsSection] = ALL_SECTIONS,
+        riskfree_rate: float = 0.02,
+    ) -> pl.DataFrame:
+        """Get structured metrics as single-row DataFrame.
+
+        Args:
+            sections: List of sections to include. Options: 'backtest', 'profitability',
+                     'risk', 'ratio', 'winrate'. Defaults to all sections.
+            riskfree_rate: Annual risk-free rate for Sharpe/Sortino calculations.
+
+        Returns:
+            Single-row DataFrame with each metric as a column.
+            Includes paper returns for open positions (like Finlab).
+        """
+        # Validate sections
+        invalid = [s for s in sections if s not in ALL_SECTIONS]
+        if invalid:
+            raise ValueError(f"Invalid sections: {invalid}. Valid: {ALL_SECTIONS}")
+
+        daily = self.daily_creturn
+
+        # Prepare daily with returns
+        daily_with_return = daily.with_columns(
+            (pl.col("creturn") / pl.col("creturn").shift(1) - 1)
+            .fill_null(0.0)
+            .alias("return"),
+            (pl.col("creturn") / pl.col("creturn").cum_max() - 1).alias("drawdown"),
+        )
+
+        monthly_with_return = (
+            daily
+            .with_columns(pl.col("date").dt.truncate("1mo").alias("month"))
+            .group_by("month")
+            .agg(pl.col("creturn").last())
+            .sort("month")
+            .with_columns(
+                (pl.col("creturn") / pl.col("creturn").shift(1) - 1)
+                .fill_null(0.0)
+                .alias("return")
+            )
+        )
+
+        # Drawdown details for avgDrawdownDays
+        dd_details = self.get_drawdown_details(top_n=None)
+        avg_dd_days = dd_details["length"].mean() if dd_details.height > 0 else 0.0
+
+        # Position statistics - filter by joining with daily date range
+        position_df = self.position
+        date_col = position_df.columns[0]
+        stock_cols = [c for c in position_df.columns if c != date_col]
+
+        # Use semi join to filter position to creturn date range
+        date_range = daily.select(pl.col("date").cast(pl.Utf8).alias(date_col))
+        position_filtered = position_df.join(date_range, on=date_col, how="semi")
+
+        n_stocks_df = position_filtered.with_columns(
+            pl.sum_horizontal([
+                pl.col(c).cast(pl.Float64).abs().gt(0).cast(pl.Int32)
+                for c in stock_cols
+            ]).alias("n_stocks")
+        )
+
+        # Trade statistics with paper returns
+        all_trades = self.trades
+        closed_trades = all_trades.filter(
+            pl.col("return").is_not_null() & pl.col("return").is_not_nan()
+        )
+        open_trades = all_trades.filter(
+            pl.col("entry_date").is_not_null() &
+            pl.col("exit_date").is_null() &
+            pl.col("trade_price@entry_date").is_not_null() &
+            pl.col("trade_price@entry_date").is_not_nan()
+        )
+
+        # Calculate paper returns using join instead of loop
+        if open_trades.height > 0:
+            last_creturn = daily.select(pl.col("creturn").last()).item()
+            paper_df = (
+                open_trades
+                .select(pl.col("entry_date"))
+                .join(
+                    daily.select(
+                        pl.col("date").cast(pl.Utf8).alias("entry_date"),
+                        pl.col("creturn").alias("entry_creturn"),
+                    ),
+                    on="entry_date",
+                    how="left",
+                )
+                .with_columns(
+                    (pl.lit(last_creturn) / pl.col("entry_creturn") - 1).alias("return")
+                )
+                .select("return")
+                .drop_nulls()
+            )
+            trades_with_paper = pl.concat([
+                closed_trades.select("return"),
+                paper_df,
+            ])
+        else:
+            trades_with_paper = closed_trades.select("return")
+
+        # Precompute values
+        nperiods = 252
+        rf_periodic = (1 + riskfree_rate) ** (1 / nperiods) - 1
+
+        # Build select expressions based on sections
+        exprs: list[pl.Expr] = []
+
+        if "backtest" in sections:
+            exprs.extend([
+                pl.col("date").first().cast(pl.Utf8).alias("startDate"),
+                pl.col("date").last().cast(pl.Utf8).alias("endDate"),
+                pl.lit(self.fee_ratio).alias("feeRatio"),
+                pl.lit(self.tax_ratio).alias("taxRatio"),
+                pl.lit("daily").alias("freq"),
+                pl.lit(self.trade_at).alias("tradeAt"),
+                pl.lit(self.stop_loss).alias("stopLoss"),
+                pl.lit(self.take_profit).alias("takeProfit"),
+                pl.lit(self.trail_stop).alias("trailStop"),
+            ])
+
+        if "profitability" in sections:
+            exprs.extend([
+                (
+                    (pl.col("creturn").last() / pl.col("creturn").first())
+                    .pow(1.0 / ((pl.col("date").last() - pl.col("date").first())
+                                .dt.total_days() / 365.25))
+                    - 1
+                ).alias("annualReturn"),
+                pl.lit(n_stocks_df["n_stocks"].mean()).alias("avgNStock"),
+                pl.lit(n_stocks_df["n_stocks"].max()).alias("maxNStock"),
+            ])
+
+        if "risk" in sections:
+            var_5 = monthly_with_return["return"].quantile(0.05)
+            cvar_5 = (
+                monthly_with_return.filter(pl.col("return") <= var_5)["return"].mean()
+                if var_5 is not None else None
+            )
+            exprs.extend([
+                pl.col("drawdown").min().alias("maxDrawdown"),
+                pl.lit(self._calc_avg_drawdown(daily_with_return)).alias("avgDrawdown"),
+                pl.lit(avg_dd_days).alias("avgDrawdownDays"),
+                pl.lit(var_5).alias("valueAtRisk"),
+                pl.lit(cvar_5).alias("cvalueAtRisk"),
+            ])
+
+        if "ratio" in sections:
+            p95 = daily_with_return["return"].quantile(0.95)
+            p05 = daily_with_return["return"].quantile(0.05)
+            tail_ratio = abs(p95 / p05) if p95 and p05 and p05 != 0 else float("inf")
+
+            pos_sum = trades_with_paper.filter(pl.col("return") > 0)["return"].sum()
+            neg_sum = trades_with_paper.filter(pl.col("return") < 0)["return"].sum()
+            profit_factor = abs(pos_sum / neg_sum) if neg_sum != 0 else float("inf")
+
+            exprs.extend([
+                (
+                    (pl.col("return") - rf_periodic).mean()
+                    / (pl.col("return") - rf_periodic).std(ddof=1)
+                    * (nperiods ** 0.5)
+                ).alias("sharpeRatio"),
+                (
+                    (pl.col("return") - rf_periodic).mean()
+                    / pl.when(pl.col("return") < rf_periodic)
+                    .then(pl.col("return") - rf_periodic)
+                    .otherwise(0.0)
+                    .std(ddof=1)
+                    * (nperiods ** 0.5)
+                ).alias("sortinoRatio"),
+                (
+                    (
+                        (pl.col("creturn").last() / pl.col("creturn").first())
+                        .pow(1.0 / ((pl.col("date").last() - pl.col("date").first())
+                                    .dt.total_days() / 365.25))
+                        - 1
+                    )
+                    / pl.col("drawdown").min().abs()
+                ).alias("calmarRatio"),
+                (pl.col("return").std(ddof=1) * (nperiods ** 0.5)).alias("volatility"),
+                pl.lit(profit_factor).alias("profitFactor"),
+                pl.lit(tail_ratio).alias("tailRatio"),
+            ])
+
+        if "winrate" in sections:
+            expectancy = trades_with_paper["return"].mean()
+            mae = closed_trades["mae"].mean() if "mae" in closed_trades.columns else None
+            mfe = closed_trades["gmfe"].mean() if "gmfe" in closed_trades.columns else None
+
+            exprs.extend([
+                pl.lit(self._calc_win_ratio()).alias("winRate"),
+                pl.lit(expectancy).alias("expectancy"),
+                pl.lit(mae).alias("mae"),
+                pl.lit(mfe).alias("mfe"),
+            ])
+
+        return daily_with_return.select(exprs)
+
 
 def backtest_with_report_wide(
     close: pl.DataFrame,
@@ -981,6 +1199,12 @@ def backtest_with_report_wide(
         low_data,
     )
 
+    # Determine trade_at string
+    if isinstance(trade_at_price, str):
+        trade_at_str = trade_at_price
+    else:
+        trade_at_str = "custom"
+
     # Create Report object
     return Report(
         creturn=result.creturn,
@@ -991,4 +1215,9 @@ def backtest_with_report_wide(
         fee_ratio=fee_ratio,
         tax_ratio=tax_ratio,
         first_signal_index=first_signal_index,
+        resample=resample,
+        trade_at=trade_at_str,
+        stop_loss=stop_loss if stop_loss < 1.0 else None,
+        take_profit=take_profit if take_profit < float("inf") else None,
+        trail_stop=trail_stop if trail_stop < float("inf") else None,
     )
