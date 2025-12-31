@@ -81,14 +81,91 @@ Reference: `polars_backtest/restore/restored_report.pyx`
 - Returns nested dict with profitability, risk, ratio, winrate sections
 - Compatible with dashboard/API consumption
 
+**Finlab get_metrics() Structure**:
+```python
+{
+    "backtest": {
+        "startDate": str,           # 開始日期
+        "endDate": str,             # 結束日期
+        "feeRatio": float,          # 手續費率
+        "taxRatio": float,          # 交易稅率
+        "freq": str,                # 資料頻率 (daily, minute 等)
+        "tradeAt": str,             # 交易時機 (open/close)
+        "stopLoss": float | None,   # 停損設定
+        "takeProfit": float | None, # 停利設定
+        "trailStop": float | None,  # 追蹤停損設定
+        # 暫不實作:
+        # "market", "expired", "version", "updateDate",
+        # "nextTradingDate", "currentRebalanceDate", "nextRebalanceDate",
+        # "livePerformanceStart"
+    },
+    "profitability": {
+        "annualReturn": float,      # CAGR
+        "avgNStock": float,         # 平均持股數
+        "maxNStock": int,           # 最大持股數
+        "alpha": float,             # Alpha (需要 benchmark)
+        "beta": float,              # Beta (需要 benchmark)
+    },
+    "risk": {
+        "maxDrawdown": float,       # 最大回撤
+        "avgDrawdown": float,       # 平均回撤
+        "avgDrawdownDays": float,   # 平均回撤天數
+        "valueAtRisk": float,       # VaR (5% percentile)
+        "cvalueAtRisk": float,      # CVaR (expected shortfall)
+    },
+    "ratio": {
+        "sharpeRatio": float,       # 夏普比率
+        "sortinoRatio": float,      # 索提諾比率
+        "calmarRatio": float,       # 卡瑪比率
+        "volatility": float,        # 年化波動率
+        "profitFactor": float,      # 獲利因子 (總獲利/總虧損)
+        "tailRatio": float,         # 尾部風險比率
+    },
+    "winrate": {
+        "winRate": float,           # 勝率
+        "m12WinRate": float,        # 12個月滾動勝率 (需要 benchmark)
+        "expectancy": float,        # 期望值 (平均每筆交易報酬)
+        "mae": float,               # 平均 MAE
+        "mfe": float,               # 平均 MFE
+    },
+    "liquidity": {                  # 需要額外資料，可能需改 Rust
+        "capacity": float,          # 策略容量
+        "disposalStockRatio": float,    # 處置股比例 帶入 data 要有 這個flag 才需要算
+        "warningStockRatio": float,     # 警示股比例 帶入 data 要有 這個flag 才需要算
+        "fullDeliveryStockRatio": float, # 全額交割股比例 帶入 data 要有 這個flag 才需要算
+        "buyHigh": float,           # 買在漲停比例 (漲停根本買不到 流動性問題) 沒辦法成交策略會有誤差
+        "sellLow": float,           # 賣在跌停比例 (跌停根本賣不掉 流動性問題)
+    }
+}
+```
+
 **Implementation**:
-1. Implement `get_metrics(riskfree_rate=0.02)`:
-   - `backtest`: startDate, endDate, feeRatio, taxRatio, freq
-   - `profitability`: annualReturn, avgNStock, maxNStock
-   - `risk`: maxDrawdown, avgDrawdown, avgDrawdownDays, valueAtRisk
-   - `ratio`: sharpeRatio, sortinoRatio, calmarRatio, volatility, profitFactor, tailRatio
-   - `winrate`: winRate, expectancy, mae, mfe
-2. Add `metrics` cached_property returning self (for chained access)
+
+Phase 2a - 核心指標 (可立即實作):
+1. Implement `get_metrics(riskfree_rate=0.02, benchmark=None)` returning nested dict
+2. Reuse Stage 1 calculations where possible
+3. Add new calculations:
+   - `avgNStock`, `maxNStock` - from position DataFrame
+   - `avgDrawdownDays` - from drawdown_details
+   - `valueAtRisk`, `cvalueAtRisk` - from daily return percentiles
+   - `profitFactor` - sum(positive returns) / abs(sum(negative returns))
+   - `tailRatio` - 95th percentile / abs(5th percentile)
+   - `expectancy` - mean trade return
+   - `mae`, `mfe` - mean from trades DataFrame
+
+Phase 2b - Benchmark 相關 (用戶傳入 benchmark):
+1. Add `benchmark` parameter to `get_metrics()` and Report class
+2. Implement:
+   - `alpha` - Jensen's alpha (strategy return - expected return based on beta)
+   - `beta` - covariance(strategy, benchmark) / variance(benchmark)
+   - `m12WinRate` - 12-month rolling win rate vs benchmark
+
+Phase 2c - Liquidity 相關 (需要額外資料/Rust 修改):
+1. 需要: 成交量資料、處置/警示/全額交割股清單
+2. Implement:
+   - `capacity` - 策略容量估算
+   - `disposalStockRatio`, `warningStockRatio`, `fullDeliveryStockRatio`
+   - `buyHigh`, `sellLow` - 買賣價位分析
 
 **Dependencies**: Stage 1
 
@@ -96,6 +173,8 @@ Reference: `polars_backtest/restore/restored_report.pyx`
 - [ ] `get_metrics()` returns all expected sections
 - [ ] Nested values are correct types (float, str, etc.)
 - [ ] Metrics match Finlab output for same data
+- [ ] Alpha/Beta calculation correct with benchmark
+- [ ] Liquidity metrics correct when data available
 
 **Status**: Not Started
 
