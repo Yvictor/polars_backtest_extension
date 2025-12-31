@@ -640,7 +640,7 @@ class Report:
             .alias("dd_period")
         )
 
-        # Get period details: start, end, min drawdown, trading days count
+        # Get period details: start, end, min drawdown, calendar days
         period_details = (
             dd_with_period
             .filter(pl.col("drawdown") < 0)
@@ -649,7 +649,9 @@ class Report:
                 pl.col("date").first().alias("start"),
                 pl.col("date").last().alias("end"),
                 pl.col("drawdown").min().alias("drawdown"),
-                pl.len().alias("length"),  # Count trading days
+            )
+            .with_columns(
+                (pl.col("end") - pl.col("start")).dt.total_days().alias("length")
             )
             .select("start", "end", "length", "drawdown")
             .sort("drawdown")  # Sort by drawdown (most negative first)
