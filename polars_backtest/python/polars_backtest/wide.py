@@ -542,14 +542,13 @@ class Report:
                     / (pl.col("return") - rf_periodic).std(ddof=1)
                     * (nperiods ** 0.5)
                 ).alias("daily_sharpe"),
-                # Sortino ratio
+                # Sortino ratio (Finlab compatible: min(excess, 0) then std)
                 (
                     (pl.col("return") - rf_periodic).mean()
-                    / (pl.col("return") - rf_periodic)
-                    .filter(pl.col("return") < rf_periodic)
-                    .pow(2)
-                    .mean()
-                    .sqrt()
+                    / pl.when(pl.col("return") < rf_periodic)
+                    .then(pl.col("return") - rf_periodic)
+                    .otherwise(0.0)
+                    .std(ddof=1)
                     * (nperiods ** 0.5)
                 ).alias("daily_sortino"),
                 # Best/worst day
@@ -640,11 +639,10 @@ class Report:
                 ).alias("monthly_sharpe"),
                 (
                     (pl.col("return") - rf_periodic).mean()
-                    / (pl.col("return") - rf_periodic)
-                    .filter(pl.col("return") < rf_periodic)
-                    .pow(2)
-                    .mean()
-                    .sqrt()
+                    / pl.when(pl.col("return") < rf_periodic)
+                    .then(pl.col("return") - rf_periodic)
+                    .otherwise(0.0)
+                    .std(ddof=1)
                     * (nperiods ** 0.5)
                 ).alias("monthly_sortino"),
                 pl.col("return").max().alias("best_month"),

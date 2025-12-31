@@ -608,11 +608,7 @@ STATS_RTOL = 0.01  # 1% tolerance for statistical metrics
 
 
 def test_stats_match(price_data):
-    """Test statistics match between Finlab and Polars.
-
-    Known differences (logged but not asserted):
-    - daily_sortino/monthly_sortino: Different downside deviation formula
-    """
+    """Test statistics match between Finlab and Polars."""
     close, adj_close = price_data
     position = close >= close.rolling(300).max()
     finlab_report, polars_report = run_comparison(
@@ -646,10 +642,6 @@ def test_stats_match(price_data):
         ('best_month', polars_monthly, 'best_month'),
         ('worst_month', polars_monthly, 'worst_month'),
         ('win_ratio', polars_stats, 'win_ratio'),
-    ]
-
-    # Known differences (log only)
-    known_diff = [
         ('daily_sortino', polars_stats, 'daily_sortino'),
         ('monthly_sortino', polars_monthly, 'monthly_sortino'),
     ]
@@ -676,15 +668,6 @@ def test_stats_match(price_data):
 
         if rel_diff >= STATS_RTOL:
             failed.append((finlab_key, finlab_val, polars_val, rel_diff))
-
-    print("\n  Known differences (log only):")
-    for finlab_key, polars_df, polars_key in known_diff:
-        finlab_val = finlab_stats.get(finlab_key)
-        polars_val = polars_df[polars_key][0]
-        if finlab_val is not None and polars_val is not None:
-            diff = abs(finlab_val - polars_val)
-            rel_diff = diff / abs(finlab_val) if finlab_val != 0 else diff
-            print(f"  ~ {finlab_key}: F={finlab_val:.6f}, P={polars_val:.6f}, diff={rel_diff:.2e}")
 
     assert len(failed) == 0, f"Core metrics with diff >= {STATS_RTOL}: {failed}"
 

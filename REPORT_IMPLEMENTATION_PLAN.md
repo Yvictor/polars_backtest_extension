@@ -55,14 +55,10 @@ Reference: `polars_backtest/restore/restored_report.pyx`
 - `get_ndays_return(creturn_df, n)` - Static method for N-day return
 
 **Tested Metrics**:
-- ✓ cagr, total_return, max_drawdown, calmar
-- ✓ daily_sharpe, daily_mean, daily_vol, best_day, worst_day
-- ✓ monthly_sharpe, monthly_mean, monthly_vol, best_month, worst_month
+- ✓ cagr, total_return, max_drawdown, avg_drawdown, calmar
+- ✓ daily_sharpe, daily_sortino, daily_mean, daily_vol, best_day, worst_day
+- ✓ monthly_sharpe, monthly_sortino, monthly_mean, monthly_vol, best_month, worst_month
 - ✓ win_ratio, return_table
-
-**Known Differences** (vs Finlab, logged but not asserted):
-- avg_drawdown: Finlab uses per-period min mean, we use all dd values mean
-- sortino: Different downside deviation formula
 
 ---
 
