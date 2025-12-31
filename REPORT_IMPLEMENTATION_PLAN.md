@@ -166,13 +166,28 @@ Phase 2c - Liquidity 相關 (略過，等 long format):
 **Dependencies**: Stage 1
 
 **Tests**:
-- [ ] `get_metrics()` returns all expected sections
-- [ ] Nested values are correct types (float, str, etc.)
-- [ ] Metrics match Finlab output for same data
-- [ ] Alpha/Beta calculation correct with benchmark
-- [ ] Liquidity metrics correct when data available
+- [x] `get_metrics()` returns all expected sections
+- [x] Nested values are correct types (float, str, etc.)
+- [x] Metrics match Finlab output for same data
+- [ ] Alpha/Beta calculation correct with benchmark (deferred to long format)
+- [ ] Liquidity metrics correct when data available (deferred to long format)
 
-**Status**: Not Started
+**Status**: ✅ Complete (Phase 2a)
+
+**Implemented**:
+- `get_metrics(sections, riskfree_rate)` - Returns single-row DataFrame
+- Uses Literal type for sections parameter (backtest, profitability, risk, ratio, winrate)
+- Includes paper returns for open positions (like Finlab)
+- Uses Polars native patterns: `daily_with_return.select(exprs)`
+- Semi join for position filtering to creturn date range
+- Join for paper returns calculation (no Python loop)
+
+**Metrics implemented**:
+- backtest: startDate, endDate, feeRatio, taxRatio, freq, tradeAt, stopLoss, takeProfit, trailStop
+- profitability: annualReturn, avgNStock, maxNStock
+- risk: maxDrawdown, avgDrawdown, avgDrawdownDays, valueAtRisk, cvalueAtRisk
+- ratio: sharpeRatio, sortinoRatio, calmarRatio, volatility, profitFactor, tailRatio
+- winrate: winRate, expectancy, mae, mfe
 
 ---
 
