@@ -629,7 +629,9 @@ class Report:
         )
 
         # Add drawdown period ID: increment when transitioning from >=0 to <0
+        # Also mark recovery days (first day back to >= 0) as part of the period
         dd_with_period = daily.with_columns(
+            # Period starts when: drawdown < 0 and previous day >= 0
             pl.when(
                 (pl.col("drawdown") < 0) &
                 (pl.col("drawdown").shift(1).fill_null(0.0) >= 0)
@@ -637,16 +639,32 @@ class Report:
             .then(1)
             .otherwise(0)
             .cum_sum()
+            .alias("dd_period_raw")
+        ).with_columns(
+            # Recovery day: drawdown >= 0 and previous day < 0
+            # Assign recovery day to the previous period
+            pl.when(
+                (pl.col("drawdown") >= 0) &
+                (pl.col("drawdown").shift(1).fill_null(0.0) < 0)
+            )
+            .then(pl.col("dd_period_raw").shift(1))
+            .otherwise(
+                pl.when(pl.col("drawdown") < 0)
+                .then(pl.col("dd_period_raw"))
+                .otherwise(None)
+            )
             .alias("dd_period")
         )
 
-        # Get period details: start, end, min drawdown, calendar days
+        # Get period details: start (first dd<0), end (recovery day), min drawdown
         period_details = (
             dd_with_period
-            .filter(pl.col("drawdown") < 0)
+            .filter(pl.col("dd_period").is_not_null())
             .group_by("dd_period")
             .agg(
-                pl.col("date").first().alias("start"),
+                # Start: first day with drawdown < 0
+                pl.col("date").filter(pl.col("drawdown") < 0).first().alias("start"),
+                # End: last day in period (recovery day if exists)
                 pl.col("date").last().alias("end"),
                 pl.col("drawdown").min().alias("drawdown"),
             )
