@@ -8,6 +8,7 @@ long format API in namespace.py (df.bt.backtest).
 from __future__ import annotations
 
 from datetime import date, timedelta
+from functools import cached_property
 
 import polars as pl
 
@@ -465,6 +466,218 @@ class Report:
     def __repr__(self) -> str:
         return (
             f"Report(creturn_len={len(self._creturn_list)}, trades_count={len(self._trades_raw)})"
+        )
+
+    @cached_property
+    def daily_creturn(self) -> pl.DataFrame:
+        """Daily resampled cumulative return DataFrame."""
+        return (
+            self.creturn
+            .with_columns(pl.col("date").cast(pl.Date))
+            .group_by("date")
+            .agg(pl.col("creturn").last())
+            .sort("date")
+        )
+
+    def get_stats(self, riskfree_rate: float = 0.02) -> pl.DataFrame:
+        """Get backtest statistics as DataFrame.
+
+        Args:
+            riskfree_rate: Annual risk-free rate for Sharpe/Sortino calculations
+
+        Returns:
+            DataFrame with one row containing all statistics
+        """
+        daily = self.daily_creturn
+
+        if daily.height < 2:
+            return pl.DataFrame({"error": ["Insufficient data"]})
+
+        nperiods = 252
+        rf_periodic = (1 + riskfree_rate) ** (1 / nperiods) - 1
+
+        # Add returns and drawdown columns
+        daily_with_stats = daily.with_columns(
+            # Daily returns
+            (pl.col("creturn") / pl.col("creturn").shift(1) - 1)
+            .fill_null(0.0)
+            .alias("return"),
+            # Drawdown
+            (pl.col("creturn") / pl.col("creturn").cum_max() - 1).alias("drawdown"),
+        )
+
+        # Calculate avg_drawdown using per-period min (Finlab compatible)
+        avg_dd = self._calc_avg_drawdown(daily_with_stats)
+
+        # Build all stats
+        return (
+            daily_with_stats
+            .select(
+                # Dates
+                pl.col("date").first().cast(pl.Utf8).alias("start"),
+                pl.col("date").last().cast(pl.Utf8).alias("end"),
+                pl.lit(riskfree_rate).alias("rf"),
+                # Total return
+                (pl.col("creturn").last() / pl.col("creturn").first() - 1).alias("total_return"),
+                # CAGR
+                (
+                    (pl.col("creturn").last() / pl.col("creturn").first())
+                    .pow(
+                        1.0 / ((pl.col("date").last() - pl.col("date").first())
+                               .dt.total_days() / 365.25)
+                    )
+                    - 1
+                ).alias("cagr"),
+                # Max drawdown
+                pl.col("drawdown").min().alias("max_drawdown"),
+                # Avg drawdown (per-period min average, Finlab compatible)
+                pl.lit(avg_dd).alias("avg_drawdown"),
+                # Daily mean (annualized raw return)
+                (pl.col("return").mean() * nperiods).alias("daily_mean"),
+                # Daily volatility (annualized)
+                (pl.col("return").std(ddof=1) * (nperiods ** 0.5)).alias("daily_vol"),
+                # Sharpe ratio
+                (
+                    (pl.col("return") - rf_periodic).mean()
+                    / (pl.col("return") - rf_periodic).std(ddof=1)
+                    * (nperiods ** 0.5)
+                ).alias("daily_sharpe"),
+                # Sortino ratio
+                (
+                    (pl.col("return") - rf_periodic).mean()
+                    / (pl.col("return") - rf_periodic)
+                    .filter(pl.col("return") < rf_periodic)
+                    .pow(2)
+                    .mean()
+                    .sqrt()
+                    * (nperiods ** 0.5)
+                ).alias("daily_sortino"),
+                # Best/worst day
+                pl.col("return").max().alias("best_day"),
+                pl.col("return").min().alias("worst_day"),
+                # Calmar ratio
+                (
+                    (
+                        (pl.col("creturn").last() / pl.col("creturn").first())
+                        .pow(
+                            1.0 / ((pl.col("date").last() - pl.col("date").first())
+                                   .dt.total_days() / 365.25)
+                        )
+                        - 1
+                    )
+                    / pl.col("drawdown").min().abs()
+                ).alias("calmar"),
+                # Win ratio from trades
+                pl.lit(self._calc_win_ratio()).alias("win_ratio"),
+            )
+        )
+
+    def _calc_win_ratio(self) -> float:
+        """Calculate win ratio from trades."""
+        trades = self.trades.drop_nulls(subset=["return"])
+        if trades.height == 0:
+            return 0.0
+        return trades.select(
+            (pl.col("return").filter(pl.col("return") > 0).count().cast(pl.Float64)
+             / pl.col("return").count().cast(pl.Float64))
+        ).item()
+
+    def _calc_avg_drawdown(self, daily: pl.DataFrame) -> float:
+        """Calculate average drawdown (mean of per-period minimum drawdowns).
+
+        Finlab definition: For each drawdown period (consecutive days where dd < 0),
+        find the minimum drawdown value, then take the mean of all these minimums.
+        """
+        # Add drawdown period ID: increment when transitioning from >=0 to <0
+        dd_with_period = daily.with_columns(
+            # Detect period start: previous row was >=0 and current is <0
+            pl.when(
+                (pl.col("drawdown") < 0) &
+                (pl.col("drawdown").shift(1).fill_null(0.0) >= 0)
+            )
+            .then(1)
+            .otherwise(0)
+            .cum_sum()
+            .alias("dd_period")
+        )
+
+        # Filter to only drawdown rows and get min per period
+        period_mins = (
+            dd_with_period
+            .filter(pl.col("drawdown") < 0)
+            .group_by("dd_period")
+            .agg(pl.col("drawdown").min().alias("period_min"))
+        )
+
+        if period_mins.height == 0:
+            return 0.0
+
+        return period_mins["period_min"].mean()
+
+    def get_monthly_stats(self, riskfree_rate: float = 0.02) -> pl.DataFrame:
+        """Get monthly statistics as DataFrame."""
+        nperiods = 12
+        rf_periodic = (1 + riskfree_rate) ** (1 / nperiods) - 1
+
+        return (
+            self.daily_creturn
+            .with_columns(pl.col("date").dt.truncate("1mo").alias("month"))
+            .group_by("month")
+            .agg(pl.col("creturn").last())
+            .sort("month")
+            .with_columns(
+                (pl.col("creturn") / pl.col("creturn").shift(1) - 1)
+                .fill_null(0.0)
+                .alias("return")
+            )
+            .select(
+                (pl.col("return").mean() * nperiods).alias("monthly_mean"),
+                (pl.col("return").std(ddof=1) * (nperiods ** 0.5)).alias("monthly_vol"),
+                (
+                    (pl.col("return") - rf_periodic).mean()
+                    / (pl.col("return") - rf_periodic).std(ddof=1)
+                    * (nperiods ** 0.5)
+                ).alias("monthly_sharpe"),
+                (
+                    (pl.col("return") - rf_periodic).mean()
+                    / (pl.col("return") - rf_periodic)
+                    .filter(pl.col("return") < rf_periodic)
+                    .pow(2)
+                    .mean()
+                    .sqrt()
+                    * (nperiods ** 0.5)
+                ).alias("monthly_sortino"),
+                pl.col("return").max().alias("best_month"),
+                pl.col("return").min().alias("worst_month"),
+            )
+        )
+
+    def get_return_table(self) -> pl.DataFrame:
+        """Get monthly return table as DataFrame."""
+        return (
+            self.daily_creturn
+            .with_columns(
+                pl.col("date").dt.year().alias("year"),
+                pl.col("date").dt.month().alias("month"),
+            )
+            .group_by(["year", "month"])
+            .agg(pl.col("creturn").last().alias("month_end"))
+            .sort(["year", "month"])
+            .with_columns(
+                (pl.col("month_end") / pl.col("month_end").shift(1) - 1)
+                .fill_null(0.0)
+                .alias("monthly_return")
+            )
+            .pivot(on="month", index="year", values="monthly_return")
+            .sort("year")
+        )
+
+    @staticmethod
+    def get_ndays_return(creturn_df: pl.DataFrame, n: int) -> pl.DataFrame:
+        """Get N-day return as DataFrame."""
+        return creturn_df.select(
+            (pl.col("creturn").last() / pl.col("creturn").get(pl.len() - 1 - n) - 1)
+            .alias("nday_return")
         )
 
 

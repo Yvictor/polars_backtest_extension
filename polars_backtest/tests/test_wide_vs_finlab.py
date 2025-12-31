@@ -598,5 +598,199 @@ def test_touched_exit_with_retain_cost(price_data, ohlc_data):
                    retain_cost_when_rebalance=True)
 
 
+# =============================================================================
+# Statistics Comparison Tests
+# =============================================================================
+# Compare get_stats() output between Finlab and Polars implementations.
+
+
+STATS_RTOL = 0.01  # 1% tolerance for statistical metrics
+
+
+def test_stats_match(price_data):
+    """Test statistics match between Finlab and Polars.
+
+    Known differences (logged but not asserted):
+    - daily_sortino/monthly_sortino: Different downside deviation formula
+    """
+    close, adj_close = price_data
+    position = close >= close.rolling(300).max()
+    finlab_report, polars_report = run_comparison(
+        adj_close, position, "stats_match", resample='M'
+    )
+
+    # Get stats from both
+    finlab_stats = finlab_report.get_stats()
+    polars_stats = polars_report.get_stats()
+    polars_monthly = polars_report.get_monthly_stats()
+
+    print("\n=== Statistics Comparison ===")
+    print(f"Polars stats:\n{polars_stats}")
+    print(f"Polars monthly:\n{polars_monthly}")
+
+    # Core metrics that MUST match
+    must_match = [
+        ('cagr', polars_stats, 'cagr'),
+        ('total_return', polars_stats, 'total_return'),
+        ('max_drawdown', polars_stats, 'max_drawdown'),
+        ('avg_drawdown', polars_stats, 'avg_drawdown'),
+        ('calmar', polars_stats, 'calmar'),
+        ('daily_sharpe', polars_stats, 'daily_sharpe'),
+        ('daily_mean', polars_stats, 'daily_mean'),
+        ('daily_vol', polars_stats, 'daily_vol'),
+        ('best_day', polars_stats, 'best_day'),
+        ('worst_day', polars_stats, 'worst_day'),
+        ('monthly_sharpe', polars_monthly, 'monthly_sharpe'),
+        ('monthly_mean', polars_monthly, 'monthly_mean'),
+        ('monthly_vol', polars_monthly, 'monthly_vol'),
+        ('best_month', polars_monthly, 'best_month'),
+        ('worst_month', polars_monthly, 'worst_month'),
+        ('win_ratio', polars_stats, 'win_ratio'),
+    ]
+
+    # Known differences (log only)
+    known_diff = [
+        ('daily_sortino', polars_stats, 'daily_sortino'),
+        ('monthly_sortino', polars_monthly, 'monthly_sortino'),
+    ]
+
+    print("\n  Core metrics (must match):")
+    failed = []
+    for finlab_key, polars_df, polars_key in must_match:
+        finlab_val = finlab_stats.get(finlab_key)
+        polars_val = polars_df[polars_key][0]
+
+        if finlab_val is None or (isinstance(finlab_val, float) and np.isnan(finlab_val)):
+            print(f"  {finlab_key}: Finlab=NaN, Polars={polars_val}")
+            continue
+
+        if polars_val is None or (isinstance(polars_val, float) and np.isnan(polars_val)):
+            print(f"  {finlab_key}: Finlab={finlab_val:.6f}, Polars=NaN")
+            continue
+
+        diff = abs(finlab_val - polars_val)
+        rel_diff = diff / abs(finlab_val) if finlab_val != 0 else diff
+
+        status = "✓" if rel_diff < STATS_RTOL else "✗"
+        print(f"  {status} {finlab_key}: F={finlab_val:.6f}, P={polars_val:.6f}, diff={rel_diff:.2e}")
+
+        if rel_diff >= STATS_RTOL:
+            failed.append((finlab_key, finlab_val, polars_val, rel_diff))
+
+    print("\n  Known differences (log only):")
+    for finlab_key, polars_df, polars_key in known_diff:
+        finlab_val = finlab_stats.get(finlab_key)
+        polars_val = polars_df[polars_key][0]
+        if finlab_val is not None and polars_val is not None:
+            diff = abs(finlab_val - polars_val)
+            rel_diff = diff / abs(finlab_val) if finlab_val != 0 else diff
+            print(f"  ~ {finlab_key}: F={finlab_val:.6f}, P={polars_val:.6f}, diff={rel_diff:.2e}")
+
+    assert len(failed) == 0, f"Core metrics with diff >= {STATS_RTOL}: {failed}"
+
+
+MONTH_NAMES = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec']
+
+
+def test_return_table_match(price_data):
+    """Test return table structure matches between Finlab and Polars."""
+    close, adj_close = price_data
+    position = close >= close.rolling(300).max()
+    finlab_report, polars_report = run_comparison(
+        adj_close, position, "return_table_match", resample='M'
+    )
+
+    # Get return tables
+    finlab_stats = finlab_report.get_stats()
+    finlab_return_table = finlab_stats.get('return_table', {})
+    polars_return_table = polars_report.get_return_table()
+
+    print("\n=== Return Table Comparison ===")
+    print(f"Finlab years: {list(finlab_return_table.keys())}")
+    print(f"Polars return table:\n{polars_return_table}")
+
+    # Verify polars return table has year column
+    assert 'year' in polars_return_table.columns, "Missing 'year' column in return table"
+
+    # Compare year coverage
+    polars_years = set(polars_return_table['year'].to_list())
+    finlab_years = set(finlab_return_table.keys())
+
+    common_years = polars_years & finlab_years
+    print(f"Common years: {len(common_years)}")
+
+    # Compare monthly returns for common years
+    # Finlab uses 'Jan', 'Feb', etc. Polars uses 1, 2, etc.
+    mismatches = []
+    for year in sorted(common_years):
+        finlab_year = finlab_return_table[year]
+        polars_row = polars_return_table.filter(pl.col('year') == year)
+
+        if polars_row.is_empty():
+            continue
+
+        for month_num in range(1, 13):
+            month_name = MONTH_NAMES[month_num - 1]
+            finlab_val = finlab_year.get(month_name, 0.0)
+            polars_col = str(month_num)
+
+            if polars_col not in polars_row.columns:
+                continue
+
+            polars_val = polars_row[polars_col][0]
+            if polars_val is None:
+                polars_val = 0.0
+
+            diff = abs(finlab_val - polars_val)
+            if diff > 0.001:  # 0.1% tolerance
+                mismatches.append((year, month_num, finlab_val, polars_val, diff))
+
+    if mismatches:
+        print(f"  Mismatches ({len(mismatches)}):")
+        for year, month, f_val, p_val, diff in mismatches[:10]:
+            print(f"    {year}-{month:02d}: F={f_val:.4f}, P={p_val:.4f}, diff={diff:.4f}")
+
+    assert len(mismatches) == 0, f"Return table mismatches: {len(mismatches)}"
+
+
+def test_monthly_stats_match(price_data):
+    """Test monthly statistics match between Finlab and Polars."""
+    close, adj_close = price_data
+    position = close >= close.rolling(300).max()
+    finlab_report, polars_report = run_comparison(
+        adj_close, position, "monthly_stats_match", resample='M'
+    )
+
+    finlab_stats = finlab_report.get_stats()
+    polars_monthly = polars_report.get_monthly_stats()
+
+    print("\n=== Monthly Stats Comparison ===")
+    print(f"Polars monthly stats:\n{polars_monthly}")
+
+    # Compare monthly metrics
+    metrics = [
+        ('monthly_sharpe', 'monthly_sharpe'),
+        ('best_month', 'best_month'),
+        ('worst_month', 'worst_month'),
+    ]
+
+    for finlab_key, polars_key in metrics:
+        finlab_val = finlab_stats.get(finlab_key)
+        polars_val = polars_monthly[polars_key][0]
+
+        if finlab_val is None or np.isnan(finlab_val):
+            print(f"  {finlab_key}: Finlab=NaN, Polars={polars_val}")
+            continue
+
+        if polars_val is None or np.isnan(polars_val):
+            print(f"  {finlab_key}: Finlab={finlab_val:.6f}, Polars=NaN")
+            continue
+
+        diff = abs(finlab_val - polars_val)
+        rel_diff = diff / abs(finlab_val) if finlab_val != 0 else diff
+
+        print(f"  {finlab_key}: Finlab={finlab_val:.6f}, Polars={polars_val:.6f}, diff={rel_diff:.2e}")
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v", "-s"])
