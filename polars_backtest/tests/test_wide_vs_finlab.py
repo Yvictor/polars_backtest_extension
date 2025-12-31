@@ -775,5 +775,71 @@ def test_monthly_stats_match(price_data):
         print(f"  {finlab_key}: Finlab={finlab_val:.6f}, Polars={polars_val:.6f}, diff={rel_diff:.2e}")
 
 
+def test_drawdown_details_match(price_data):
+    """Test drawdown details match between Finlab and Polars."""
+    close, adj_close = price_data
+    position = close >= close.rolling(300).max()
+    finlab_report, polars_report = run_comparison(
+        adj_close, position, "drawdown_details_match", resample='M'
+    )
+
+    # Get Finlab drawdown details
+    finlab_stats = finlab_report.get_stats()
+    finlab_dd_raw = finlab_stats.get('drawdown_details')
+
+    if finlab_dd_raw is None or len(finlab_dd_raw) == 0:
+        pytest.skip("Finlab drawdown_details is None or empty")
+
+    # Parse Finlab drawdown_details: dict with Start date as key, value is dict
+    # {'2011-08-04': {'End': '2013-12-30', 'Length': 879, 'drawdown': -0.444}}
+    dd_rows = []
+    for start_date, info in finlab_dd_raw.items():
+        dd_rows.append({
+            'start': start_date,
+            'end': info.get('End'),
+            'length': info.get('Length'),
+            'drawdown': info.get('drawdown'),
+        })
+    finlab_dd = pd.DataFrame(dd_rows)
+
+    # Sort Finlab by drawdown (most negative first)
+    finlab_dd = finlab_dd.sort_values('drawdown').reset_index(drop=True)
+
+    # Get Polars drawdown details (already sorted by magnitude)
+    polars_dd = polars_report.get_drawdown_details()
+
+    print(f"\nDrawdown periods: Finlab={len(finlab_dd)}, Polars={polars_dd.height}")
+
+    # Compare top 5 drawdowns by magnitude
+    print("\nTop 5 drawdowns comparison:")
+    for i in range(min(5, len(finlab_dd), polars_dd.height)):
+        f_row = finlab_dd.iloc[i]
+        p_dd = polars_dd.row(i, named=True)
+
+        f_val = f_row['drawdown']
+        p_val = p_dd['drawdown']
+        diff = abs(f_val - p_val)
+        rel_diff = diff / abs(f_val) if f_val != 0 else diff
+
+        f_start = str(f_row['start'])
+        p_start = str(p_dd['start'])
+        f_len = f_row['length']
+        p_len = p_dd['length']
+
+        status = "✓" if rel_diff < 0.01 else "✗"
+        print(f"  {status} [{i}] dd: F={f_val:.4f} P={p_val:.4f} (diff={rel_diff:.2e})")
+        print(f"       start: F={f_start} P={p_start}")
+        print(f"       length: F={f_len} P={p_len}")
+
+    # Verify max_drawdown matches top drawdown
+    max_dd_polars = polars_dd["drawdown"].min()
+    max_dd_finlab = finlab_stats.get('max_drawdown')
+    diff = abs(max_dd_finlab - max_dd_polars)
+    rel_diff = diff / abs(max_dd_finlab) if max_dd_finlab != 0 else diff
+    print(f"\nMax drawdown: Finlab={max_dd_finlab:.6f}, Polars={max_dd_polars:.6f}")
+    print(f"diff={rel_diff:.2e}")
+    assert rel_diff < 0.01, f"Max drawdown mismatch: F={max_dd_finlab}, P={max_dd_polars}"
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v", "-s"])

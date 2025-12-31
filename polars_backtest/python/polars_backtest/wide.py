@@ -613,6 +613,53 @@ class Report:
 
         return period_mins["period_min"].mean()
 
+    def get_drawdown_details(self, top_n: int | None = 5) -> pl.DataFrame:
+        """Get drawdown period details.
+
+        Returns DataFrame with columns: start, end, length, drawdown
+        Each row represents a drawdown period (consecutive days below peak).
+
+        Args:
+            top_n: Return only the top N largest drawdowns (default 5).
+                   Set to None to return all drawdown periods.
+        """
+        # Add drawdown column
+        daily = self.daily_creturn.with_columns(
+            (pl.col("creturn") / pl.col("creturn").cum_max() - 1).alias("drawdown")
+        )
+
+        # Add drawdown period ID: increment when transitioning from >=0 to <0
+        dd_with_period = daily.with_columns(
+            pl.when(
+                (pl.col("drawdown") < 0) &
+                (pl.col("drawdown").shift(1).fill_null(0.0) >= 0)
+            )
+            .then(1)
+            .otherwise(0)
+            .cum_sum()
+            .alias("dd_period")
+        )
+
+        # Get period details: start, end, min drawdown, trading days count
+        period_details = (
+            dd_with_period
+            .filter(pl.col("drawdown") < 0)
+            .group_by("dd_period")
+            .agg(
+                pl.col("date").first().alias("start"),
+                pl.col("date").last().alias("end"),
+                pl.col("drawdown").min().alias("drawdown"),
+                pl.len().alias("length"),  # Count trading days
+            )
+            .select("start", "end", "length", "drawdown")
+            .sort("drawdown")  # Sort by drawdown (most negative first)
+        )
+
+        if top_n is not None:
+            return period_details.head(top_n)
+
+        return period_details
+
     def get_monthly_stats(self, riskfree_rate: float = 0.02) -> pl.DataFrame:
         """Get monthly statistics as DataFrame."""
         nperiods = 12
