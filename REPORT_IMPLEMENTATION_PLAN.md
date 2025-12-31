@@ -52,13 +52,14 @@ Reference: `polars_backtest/restore/restored_report.pyx`
 - `get_stats(riskfree_rate=0.02)` - Returns DataFrame with all stats
 - `get_monthly_stats(riskfree_rate=0.02)` - Returns DataFrame with monthly stats
 - `get_return_table()` - Returns pivoted year/month return DataFrame
+- `get_drawdown_details(top_n=5)` - Returns top N drawdown periods with start/end/length/drawdown
 - `get_ndays_return(creturn_df, n)` - Static method for N-day return
 
 **Tested Metrics**:
 - ✓ cagr, total_return, max_drawdown, avg_drawdown, calmar
 - ✓ daily_sharpe, daily_sortino, daily_mean, daily_vol, best_day, worst_day
 - ✓ monthly_sharpe, monthly_sortino, monthly_mean, monthly_vol, best_month, worst_month
-- ✓ win_ratio, return_table
+- ✓ win_ratio, return_table, drawdown_details
 
 ---
 
