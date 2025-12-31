@@ -2,9 +2,13 @@
 
 from __future__ import annotations
 
+from typing import Literal
+
 import polars as pl
 
 from polars_backtest.namespace import BacktestNamespace
+
+MetricsSection = Literal["backtest", "profitability", "risk", "ratio", "winrate"]
 
 
 class DataFrame(pl.DataFrame):
@@ -157,6 +161,30 @@ class BacktestReport:
 
         Returns:
             True if stop loss or take profit was triggered.
+        """
+        ...
+
+    def get_metrics(
+        self,
+        sections: list[MetricsSection] | None = None,
+        riskfree_rate: float = 0.02,
+    ) -> pl.DataFrame:
+        """Get structured metrics as single-row DataFrame.
+
+        Args:
+            sections: List of sections to include. Options: 'backtest', 'profitability',
+                     'risk', 'ratio', 'winrate'. Defaults to all sections.
+            riskfree_rate: Annual risk-free rate for Sharpe/Sortino calculations.
+
+        Returns:
+            Single-row DataFrame with metrics columns:
+            - backtest: startDate, endDate, feeRatio, taxRatio, freq, tradeAt,
+                       stopLoss, takeProfit, trailStop
+            - profitability: annualReturn, avgNStock, maxNStock
+            - risk: maxDrawdown, avgDrawdown, avgDrawdownDays, valueAtRisk, cvalueAtRisk
+            - ratio: sharpeRatio, sortinoRatio, calmarRatio, volatility,
+                    profitFactor, tailRatio
+            - winrate: winRate, expectancy, mae, mfe
         """
         ...
 

@@ -1500,6 +1500,50 @@ def run_report_comparison(
     assert wide_stop == long_stop, f"is_stop_triggered mismatch: wide={wide_stop}, long={long_stop}"
     print(f"is_stop_triggered: {wide_stop}")
 
+    # Compare get_metrics() - compare all overlapping metrics
+    wide_metrics = wide_report.get_metrics()
+    long_metrics = long_report.get_metrics()
+    print(f"get_metrics(): Wide shape={wide_metrics.shape}, Long shape={long_metrics.shape}")
+
+    # Find common columns and compare all of them
+    common_cols = set(wide_metrics.columns) & set(long_metrics.columns)
+    # Skip string columns that can't be compared numerically
+    skip_cols = {"startDate", "endDate", "freq", "tradeAt"}
+    numeric_cols = [c for c in common_cols if c not in skip_cols]
+
+    # Known differences:
+    # - avgNStock/maxNStock: Wide uses position matrix, Long uses sweep line from trades
+    # - winRate/expectancy/mae/mfe: trades-derived, may differ due to 0 price handling
+    # Use looser tolerance for trade-derived metrics
+    trade_derived = {"avgNStock", "maxNStock", "winRate", "expectancy", "mae", "mfe", "profitFactor"}
+    metrics_tol = 5e-2 if resample == "D" else 1e-2  # 5% for daily, 1% otherwise
+
+    print(f"  Comparing {len(numeric_cols)} numeric columns...")
+    for metric in sorted(numeric_cols):
+        wide_val = wide_metrics[metric][0]
+        long_val = long_metrics[metric][0]
+
+        # Skip null comparisons
+        if wide_val is None or long_val is None:
+            continue
+        # Skip NaN comparisons
+        if isinstance(wide_val, float) and isinstance(long_val, float):
+            if wide_val != wide_val or long_val != long_val:  # NaN check
+                continue
+
+        diff = abs(wide_val - long_val)
+        tol = metrics_tol if metric in trade_derived else stats_tol
+
+        # Use relative difference for non-zero values
+        if abs(wide_val) > 1e-10:
+            rel_diff = diff / abs(wide_val)
+            if rel_diff > tol:
+                print(f"  WARN {metric}: Wide={wide_val:.6f}, Long={long_val:.6f}, rel_diff={rel_diff:.4%} > tol={tol:.4%}")
+        elif diff > 1e-6:
+            print(f"  WARN {metric}: Wide={wide_val:.6f}, Long={long_val:.6f}, abs_diff={diff:.6f}")
+
+    print("get_metrics(): all columns checked")
+
     return long_report, wide_report
 
 

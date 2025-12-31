@@ -7,6 +7,7 @@ use pyo3::prelude::*;
 use pyo3::exceptions::PyValueError;
 use pyo3_polars::PyDataFrame;
 use polars::prelude::*;
+use polars::prelude::QuantileMethod;
 use polars_ops::pivot::pivot;
 
 use btcore::BacktestConfig;
@@ -385,6 +386,209 @@ impl PyBacktestReport {
             self.creturn_df.height(), self.trades_df.height(),
         )
     }
+
+    /// Get structured metrics as single-row DataFrame
+    ///
+    /// Args:
+    ///     sections: List of sections to include. Options: "backtest", "profitability",
+    ///              "risk", "ratio", "winrate". Defaults to all sections.
+    ///     riskfree_rate: Annual risk-free rate for Sharpe/Sortino calculations.
+    ///
+    /// Returns:
+    ///     Single-row DataFrame with each metric as a column.
+    #[pyo3(signature = (sections=None, riskfree_rate=0.02))]
+    fn get_metrics(
+        &self,
+        sections: Option<Vec<String>>,
+        riskfree_rate: f64,
+    ) -> PyResult<PyDataFrame> {
+        let all_sections = vec!["backtest", "profitability", "risk", "ratio", "winrate"];
+        let sections_list: Vec<&str> = match &sections {
+            Some(s) => {
+                // Validate sections
+                for sec in s {
+                    if !all_sections.contains(&sec.as_str()) {
+                        return Err(PyValueError::new_err(format!(
+                            "Invalid section: '{}'. Valid: {:?}",
+                            sec, all_sections
+                        )));
+                    }
+                }
+                s.iter().map(|s| s.as_str()).collect()
+            }
+            None => all_sections.clone(),
+        };
+
+        let daily = self.compute_daily_creturn().map_err(to_py_err)?;
+
+        if daily.height() < 2 {
+            return Err(PyValueError::new_err("Insufficient data for metrics"));
+        }
+
+        let nperiods = 252.0_f64;
+        let rf_periodic = (1.0 + riskfree_rate).powf(1.0 / nperiods) - 1.0;
+
+        // Prepare daily with returns and drawdown
+        let daily_with_return = daily
+            .clone()
+            .lazy()
+            .with_columns([
+                (col("creturn") / col("creturn").shift(lit(1)) - lit(1.0))
+                    .fill_null(lit(0.0))
+                    .alias("return"),
+                (col("creturn") / col("creturn").cum_max(false) - lit(1.0))
+                    .alias("drawdown"),
+            ])
+            .collect()
+            .map_err(to_py_err)?;
+
+        // Prepare monthly returns for VaR/CVaR
+        let monthly_with_return = daily
+            .clone()
+            .lazy()
+            .with_column(col("date").dt().truncate(lit("1mo")).alias("month"))
+            .group_by([col("month")])
+            .agg([col("creturn").last()])
+            .sort(["month"], Default::default())
+            .with_column(
+                (col("creturn") / col("creturn").shift(lit(1)) - lit(1.0))
+                    .fill_null(lit(0.0))
+                    .alias("return"),
+            )
+            .collect()
+            .map_err(to_py_err)?;
+
+        // Build expressions based on sections
+        let mut exprs: Vec<Expr> = Vec::new();
+
+        // === BACKTEST SECTION ===
+        if sections_list.contains(&"backtest") {
+            exprs.push(col("date").first().cast(DataType::String).alias("startDate"));
+            exprs.push(col("date").last().cast(DataType::String).alias("endDate"));
+            exprs.push(lit(self.config.fee_ratio).alias("feeRatio"));
+            exprs.push(lit(self.config.tax_ratio).alias("taxRatio"));
+            exprs.push(lit("daily").alias("freq"));
+            exprs.push(lit("close").alias("tradeAt"));
+            exprs.push(if self.config.stop_loss >= 1.0 {
+                lit(NULL).alias("stopLoss")
+            } else {
+                lit(self.config.stop_loss).alias("stopLoss")
+            });
+            exprs.push(if self.config.take_profit.is_infinite() {
+                lit(NULL).alias("takeProfit")
+            } else {
+                lit(self.config.take_profit).alias("takeProfit")
+            });
+            exprs.push(if self.config.trail_stop.is_infinite() {
+                lit(NULL).alias("trailStop")
+            } else {
+                lit(self.config.trail_stop).alias("trailStop")
+            });
+        }
+
+        // === PROFITABILITY SECTION ===
+        if sections_list.contains(&"profitability") {
+            // Annual return (CAGR)
+            exprs.push(
+                ((col("creturn").last() / col("creturn").first())
+                    .pow(lit(1.0) / ((col("date").last() - col("date").first())
+                        .dt().total_days(false).cast(DataType::Float64) / lit(365.25)))
+                    - lit(1.0))
+                    .alias("annualReturn"),
+            );
+
+            // Calculate avg/max number of concurrent positions from trades
+            let (avg_n_stock, max_n_stock) =
+                self.calc_position_stats().map_err(to_py_err)?;
+            exprs.push(lit(avg_n_stock).alias("avgNStock"));
+            exprs.push(lit(max_n_stock).alias("maxNStock"));
+        }
+
+        // === RISK SECTION ===
+        if sections_list.contains(&"risk") {
+            exprs.push(col("drawdown").min().alias("maxDrawdown"));
+
+            let avg_dd = self.calc_avg_drawdown(&daily).map_err(to_py_err)?;
+            exprs.push(lit(avg_dd).alias("avgDrawdown"));
+
+            // Calculate avgDrawdownDays
+            let avg_dd_days = self.calc_avg_drawdown_days(&daily).map_err(to_py_err)?;
+            exprs.push(lit(avg_dd_days).alias("avgDrawdownDays"));
+
+            // VaR and CVaR (5% percentile of monthly returns)
+            let (var_5, cvar_5) =
+                self.calc_var_cvar(&monthly_with_return).map_err(to_py_err)?;
+            exprs.push(lit(var_5).alias("valueAtRisk"));
+            exprs.push(lit(cvar_5).alias("cvalueAtRisk"));
+        }
+
+        // === RATIO SECTION ===
+        if sections_list.contains(&"ratio") {
+            // Sharpe ratio
+            exprs.push(
+                (((col("return") - lit(rf_periodic)).mean())
+                    / (col("return") - lit(rf_periodic)).std(1)
+                    * lit(nperiods.sqrt()))
+                    .alias("sharpeRatio"),
+            );
+
+            // Sortino ratio
+            exprs.push(
+                (((col("return") - lit(rf_periodic)).mean())
+                    / when(col("return").lt(lit(rf_periodic)))
+                        .then(col("return") - lit(rf_periodic))
+                        .otherwise(lit(0.0))
+                        .std(1)
+                    * lit(nperiods.sqrt()))
+                    .alias("sortinoRatio"),
+            );
+
+            // Calmar ratio
+            exprs.push(
+                (((col("creturn").last() / col("creturn").first())
+                    .pow(lit(1.0) / ((col("date").last() - col("date").first())
+                        .dt().total_days(false).cast(DataType::Float64) / lit(365.25)))
+                    - lit(1.0))
+                    / (lit(0.0) - col("drawdown").min()))
+                    .alias("calmarRatio"),
+            );
+
+            // Volatility (annualized daily vol)
+            exprs.push(
+                (col("return").std(1) * lit(nperiods.sqrt())).alias("volatility"),
+            );
+
+            // Profit factor and tail ratio (pre-computed)
+            let profit_factor = self.calc_profit_factor()?;
+            let tail_ratio = self.calc_tail_ratio(&daily_with_return).map_err(to_py_err)?;
+            exprs.push(lit(profit_factor).alias("profitFactor"));
+            exprs.push(lit(tail_ratio).alias("tailRatio"));
+        }
+
+        // === WINRATE SECTION ===
+        if sections_list.contains(&"winrate") {
+            let win_ratio = self.calc_win_ratio()?;
+            let expectancy = self.calc_expectancy()?;
+            let (mae, mfe) = self.calc_mae_mfe()?;
+
+            exprs.push(lit(win_ratio).alias("winRate"));
+            exprs.push(lit(expectancy).alias("expectancy"));
+            exprs.push(lit(mae).alias("mae"));
+            exprs.push(lit(mfe).alias("mfe"));
+        }
+
+        if exprs.is_empty() {
+            return Err(PyValueError::new_err("No sections specified"));
+        }
+
+        let result = daily_with_return
+            .lazy()
+            .select(exprs)
+            .collect()
+            .map_err(to_py_err)?;
+
+        Ok(PyDataFrame(result))
+    }
 }
 
 // Helper methods (not exposed to Python)
@@ -489,5 +693,263 @@ impl PyBacktestReport {
         } else {
             Ok(winners / total)
         }
+    }
+
+    /// Calculate average drawdown days
+    fn calc_avg_drawdown_days(&self, daily: &DataFrame) -> PolarsResult<f64> {
+        let dd_df = daily
+            .clone()
+            .lazy()
+            .with_column(
+                (col("creturn") / col("creturn").cum_max(false) - lit(1.0))
+                    .alias("drawdown"),
+            )
+            .with_columns([
+                // Mark start of new drawdown period
+                when(
+                    col("drawdown").lt(lit(0.0))
+                        .and(col("drawdown").shift(lit(1)).fill_null(lit(0.0)).gt_eq(lit(0.0))),
+                )
+                .then(lit(1i32))
+                .otherwise(lit(0i32))
+                .cum_sum(false)
+                .alias("dd_period"),
+            ])
+            .filter(col("drawdown").lt(lit(0.0)))
+            .collect()?;
+
+        if dd_df.height() == 0 {
+            return Ok(0.0);
+        }
+
+        // Count days per drawdown period and average
+        let result = dd_df
+            .lazy()
+            .group_by([col("dd_period")])
+            .agg([col("drawdown").len().alias("length")])
+            .select([col("length").mean()])
+            .collect()?;
+
+        Ok(result
+            .column("length")
+            .ok()
+            .and_then(|c| c.f64().ok())
+            .and_then(|c| c.get(0))
+            .unwrap_or(0.0))
+    }
+
+    /// Calculate VaR and CVaR (5% percentile of monthly returns)
+    fn calc_var_cvar(&self, monthly: &DataFrame) -> PolarsResult<(f64, f64)> {
+        let return_col = monthly.column("return")?.f64()?;
+
+        // Calculate 5% quantile (VaR)
+        let var_5 = return_col.quantile(0.05, QuantileMethod::Linear)?
+            .unwrap_or(f64::NAN);
+
+        if var_5.is_nan() {
+            return Ok((f64::NAN, f64::NAN));
+        }
+
+        // CVaR = mean of returns below VaR
+        let cvar_df = monthly
+            .clone()
+            .lazy()
+            .filter(col("return").lt_eq(lit(var_5)))
+            .select([col("return").mean()])
+            .collect()?;
+
+        let cvar_5 = cvar_df
+            .column("return")
+            .ok()
+            .and_then(|c| c.f64().ok())
+            .and_then(|c| c.get(0))
+            .unwrap_or(f64::NAN);
+
+        Ok((var_5, cvar_5))
+    }
+
+    /// Calculate position statistics (avg and max concurrent positions) from trades
+    ///
+    /// For each date in creturn, count how many trades are active (entry <= date <= exit).
+    fn calc_position_stats(&self) -> PolarsResult<(f64, i64)> {
+        let trades = &self.trades_df;
+
+        if trades.height() == 0 {
+            return Ok((0.0, 0));
+        }
+
+        // Check if we have the required columns
+        if trades.column("entry_date").is_err() || trades.column("exit_date").is_err() {
+            return Ok((0.0, 0));
+        }
+
+        // Get creturn dates as i32 (days since epoch)
+        let creturn_dates = self.creturn_df.column("date")?.date()?;
+        let last_date = creturn_dates.physical().get(creturn_dates.len() - 1).unwrap_or(0);
+
+        // Get entry/exit dates as Date type
+        let entry_col = trades.column("entry_date")?.date()?;
+        let exit_col = trades.column("exit_date")?.date()?;
+
+        // Build trade ranges: (entry, exit) as days since epoch
+        let n_trades = trades.height();
+        let mut trade_ranges: Vec<(i32, i32)> = Vec::with_capacity(n_trades);
+
+        for i in 0..n_trades {
+            if let Some(entry) = entry_col.physical().get(i) {
+                let exit = exit_col.physical().get(i).unwrap_or(last_date);
+                trade_ranges.push((entry, exit));
+            }
+        }
+
+        if trade_ranges.is_empty() {
+            return Ok((0.0, 0));
+        }
+
+        // Count active positions for each date
+        let mut sum = 0i64;
+        let mut max = 0i64;
+        let n_dates = creturn_dates.len();
+
+        for i in 0..n_dates {
+            if let Some(date) = creturn_dates.physical().get(i) {
+                let count = trade_ranges
+                    .iter()
+                    .filter(|(entry, exit)| *entry <= date && date <= *exit)
+                    .count() as i64;
+                sum += count;
+                if count > max {
+                    max = count;
+                }
+            }
+        }
+
+        let avg = if n_dates > 0 { sum as f64 / n_dates as f64 } else { 0.0 };
+        Ok((avg, max))
+    }
+
+    /// Calculate profit factor (sum of positive returns / abs(sum of negative returns))
+    fn calc_profit_factor(&self) -> PyResult<f64> {
+        let trades = &self.trades_df;
+
+        let sums = trades
+            .clone()
+            .lazy()
+            .filter(col("return").is_not_null().and(col("return").is_not_nan()))
+            .select([
+                col("return")
+                    .filter(col("return").gt(lit(0.0)))
+                    .sum()
+                    .alias("pos_sum"),
+                col("return")
+                    .filter(col("return").lt(lit(0.0)))
+                    .sum()
+                    .alias("neg_sum"),
+            ])
+            .collect()
+            .map_err(to_py_err)?;
+
+        let pos_sum = sums
+            .column("pos_sum")
+            .ok()
+            .and_then(|c| c.f64().ok())
+            .and_then(|c| c.get(0))
+            .unwrap_or(0.0);
+
+        let neg_sum = sums
+            .column("neg_sum")
+            .ok()
+            .and_then(|c| c.f64().ok())
+            .and_then(|c| c.get(0))
+            .unwrap_or(0.0);
+
+        if neg_sum == 0.0 || neg_sum.is_nan() {
+            Ok(f64::INFINITY)
+        } else {
+            Ok((pos_sum / neg_sum).abs())
+        }
+    }
+
+    /// Calculate tail ratio (95th percentile / 5th percentile of daily returns)
+    fn calc_tail_ratio(&self, daily_with_return: &DataFrame) -> PolarsResult<f64> {
+        let return_col = daily_with_return.column("return")?.f64()?;
+
+        let p95 = return_col.quantile(0.95, QuantileMethod::Linear)?
+            .unwrap_or(f64::NAN);
+        let p05 = return_col.quantile(0.05, QuantileMethod::Linear)?
+            .unwrap_or(f64::NAN);
+
+        if p05 == 0.0 || p05.is_nan() || p95.is_nan() {
+            Ok(f64::INFINITY)
+        } else {
+            Ok((p95 / p05).abs())
+        }
+    }
+
+    /// Calculate expectancy (mean of trade returns)
+    fn calc_expectancy(&self) -> PyResult<f64> {
+        let trades = &self.trades_df;
+
+        let result = trades
+            .clone()
+            .lazy()
+            .filter(col("return").is_not_null().and(col("return").is_not_nan()))
+            .select([col("return").mean()])
+            .collect()
+            .map_err(to_py_err)?;
+
+        Ok(result
+            .column("return")
+            .ok()
+            .and_then(|c| c.f64().ok())
+            .and_then(|c| c.get(0))
+            .unwrap_or(f64::NAN))
+    }
+
+    /// Calculate MAE and MFE means
+    fn calc_mae_mfe(&self) -> PyResult<(f64, f64)> {
+        let trades = &self.trades_df;
+
+        // Check if columns exist
+        let has_mae = trades.column("mae").is_ok();
+        let has_gmfe = trades.column("gmfe").is_ok();
+
+        let mae = if has_mae {
+            let result = trades
+                .clone()
+                .lazy()
+                .select([col("mae").mean()])
+                .collect()
+                .map_err(to_py_err)?;
+
+            result
+                .column("mae")
+                .ok()
+                .and_then(|c| c.f64().ok())
+                .and_then(|c| c.get(0))
+                .unwrap_or(f64::NAN)
+        } else {
+            f64::NAN
+        };
+
+        let mfe = if has_gmfe {
+            let result = trades
+                .clone()
+                .lazy()
+                .select([col("gmfe").mean()])
+                .collect()
+                .map_err(to_py_err)?;
+
+            result
+                .column("gmfe")
+                .ok()
+                .and_then(|c| c.f64().ok())
+                .and_then(|c| c.get(0))
+                .unwrap_or(f64::NAN)
+        } else {
+            f64::NAN
+        };
+
+        Ok((mae, mfe))
     }
 }
