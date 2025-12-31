@@ -17,6 +17,9 @@
 
 mod expressions;
 mod ffi_convert;
+mod report;
+
+pub use report::PyBacktestReport;
 
 /// Check if profiling is enabled via environment variable
 fn is_profile_enabled() -> bool {
@@ -420,35 +423,7 @@ fn trades_to_dataframe(trades: &[TradeRecord]) -> PolarsResult<DataFrame> {
     ])
 }
 
-/// Python wrapper for backtest report with trades as DataFrame
-#[pyclass(name = "BacktestReport")]
-#[derive(Clone)]
-pub struct PyBacktestReport {
-    creturn_df: DataFrame,
-    trades_df: DataFrame,
-}
-
-#[pymethods]
-impl PyBacktestReport {
-    /// Get cumulative returns as a Polars DataFrame with date column
-    #[getter]
-    fn creturn(&self) -> PyDataFrame {
-        PyDataFrame(self.creturn_df.clone())
-    }
-
-    /// Get trades as a Polars DataFrame
-    #[getter]
-    fn trades(&self) -> PyDataFrame {
-        PyDataFrame(self.trades_df.clone())
-    }
-
-    fn __repr__(&self) -> String {
-        format!(
-            "BacktestReport(creturn_len={}, trades_count={})",
-            self.creturn_df.height(), self.trades_df.height(),
-        )
-    }
-}
+// PyBacktestReport is now defined in report.rs
 
 // =============================================================================
 // Main API: Long Format Backtest (zero-copy)
@@ -1104,10 +1079,12 @@ fn backtest_with_report(
 
     profile!("[PROFILE] backtest_with_report: {} rows, {} trades", n_rows, result.trades.len());
 
-    Ok(PyBacktestReport {
+    Ok(PyBacktestReport::new(
         creturn_df,
         trades_df,
-    })
+        cfg,
+        resample.map(|s| s.to_string()),
+    ))
 }
 
 // =============================================================================

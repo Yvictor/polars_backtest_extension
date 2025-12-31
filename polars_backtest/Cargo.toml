@@ -14,12 +14,28 @@ crate-type = ["cdylib"]
 
 [dependencies]
 btcore = { path = "../btcore" }
-polars.workspace = true
-polars-ops.workspace = true
-polars-arrow.workspace = true
+# polars with features needed for this crate
+# lazy + timezones: fix polars 0.52 compile bugs with pyo3-polars
+# new_streaming: required for lazy collect operations
+polars = { version = "0.52", default-features = false, features = [
+    "lazy",
+    "timezones",
+    "temporal",
+    "pivot",
+    "cum_agg",
+    "dtype-date",
+    "dtype-datetime",
+    "dtype-struct",
+    "rows",
+    "new_streaming"
+] }
+# polars-lazy with python feature to fix PythonScan compile error
+polars-lazy = { version = "0.52", default-features = false, features = ["python"] }
+polars-ops = { version = "0.52", default-features = false, features = ["pivot"] }
+polars-arrow = "0.52"
 arrow.workspace = true
-pyo3.workspace = true
-pyo3-polars.workspace = true
+pyo3 = { version = "0.26" }
+pyo3-polars = { version = "0.25", features = ["derive"] }
 chrono.workspace = true
 serde.workspace = true
 rayon.workspace = true

@@ -590,8 +590,14 @@ class Report:
         )
 
     def _calc_win_ratio(self) -> float:
-        """Calculate win ratio from trades."""
-        trades = self.trades.drop_nulls(subset=["return"])
+        """Calculate win ratio from trades.
+
+        Note: NaN values are filtered out because NaN > 0 returns True in Polars,
+        which would incorrectly count NaN as winners.
+        """
+        trades = self.trades.filter(
+            pl.col("return").is_not_null() & ~pl.col("return").is_nan()
+        )
         if trades.height == 0:
             return 0.0
         return trades.select(
