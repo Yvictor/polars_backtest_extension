@@ -13,6 +13,8 @@
 use std::collections::HashMap;
 use std::hash::Hash;
 
+use crate::mae_mfe::calculate_mae_mfe_at_exit;
+
 // ============================================================================
 // Trade Records
 // ============================================================================
@@ -42,6 +44,20 @@ pub struct WideTradeRecord {
     pub exit_price: Option<f64>,
     /// Trade return (calculated using original prices with fees)
     pub trade_return: Option<f64>,
+
+    // MAE/MFE metrics (calculated at exit)
+    /// Maximum Adverse Excursion (max loss during trade, negative)
+    pub mae: Option<f64>,
+    /// Global Maximum Favorable Excursion (max profit during trade)
+    pub gmfe: Option<f64>,
+    /// Before-MAE MFE (MFE at the time when MAE occurred)
+    pub bmfe: Option<f64>,
+    /// Maximum drawdown during the trade
+    pub mdd: Option<f64>,
+    /// Number of profitable days
+    pub pdays: Option<u32>,
+    /// Holding period in days
+    pub period: Option<u32>,
 }
 
 impl WideTradeRecord {
@@ -89,6 +105,20 @@ pub struct TradeRecord {
     pub exit_price: Option<f64>,
     /// Trade return (calculated using original prices with fees)
     pub trade_return: Option<f64>,
+
+    // MAE/MFE metrics (calculated at exit)
+    /// Maximum Adverse Excursion (max loss during trade, negative)
+    pub mae: Option<f64>,
+    /// Global Maximum Favorable Excursion (max profit during trade)
+    pub gmfe: Option<f64>,
+    /// Before-MAE MFE (MFE at the time when MAE occurred)
+    pub bmfe: Option<f64>,
+    /// Maximum drawdown during the trade
+    pub mdd: Option<f64>,
+    /// Number of profitable days
+    pub pdays: Option<u32>,
+    /// Holding period in days
+    pub period: Option<i32>,
 }
 
 impl TradeRecord {
@@ -183,6 +213,10 @@ pub trait TradeTracker {
     /// Add a pending entry (signal given but not yet executed)
     fn add_pending_entry(&mut self, key: Self::Key, signal_date: Self::Date, weight: f64);
 
+    /// Record a price for MAE/MFE calculation
+    /// Call this each day while a position is open
+    fn record_price(&mut self, key: &Self::Key, close_price: f64, trade_price: f64);
+
     /// Finalize all open trades at the end of simulation
     fn finalize(self, fee_ratio: f64, tax_ratio: f64) -> Vec<Self::Record>;
 }
@@ -244,6 +278,9 @@ where
     fn add_pending_entry(&mut self, _: Self::Key, _: Self::Date, _: f64) {}
 
     #[inline]
+    fn record_price(&mut self, _: &Self::Key, _: f64, _: f64) {}
+
+    #[inline]
     fn finalize(self, _: f64, _: f64) -> Vec<Self::Record> {
         vec![]
     }
@@ -265,6 +302,10 @@ struct OpenTradeInfo<K: Clone, D: Copy> {
     signal_date: D,
     weight: f64,
     entry_price: f64,
+    /// Close prices during the trade (for MAE/MFE calculation)
+    close_prices: Vec<f64>,
+    /// Trade prices during the trade (for MAE/MFE calculation)
+    trade_prices: Vec<f64>,
 }
 
 /// Trait for building trade records from generic open trade info
@@ -272,7 +313,7 @@ pub trait RecordBuilder: Sized {
     type Key: Clone + Eq + Hash;
     type Date: Copy;
 
-    /// Build a completed trade record
+    /// Build a completed trade record (without MAE/MFE calculation)
     fn build_completed(
         key: Self::Key,
         entry_date: Self::Date,
@@ -284,6 +325,22 @@ pub trait RecordBuilder: Sized {
         exit_price: f64,
         fee_ratio: f64,
         tax_ratio: f64,
+    ) -> Self;
+
+    /// Build a completed trade record with MAE/MFE calculation
+    fn build_completed_with_mae_mfe(
+        key: Self::Key,
+        entry_date: Self::Date,
+        exit_date: Self::Date,
+        signal_date: Self::Date,
+        exit_sig_date: Option<Self::Date>,
+        weight: f64,
+        entry_price: f64,
+        exit_price: f64,
+        fee_ratio: f64,
+        tax_ratio: f64,
+        close_prices: &[f64],
+        trade_prices: &[f64],
     ) -> Self;
 
     /// Build a pending entry record (signal given but not executed)
@@ -325,6 +382,64 @@ impl RecordBuilder for WideTradeRecord {
             entry_price,
             exit_price: Some(exit_price),
             trade_return: None,
+            mae: None,
+            gmfe: None,
+            bmfe: None,
+            mdd: None,
+            pdays: None,
+            period: Some((exit_date - entry_date) as u32),
+        };
+        Self {
+            trade_return: trade.calculate_return(fee_ratio, tax_ratio),
+            ..trade
+        }
+    }
+
+    fn build_completed_with_mae_mfe(
+        key: usize,
+        entry_date: usize,
+        exit_date: usize,
+        signal_date: usize,
+        exit_sig_date: Option<usize>,
+        weight: f64,
+        entry_price: f64,
+        exit_price: f64,
+        fee_ratio: f64,
+        tax_ratio: f64,
+        close_prices: &[f64],
+        trade_prices: &[f64],
+    ) -> Self {
+        // Calculate MAE/MFE metrics
+        let is_long = weight >= 0.0;
+        let exit_idx = close_prices.len().saturating_sub(1);
+        let metrics = calculate_mae_mfe_at_exit(
+            close_prices,
+            trade_prices,
+            0,         // entry is at index 0 in our collected prices
+            exit_idx,  // exit is at the last index
+            is_long,
+            true,  // has_entry_transaction
+            true,  // has_exit_transaction
+            fee_ratio,
+            tax_ratio,
+        );
+
+        let trade = Self {
+            stock_id: key,
+            entry_index: Some(entry_date),
+            exit_index: Some(exit_date),
+            entry_sig_index: signal_date,
+            exit_sig_index: exit_sig_date,
+            position_weight: weight,
+            entry_price,
+            exit_price: Some(exit_price),
+            trade_return: None,
+            mae: Some(metrics.mae),
+            gmfe: Some(metrics.gmfe),
+            bmfe: Some(metrics.bmfe),
+            mdd: Some(metrics.mdd),
+            pdays: Some(metrics.pdays),
+            period: Some((exit_date - entry_date) as u32),
         };
         Self {
             trade_return: trade.calculate_return(fee_ratio, tax_ratio),
@@ -343,6 +458,12 @@ impl RecordBuilder for WideTradeRecord {
             entry_price: f64::NAN,
             exit_price: None,
             trade_return: None,
+            mae: None,
+            gmfe: None,
+            bmfe: None,
+            mdd: None,
+            pdays: None,
+            period: None,
         }
     }
 
@@ -363,6 +484,12 @@ impl RecordBuilder for WideTradeRecord {
             entry_price,
             exit_price: None,
             trade_return: None,
+            mae: None,
+            gmfe: None,
+            bmfe: None,
+            mdd: None,
+            pdays: None,
+            period: None,
         }
     }
 }
@@ -393,6 +520,64 @@ impl RecordBuilder for TradeRecord {
             entry_price,
             exit_price: Some(exit_price),
             trade_return: None,
+            mae: None,
+            gmfe: None,
+            bmfe: None,
+            mdd: None,
+            pdays: None,
+            period: Some(exit_date - entry_date),
+        };
+        Self {
+            trade_return: trade.calculate_return(fee_ratio, tax_ratio),
+            ..trade
+        }
+    }
+
+    fn build_completed_with_mae_mfe(
+        key: String,
+        entry_date: i32,
+        exit_date: i32,
+        signal_date: i32,
+        exit_sig_date: Option<i32>,
+        weight: f64,
+        entry_price: f64,
+        exit_price: f64,
+        fee_ratio: f64,
+        tax_ratio: f64,
+        close_prices: &[f64],
+        trade_prices: &[f64],
+    ) -> Self {
+        // Calculate MAE/MFE metrics
+        let is_long = weight >= 0.0;
+        let exit_idx = close_prices.len().saturating_sub(1);
+        let metrics = calculate_mae_mfe_at_exit(
+            close_prices,
+            trade_prices,
+            0,         // entry is at index 0 in our collected prices
+            exit_idx,  // exit is at the last index
+            is_long,
+            true,  // has_entry_transaction
+            true,  // has_exit_transaction
+            fee_ratio,
+            tax_ratio,
+        );
+
+        let trade = Self {
+            symbol: key,
+            entry_date: Some(entry_date),
+            exit_date: Some(exit_date),
+            entry_sig_date: signal_date,
+            exit_sig_date,
+            position_weight: weight,
+            entry_price,
+            exit_price: Some(exit_price),
+            trade_return: None,
+            mae: Some(metrics.mae),
+            gmfe: Some(metrics.gmfe),
+            bmfe: Some(metrics.bmfe),
+            mdd: Some(metrics.mdd),
+            pdays: Some(metrics.pdays),
+            period: Some(exit_date - entry_date),
         };
         Self {
             trade_return: trade.calculate_return(fee_ratio, tax_ratio),
@@ -411,6 +596,12 @@ impl RecordBuilder for TradeRecord {
             entry_price: f64::NAN,
             exit_price: None,
             trade_return: None,
+            mae: None,
+            gmfe: None,
+            bmfe: None,
+            mdd: None,
+            pdays: None,
+            period: None,
         }
     }
 
@@ -431,6 +622,12 @@ impl RecordBuilder for TradeRecord {
             entry_price,
             exit_price: None,
             trade_return: None,
+            mae: None,
+            gmfe: None,
+            bmfe: None,
+            mdd: None,
+            pdays: None,
+            period: None,
         }
     }
 }
@@ -461,6 +658,7 @@ impl<R: RecordBuilder> TradeTracker for GenericTracker<R> {
         entry_price: f64,
         weight: f64,
     ) {
+        // Initialize with the entry price as first price point
         self.open_trades.insert(
             key.clone(),
             OpenTradeInfo {
@@ -469,6 +667,8 @@ impl<R: RecordBuilder> TradeTracker for GenericTracker<R> {
                 signal_date,
                 weight,
                 entry_price,
+                close_prices: vec![entry_price],
+                trade_prices: vec![entry_price],
             },
         );
     }
@@ -483,18 +683,37 @@ impl<R: RecordBuilder> TradeTracker for GenericTracker<R> {
         tax_ratio: f64,
     ) {
         if let Some(open_trade) = self.open_trades.remove(key) {
-            self.completed_trades.push(R::build_completed(
-                open_trade.key,
-                open_trade.entry_date,
-                exit_date,
-                open_trade.signal_date,
-                exit_sig_date,
-                open_trade.weight,
-                open_trade.entry_price,
-                exit_price,
-                fee_ratio,
-                tax_ratio,
-            ));
+            // Use MAE/MFE calculation if we have price history (more than just entry price)
+            if open_trade.close_prices.len() > 1 {
+                self.completed_trades.push(R::build_completed_with_mae_mfe(
+                    open_trade.key,
+                    open_trade.entry_date,
+                    exit_date,
+                    open_trade.signal_date,
+                    exit_sig_date,
+                    open_trade.weight,
+                    open_trade.entry_price,
+                    exit_price,
+                    fee_ratio,
+                    tax_ratio,
+                    &open_trade.close_prices,
+                    &open_trade.trade_prices,
+                ));
+            } else {
+                // No price history - skip MAE/MFE calculation
+                self.completed_trades.push(R::build_completed(
+                    open_trade.key,
+                    open_trade.entry_date,
+                    exit_date,
+                    open_trade.signal_date,
+                    exit_sig_date,
+                    open_trade.weight,
+                    open_trade.entry_price,
+                    exit_price,
+                    fee_ratio,
+                    tax_ratio,
+                ));
+            }
         }
     }
 
@@ -505,6 +724,13 @@ impl<R: RecordBuilder> TradeTracker for GenericTracker<R> {
     fn add_pending_entry(&mut self, key: Self::Key, signal_date: Self::Date, weight: f64) {
         self.completed_trades
             .push(R::build_pending(key, signal_date, weight));
+    }
+
+    fn record_price(&mut self, key: &Self::Key, close_price: f64, trade_price: f64) {
+        if let Some(trade) = self.open_trades.get_mut(key) {
+            trade.close_prices.push(close_price);
+            trade.trade_prices.push(trade_price);
+        }
     }
 
     fn finalize(mut self, _fee_ratio: f64, _tax_ratio: f64) -> Vec<R> {
@@ -542,6 +768,12 @@ mod tests {
             entry_price: 100.0,
             exit_price: Some(110.0),
             trade_return: None,
+            mae: None,
+            gmfe: None,
+            bmfe: None,
+            mdd: None,
+            pdays: None,
+            period: Some(10),
         };
         assert_eq!(trade.holding_period(), Some(10));
     }
@@ -558,6 +790,12 @@ mod tests {
             entry_price: 100.0,
             exit_price: Some(110.0),
             trade_return: None,
+            mae: None,
+            gmfe: None,
+            bmfe: None,
+            mdd: None,
+            pdays: None,
+            period: Some(10),
         };
 
         let ret = trade.calculate_return(0.001425, 0.003).unwrap();
@@ -645,6 +883,12 @@ mod tests {
             entry_price: 100.0,
             exit_price: Some(110.0),
             trade_return: None,
+            mae: None,
+            gmfe: None,
+            bmfe: None,
+            mdd: None,
+            pdays: None,
+            period: Some(10),
         };
         assert_eq!(trade.holding_days(), Some(10));
     }

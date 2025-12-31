@@ -11,6 +11,7 @@
 
 // Import from refactored modules
 use crate::config::BacktestConfig;
+use crate::mae_mfe::calculate_mae_mfe_at_exit;
 use crate::portfolio::PortfolioState;
 use crate::position::{Position, PositionSnapshot};
 use crate::stops::{detect_stops, detect_stops_finlab, detect_touched_exit};
@@ -966,7 +967,43 @@ pub fn run_backtest_with_trades<S: IntoWeights>(
     );
 
     // Finalize trades (close any remaining open positions)
-    let trades = tracker.finalize(config.fee_ratio, config.tax_ratio);
+    let mut trades = tracker.finalize(config.fee_ratio, config.tax_ratio);
+
+    // Calculate MAE/MFE for completed trades
+    let n_times = prices.close.len();
+    let n_assets = if n_times > 0 { prices.close[0].len() } else { 0 };
+
+    for trade in trades.iter_mut() {
+        if let (Some(entry_idx), Some(exit_idx)) = (trade.entry_index, trade.exit_index) {
+            let stock_id = trade.stock_id;
+            if stock_id < n_assets {
+                // Extract per-stock price series
+                let close_series: Vec<f64> = prices.close.iter().map(|row| row[stock_id]).collect();
+                let trade_series: Vec<f64> = prices.trade.iter().map(|row| row[stock_id]).collect();
+
+                // Calculate MAE/MFE at exit
+                // For Wide format, position weight > 0 means long
+                let is_long = trade.position_weight > 0.0;
+                let metrics = calculate_mae_mfe_at_exit(
+                    &close_series,
+                    &trade_series,
+                    entry_idx,
+                    exit_idx,
+                    is_long,
+                    true,  // has_entry_transaction
+                    true,  // has_exit_transaction
+                    config.fee_ratio,
+                    config.tax_ratio,
+                );
+
+                trade.mae = Some(metrics.mae);
+                trade.gmfe = Some(metrics.gmfe);
+                trade.bmfe = Some(metrics.bmfe);
+                trade.mdd = Some(metrics.mdd);
+                trade.pdays = Some(metrics.pdays);
+            }
+        }
+    }
 
     WideBacktestResult { creturn, trades }
 }
@@ -1510,5 +1547,65 @@ mod tests {
         assert!((creturn[3] - 1.10).abs() < 0.01, "Day 3 should be ~1.10, got {}", creturn[3]);
         // Day 4: In stock 1, gains from 100 to 110 = +10% on 1.10 = 1.21
         assert!((creturn[4] - 1.21).abs() < 0.01, "Day 4: Expected ~1.21, got {}", creturn[4]);
+    }
+
+    #[test]
+    fn test_mae_mfe_calculation() {
+        // Test MAE/MFE metrics calculation in trades
+        // Stock price goes: 100 -> 95 -> 105 -> 110
+        // Entry at 100 (T+1), experiences 5% drawdown then 10% profit
+        let prices = vec![
+            vec![100.0],  // Day 0: signal
+            vec![100.0],  // Day 1: entry at close
+            vec![95.0],   // Day 2: -5% from entry (MAE point)
+            vec![105.0],  // Day 3: +5%
+            vec![110.0],  // Day 4: exit at +10% (via rebalance)
+        ];
+
+        let signals = vec![
+            vec![true],   // Day 0: enter
+            vec![false],  // Day 3: exit signal (executed Day 4)
+        ];
+        let rebalance_indices = vec![0, 3];
+
+        let config = BacktestConfig {
+            fee_ratio: 0.0,
+            tax_ratio: 0.0,
+            ..Default::default()
+        };
+
+        let price_data = PriceData {
+            close: &prices,
+            trade: &prices,
+            open: None,
+            high: None,
+            low: None,
+        };
+
+        let result = run_backtest_with_trades(&price_data, &signals, &rebalance_indices, &config);
+
+        // Should have 1 completed trade
+        let completed: Vec<_> = result.trades.iter()
+            .filter(|t| t.entry_index.is_some() && t.exit_index.is_some())
+            .collect();
+        assert_eq!(completed.len(), 1, "Should have 1 completed trade");
+
+        let trade = &completed[0];
+
+        // Verify MAE/MFE are calculated
+        assert!(trade.mae.is_some(), "MAE should be calculated");
+        assert!(trade.gmfe.is_some(), "GMFE should be calculated");
+        assert!(trade.mdd.is_some(), "MDD should be calculated");
+        assert!(trade.pdays.is_some(), "pdays should be calculated");
+
+        // MAE should be negative (the -5% drop)
+        let mae = trade.mae.unwrap();
+        assert!(mae < 0.0, "MAE should be negative, got {}", mae);
+        assert!((mae - (-0.05)).abs() < 0.01, "MAE should be around -0.05, got {}", mae);
+
+        // GMFE should be positive (the +10% peak)
+        let gmfe = trade.gmfe.unwrap();
+        assert!(gmfe > 0.0, "GMFE should be positive, got {}", gmfe);
+        assert!(gmfe > 0.05, "GMFE should be at least 0.05, got {}", gmfe);
     }
 }
