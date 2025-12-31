@@ -251,11 +251,23 @@ Phase 2c - Liquidity 相關 (略過，等 long format):
 **Dependencies**: None
 
 **Tests**:
-- [ ] `current_trades` filters correctly
-- [ ] `position_info()` returns expected format
-- [ ] `is_stop_triggered()` detects SL/TP trades
+- [x] `current_trades` filters correctly
+- [x] `position_info()` returns expected format
+- [x] `is_stop_triggered()` detects SL/TP trades
 
-**Status**: Not Started
+**Status**: ✅ Complete
+
+**Implemented**:
+- `weights` (cached_property) - Current position weights as DataFrame (stock_id, weight, date)
+- `next_weights` (cached_property) - Returns None (not available in wide format)
+- `current_trades` (cached_property) - Active trades without exit or exiting on last date
+- `actions` (cached_property) - Trade actions (enter/exit/hold) for each stock
+- `position_info()` - DataFrame with current position details
+- `position_info2()` - Dict with positions list and positionConfig for API/dashboard
+- `is_rebalance_due()` - Check if last position differs from previous
+- `is_stop_triggered()` - Check if any trade hit SL/TP
+
+**Tests**: tests/test_position_info.py (23 tests)
 
 ---
 

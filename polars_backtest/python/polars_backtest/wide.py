@@ -963,6 +963,224 @@ class Report:
 
         return daily_with_return.select(exprs)
 
+    # =========================================================================
+    # Stage 4: Position Information
+    # =========================================================================
+
+    @cached_property
+    def weights(self) -> pl.DataFrame:
+        """Current position weights (last row of position DataFrame).
+
+        Returns:
+            Single-row DataFrame with stock_id and weight columns.
+        """
+        position = self._position
+        date_col = position.columns[0]
+        stock_cols = [c for c in position.columns if c != date_col]
+
+        last_row = position.tail(1)
+        last_date = last_row[date_col][0]
+
+        # Unpivot to get stock_id -> weight pairs
+        return (
+            last_row
+            .unpivot(
+                index=date_col,
+                on=stock_cols,
+                variable_name="stock_id",
+                value_name="weight",
+            )
+            .filter(pl.col("weight").abs() > 0)
+            .select("stock_id", "weight")
+            .with_columns(pl.lit(last_date).alias("date"))
+        )
+
+    @cached_property
+    def next_weights(self) -> pl.DataFrame | None:
+        """Next period weights (not available in wide format backtest).
+
+        Returns:
+            None - would require future position data.
+        """
+        return None
+
+    @cached_property
+    def current_trades(self) -> pl.DataFrame:
+        """Active trades (positions without exit or exiting on last date).
+
+        Returns:
+            DataFrame with current/active trade records.
+        """
+        trades = self.trades
+        if trades.height == 0:
+            return trades
+
+        # Get last date from creturn
+        last_date = self.creturn.select(pl.col("date").last()).item()
+        last_date_str = str(last_date)[:10] if last_date else None
+
+        # Filter: no exit_date OR exit_date is today
+        return trades.filter(
+            pl.col("exit_date").is_null() |
+            (pl.col("exit_date").cast(pl.Utf8).str.slice(0, 10) == last_date_str)
+        )
+
+    @cached_property
+    def actions(self) -> pl.DataFrame:
+        """Trade actions for current positions (enter/exit/hold).
+
+        Returns:
+            DataFrame with stock_id and action columns.
+        """
+        trades = self.trades
+        if trades.height == 0:
+            return pl.DataFrame({"stock_id": [], "action": []})
+
+        last_date = self.creturn.select(pl.col("date").last()).item()
+        last_date_str = str(last_date)[:10] if last_date else None
+
+        # Determine action for each trade
+        return trades.select(
+            pl.col("stock_id"),
+            pl.when(
+                pl.col("entry_date").cast(pl.Utf8).str.slice(0, 10) == last_date_str
+            ).then(pl.lit("enter"))
+            .when(
+                pl.col("exit_date").cast(pl.Utf8).str.slice(0, 10) == last_date_str
+            ).then(pl.lit("exit"))
+            .when(
+                pl.col("exit_date").is_null()
+            ).then(pl.lit("hold"))
+            .otherwise(pl.lit("closed"))
+            .alias("action"),
+        ).filter(pl.col("action") != "closed")
+
+    def position_info(self) -> pl.DataFrame:
+        """Get position information for API/dashboard.
+
+        Returns:
+            DataFrame with current position details including:
+            - stock_id, weight, entry_date, return, action
+        """
+        current = self.current_trades
+        weights = self.weights
+
+        if current.height == 0:
+            return pl.DataFrame({
+                "stock_id": [],
+                "weight": [],
+                "entry_date": [],
+                "exit_date": [],
+                "return": [],
+                "action": [],
+            })
+
+        # Join with weights to get current weight
+        result = (
+            current
+            .join(weights.select("stock_id", "weight"), on="stock_id", how="left")
+            .join(self.actions, on="stock_id", how="left")
+            .select(
+                "stock_id",
+                pl.col("weight").fill_null(0.0),
+                "entry_date",
+                "exit_date",
+                pl.col("return").fill_null(0.0),
+                pl.col("action").fill_null("hold"),
+            )
+        )
+        return result
+
+    def position_info2(self) -> dict:
+        """Get detailed position information for dashboard.
+
+        Returns:
+            Dict with positions list and positionConfig.
+        """
+        pos_info = self.position_info()
+        positions = pos_info.to_dicts() if pos_info.height > 0 else []
+
+        # Convert dates to ISO strings
+        for p in positions:
+            if p.get("entry_date"):
+                p["entry_date"] = str(p["entry_date"])[:10]
+            if p.get("exit_date"):
+                p["exit_date"] = str(p["exit_date"])[:10]
+
+        # Get last date from creturn
+        last_date = self.creturn.select(pl.col("date").last()).item()
+        last_date_str = str(last_date)[:10] if last_date else None
+
+        # Get weights date
+        weights_date = None
+        if self.weights.height > 0 and "date" in self.weights.columns:
+            weights_date = str(self.weights["date"][0])[:10]
+
+        return {
+            "positions": positions,
+            "positionConfig": {
+                "feeRatio": self.fee_ratio,
+                "taxRatio": self.tax_ratio,
+                "resample": self.resample,
+                "tradeAt": self.trade_at,
+                "stopLoss": self.stop_loss,
+                "takeProfit": self.take_profit,
+                "trailStop": self.trail_stop,
+                "currentRebalanceDate": weights_date,
+                "lastDate": last_date_str,
+            },
+        }
+
+    def is_rebalance_due(self) -> bool:
+        """Check if rebalance is due based on position changes.
+
+        Returns:
+            True if the last position differs from the previous position.
+        """
+        position = self._position
+        if position.height < 2:
+            return False
+
+        date_col = position.columns[0]
+        stock_cols = [c for c in position.columns if c != date_col]
+
+        # Compare last two rows
+        last_two = position.tail(2).select(stock_cols)
+        return any(
+            last_two[c][1] != last_two[c][0]
+            for c in stock_cols
+        )
+
+    def is_stop_triggered(self) -> bool:
+        """Check if any trade was triggered by stop loss or take profit.
+
+        Returns:
+            True if any current trade hit SL/TP.
+        """
+        current = self.current_trades
+        if current.height == 0:
+            return False
+
+        # Check if any trade has exit with return matching SL/TP thresholds
+        # SL: return <= -stop_loss, TP: return >= take_profit
+        if self.stop_loss is not None and self.stop_loss < 1.0:
+            sl_triggered = current.filter(
+                pl.col("return").is_not_null() &
+                (pl.col("return") <= -self.stop_loss)
+            ).height > 0
+            if sl_triggered:
+                return True
+
+        if self.take_profit is not None and self.take_profit < float("inf"):
+            tp_triggered = current.filter(
+                pl.col("return").is_not_null() &
+                (pl.col("return") >= self.take_profit)
+            ).height > 0
+            if tp_triggered:
+                return True
+
+        return False
+
 
 def backtest_with_report_wide(
     close: pl.DataFrame,
