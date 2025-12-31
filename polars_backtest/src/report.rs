@@ -792,12 +792,13 @@ impl PyBacktestReport {
         let exit_col = trades.column("exit_date")?.date()?;
 
         // Build trade ranges: (entry, exit) as days since epoch
+        // For null exit (open positions), use last_date + 1 so they're counted on last_date
         let n_trades = trades.height();
         let mut trade_ranges: Vec<(i32, i32)> = Vec::with_capacity(n_trades);
 
         for i in 0..n_trades {
             if let Some(entry) = entry_col.physical().get(i) {
-                let exit = exit_col.physical().get(i).unwrap_or(last_date);
+                let exit = exit_col.physical().get(i).unwrap_or(last_date + 1);
                 trade_ranges.push((entry, exit));
             }
         }
@@ -807,6 +808,8 @@ impl PyBacktestReport {
         }
 
         // Count active positions for each date
+        // Active means: entry_date <= date < exit_date
+        // (exit_date is the day position is closed at close, so not counted)
         let mut sum = 0i64;
         let mut max = 0i64;
         let n_dates = creturn_dates.len();
@@ -815,7 +818,7 @@ impl PyBacktestReport {
             if let Some(date) = creturn_dates.physical().get(i) {
                 let count = trade_ranges
                     .iter()
-                    .filter(|(entry, exit)| *entry <= date && date <= *exit)
+                    .filter(|(entry, exit)| *entry <= date && date < *exit)
                     .count() as i64;
                 sum += count;
                 if count > max {
