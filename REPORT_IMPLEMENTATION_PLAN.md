@@ -153,19 +153,15 @@ Phase 2a - 核心指標 (可立即實作):
    - `expectancy` - mean trade return
    - `mae`, `mfe` - mean from trades DataFrame
 
-Phase 2b - Benchmark 相關 (用戶傳入 benchmark):
-1. Add `benchmark` parameter to `get_metrics()` and Report class
-2. Implement:
-   - `alpha` - Jensen's alpha (strategy return - expected return based on beta)
-   - `beta` - covariance(strategy, benchmark) / variance(benchmark)
-   - `m12WinRate` - 12-month rolling win rate vs benchmark
+Phase 2b - Benchmark 相關 (略過，等 long format):
+- Benchmark 應在資料層傳入（如 DataFrame 包含 0050 欄位）
+- Wide format 不方便處理，等 long format 再實作
+- 待實作: alpha, beta, m12WinRate
 
-Phase 2c - Liquidity 相關 (需要額外資料/Rust 修改):
-1. 需要: 成交量資料、處置/警示/全額交割股清單
-2. Implement:
-   - `capacity` - 策略容量估算
-   - `disposalStockRatio`, `warningStockRatio`, `fullDeliveryStockRatio`
-   - `buyHigh`, `sellLow` - 買賣價位分析
+Phase 2c - Liquidity 相關 (略過，等 long format):
+- 需要額外資料：成交量、處置/警示/全額交割股清單
+- Wide format 不方便處理，等 long format 再實作
+- 待實作: capacity, disposalStockRatio, warningStockRatio, fullDeliveryStockRatio, buyHigh, sellLow
 
 **Dependencies**: Stage 1
 
