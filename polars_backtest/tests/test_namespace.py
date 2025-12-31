@@ -225,6 +225,21 @@ def test_zero_weights():
     assert all(r == pytest.approx(1.0) for r in result["creturn"].to_list())
 
 
+def test_zero_weights_with_report():
+    """Test backtest_with_report with all zero weights returns empty report without crash."""
+    df = pl.DataFrame({
+        "date": ["2024-01-01", "2024-01-01", "2024-01-02", "2024-01-02"],
+        "symbol": ["AAPL", "GOOG", "AAPL", "GOOG"],
+        "close": [100.0, 200.0, 102.0, 198.0],
+        "weight": [0.0, 0.0, 0.0, 0.0],
+    })
+
+    # Should not crash, returns empty report
+    report = pl_bt.backtest_with_report(df, trade_at_price="close", position="weight")
+    assert report.creturn.height == 0
+    assert report.trades.height == 0
+
+
 def test_negative_weights_short():
     """Test with negative weights (short positions)."""
     df = pl.DataFrame({

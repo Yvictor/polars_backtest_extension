@@ -1030,6 +1030,26 @@ fn backtest_with_report(
     // Run backtest with report using btcore
     let result = backtest_with_report_long_arrow(&input, resample_freq, offset, &cfg);
 
+    // Handle empty result (no signals/trades)
+    if result.dates.is_empty() {
+        let empty_dates = Series::new_empty(date.into(), &DataType::Date);
+        let empty_creturn = Series::new_empty("creturn".into(), &DataType::Float64);
+        let creturn_df = DataFrame::new(vec![
+            empty_dates.into_column(),
+            empty_creturn.into_column(),
+        ]).map_err(|e| PyValueError::new_err(format!("Failed to create empty creturn DataFrame: {}", e)))?;
+
+        let trades_df = trades_to_dataframe(&result.trades)
+            .map_err(|e| PyValueError::new_err(format!("Failed to create trades DataFrame: {}", e)))?;
+
+        return Ok(PyBacktestReport::new(
+            creturn_df,
+            trades_df,
+            cfg,
+            resample.map(|s| s.to_string()),
+        ));
+    }
+
     // Convert trades to DataFrame
     let trades_df = trades_to_dataframe(&result.trades)
         .map_err(|e| PyValueError::new_err(format!("Failed to create trades DataFrame: {}", e)))?;
