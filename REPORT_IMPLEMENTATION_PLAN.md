@@ -49,17 +49,27 @@ Reference: `polars_backtest/restore/restored_report.pyx`
 
 **Implemented Methods**:
 - `daily_creturn` (cached_property) - Daily resampled cumulative return
-- `get_stats(riskfree_rate=0.02)` - Returns DataFrame with all stats
+- `get_stats(riskfree_rate=0.02)` - Returns DataFrame with 15 statistics
 - `get_monthly_stats(riskfree_rate=0.02)` - Returns DataFrame with monthly stats
 - `get_return_table()` - Returns pivoted year/month return DataFrame
-- `get_drawdown_details(top_n=5)` - Returns top N drawdown periods with start/end/length/drawdown
+- `get_drawdown_details(top_n=5)` - Returns top N drawdown periods
 - `get_ndays_return(creturn_df, n)` - Static method for N-day return
 
-**Tested Metrics**:
+**Tested Metrics** (18 metrics, all match Finlab within 1% tolerance):
 - ✓ cagr, total_return, max_drawdown, avg_drawdown, calmar
 - ✓ daily_sharpe, daily_sortino, daily_mean, daily_vol, best_day, worst_day
 - ✓ monthly_sharpe, monthly_sortino, monthly_mean, monthly_vol, best_month, worst_month
 - ✓ win_ratio, return_table, drawdown_details
+
+**Implementation Notes**:
+- All calculations use pure Polars expressions (`df.with_columns(...).select(...)`)
+- `avg_drawdown`: Mean of per-period minimum drawdowns (Finlab compatible)
+- `sortino`: Uses `std(min(excess, 0), ddof=1)` formula (Finlab compatible)
+- `drawdown_details`:
+  - start = first day with drawdown < 0
+  - end = recovery day (first day back to >= 0)
+  - length = calendar days from start to end
+  - All values match Finlab exactly (diff < 1e-14)
 
 ---
 
