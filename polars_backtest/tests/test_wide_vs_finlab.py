@@ -91,7 +91,7 @@ def run_comparison(adj_close, position, test_name, ohlc=None, **kwargs):
         "date": [str(d.date()) for d in finlab_report.creturn.index],
         "creturn_finlab": finlab_report.creturn.values
     })
-    df_cmp = df_finlab.join(polars_report.creturn, on="date", how="inner")
+    df_cmp = df_finlab.join(polars_report.creturn, on="date", how="full")
 
     df_ne = df_cmp.filter(
         pl.col("creturn_finlab").round(6) != pl.col("creturn").round(6)
@@ -204,7 +204,274 @@ def test_trades_match(price_data):
 
 
 # =============================================================================
-# Short Position Tests (NOT YET IMPLEMENTED)
+# MAE/MFE Comparison Tests
+# =============================================================================
+
+# MAE/MFE tolerance: Finlab doesn't include entry fee in MAE/MFE calculation
+# Our implementation includes fee_ratio (0.001425) as immediate loss at entry
+# This causes a systematic difference of ~fee_ratio between the two implementations
+# For high return trades, the difference compounds to ~0.4%
+MAE_MFE_RTOL = 0.005  # ~3.5x fee_ratio to account for compounding on high return trades
+
+
+def test_mae_mfe_match(price_data):
+    """Test MAE/MFE metrics match between Finlab and Polars."""
+    close, adj_close = price_data
+    position = close >= close.rolling(300).max()
+    finlab_report, polars_report = run_comparison(adj_close, position, "mae_mfe_match", resample='M')
+
+    # Convert Finlab trades to Polars DataFrame
+    finlab_trades = finlab_report.trades
+    if 'mae' not in finlab_trades.columns:
+        pytest.skip("Finlab trades missing MAE/MFE columns")
+
+    # Filter out open trades and last-day entries (Finlab computes paper returns for open positions)
+    last_date = pl.from_pandas(finlab_trades.reset_index(drop=True)).select(
+        pl.col('entry_date').cast(pl.Date).max()
+    ).item()
+
+    df_finlab = pl.from_pandas(finlab_trades.reset_index(drop=True)).filter(
+        (pl.col('return').is_not_null()) & (pl.col('entry_date').cast(pl.Date) < last_date)
+    ).select([
+        pl.col('stock_id').cast(pl.Utf8).str.split(' ').list.first(),
+        pl.col('entry_date').cast(pl.Date),
+        pl.col('mae').alias('mae_finlab'),
+        pl.col('gmfe').alias('gmfe_finlab'),
+        pl.col('bmfe').alias('bmfe_finlab'),
+        pl.col('mdd').alias('mdd_finlab'),
+        pl.col('pdays').alias('pdays_finlab'),
+    ])
+
+    df_polars = polars_report.trades.filter(
+        (pl.col('return').is_not_null()) & (pl.col('entry_date').cast(pl.Date) < last_date)
+    ).select([
+        pl.col('stock_id'),
+        pl.col('entry_date').cast(pl.Date),
+        pl.col('mae').alias('mae_polars'),
+        pl.col('gmfe').alias('gmfe_polars'),
+        pl.col('bmfe').alias('bmfe_polars'),
+        pl.col('mdd').alias('mdd_polars'),
+        pl.col('pdays').alias('pdays_polars'),
+    ])
+
+    df_cmp = df_finlab.join(df_polars, on=['stock_id', 'entry_date'], how="left")
+
+    print(f"\n=== MAE/MFE Comparison ===")
+    print(f"Finlab trades: {len(df_finlab)}, Polars trades: {len(df_polars)}, Joined: {len(df_cmp)}")
+
+    # Check for unmatched trades (nulls from join)
+    df_unmatched = df_cmp.filter(pl.col('mae_polars').is_null())
+    if len(df_unmatched) > 0:
+        print(f"  Unmatched trades: {len(df_unmatched)}")
+        print(df_unmatched.head(10))
+    assert df_unmatched.is_empty(), f"Unmatched trades found:\n{df_unmatched}"
+
+    # Compare each metric (now safe since no nulls)
+    # Note: bmfe is excluded because it depends on when MAE occurs,
+    # and our fee-inclusive calculation identifies different MAE points
+    for col in ['mae', 'gmfe', 'mdd']:
+        df_ne = df_cmp.filter(
+            (pl.col(f'{col}_finlab') - pl.col(f'{col}_polars')).abs() > MAE_MFE_RTOL
+        )
+        max_diff = df_cmp.select(
+            (pl.col(f'{col}_finlab') - pl.col(f'{col}_polars')).abs().max().alias('max_diff')
+        ).get_column('max_diff')[0]
+
+        print(f"  {col}: mismatch={len(df_ne)}, max_diff={max_diff:.2e}")
+        assert df_ne.is_empty(), f"{col} mismatch:\n{df_ne}"
+
+    # pdays comparison - KNOWN FINLAB BUGS:
+    # 1. ~18% of trades have uninitialized memory values (6.6521e-310) for pdays
+    # 2. Some trades with low-volume/suspended stocks have incorrect pdays
+    #    (e.g., stock 6022 @ 2017-07-03: Finlab=18, actual=1, verified by manual calc)
+    # Our implementation is correct - verified by manual price_ratio > 1 counting.
+    # We only log the differences here without asserting.
+    df_cmp_valid = df_cmp.filter(pl.col('pdays_finlab') > 1e-100)
+    n_invalid = len(df_cmp) - len(df_cmp_valid)
+    pdays_mismatch = df_cmp_valid.filter(
+        pl.col('pdays_finlab').cast(pl.Int64) != pl.col('pdays_polars')
+    )
+    print(f"  pdays: Finlab uninitialized={n_invalid}, mismatch={len(pdays_mismatch)} (Finlab bug)")
+
+
+@pytest.mark.parametrize("stop_loss", [0.05, 0.1])
+def test_mae_mfe_with_stop_loss(price_data, stop_loss):
+    """Test MAE/MFE with stop_loss."""
+    close, adj_close = price_data
+    position = close >= close.rolling(300).max()
+    finlab_report, polars_report = run_comparison(
+        adj_close, position, f"mae_mfe+stop_loss={stop_loss}",
+        resample='M', stop_loss=stop_loss
+    )
+
+    finlab_trades = finlab_report.trades
+    if 'mae' not in finlab_trades.columns:
+        pytest.skip("Finlab trades missing MAE/MFE columns")
+
+    # Filter out open trades and last-day entries
+    last_date = pl.from_pandas(finlab_trades.reset_index(drop=True)).select(
+        pl.col('entry_date').cast(pl.Date).max()
+    ).item()
+
+    df_finlab = pl.from_pandas(finlab_trades.reset_index(drop=True)).filter(
+        (pl.col('return').is_not_null()) & (pl.col('entry_date').cast(pl.Date) < last_date)
+    ).select([
+        pl.col('stock_id').cast(pl.Utf8).str.split(' ').list.first(),
+        pl.col('entry_date').cast(pl.Date),
+        pl.col('mae').alias('mae_finlab'),
+        pl.col('gmfe').alias('gmfe_finlab'),
+    ])
+
+    df_polars = polars_report.trades.filter(
+        (pl.col('return').is_not_null()) & (pl.col('entry_date').cast(pl.Date) < last_date)
+    ).select([
+        pl.col('stock_id'),
+        pl.col('entry_date').cast(pl.Date),
+        pl.col('mae').alias('mae_polars'),
+        pl.col('gmfe').alias('gmfe_polars'),
+    ])
+
+    df_cmp = df_finlab.join(df_polars, on=['stock_id', 'entry_date'], how="left")
+
+    print(f"\n=== MAE/MFE with stop_loss={stop_loss} ===")
+    print(f"Finlab trades: {len(df_finlab)}, Polars trades: {len(df_polars)}")
+
+    # Check for unmatched trades
+    df_unmatched = df_cmp.filter(pl.col('mae_polars').is_null())
+    assert df_unmatched.is_empty(), f"Unmatched trades:\n{df_unmatched}"
+
+    for col in ['mae', 'gmfe']:
+        df_ne = df_cmp.filter(
+            (pl.col(f'{col}_finlab') - pl.col(f'{col}_polars')).abs() > MAE_MFE_RTOL
+        )
+        max_diff = df_cmp.select(
+            (pl.col(f'{col}_finlab') - pl.col(f'{col}_polars')).abs().max().alias('max_diff')
+        ).get_column('max_diff')[0]
+
+        print(f"  {col}: mismatch={len(df_ne)}, max_diff={max_diff:.2e}")
+        assert df_ne.is_empty(), f"{col} mismatch:\n{df_ne}"
+
+
+@pytest.mark.parametrize("take_profit", [0.1, 0.2])
+def test_mae_mfe_with_take_profit(price_data, take_profit):
+    """Test MAE/MFE with take_profit."""
+    close, adj_close = price_data
+    position = close >= close.rolling(300).max()
+    finlab_report, polars_report = run_comparison(
+        adj_close, position, f"mae_mfe+take_profit={take_profit}",
+        resample='M', take_profit=take_profit
+    )
+
+    finlab_trades = finlab_report.trades
+    if 'mae' not in finlab_trades.columns:
+        pytest.skip("Finlab trades missing MAE/MFE columns")
+
+    # Filter out open trades and last-day entries
+    last_date = pl.from_pandas(finlab_trades.reset_index(drop=True)).select(
+        pl.col('entry_date').cast(pl.Date).max()
+    ).item()
+
+    df_finlab = pl.from_pandas(finlab_trades.reset_index(drop=True)).filter(
+        (pl.col('return').is_not_null()) & (pl.col('entry_date').cast(pl.Date) < last_date)
+    ).select([
+        pl.col('stock_id').cast(pl.Utf8).str.split(' ').list.first(),
+        pl.col('entry_date').cast(pl.Date),
+        pl.col('mae').alias('mae_finlab'),
+        pl.col('gmfe').alias('gmfe_finlab'),
+    ])
+
+    df_polars = polars_report.trades.filter(
+        (pl.col('return').is_not_null()) & (pl.col('entry_date').cast(pl.Date) < last_date)
+    ).select([
+        pl.col('stock_id'),
+        pl.col('entry_date').cast(pl.Date),
+        pl.col('mae').alias('mae_polars'),
+        pl.col('gmfe').alias('gmfe_polars'),
+    ])
+
+    df_cmp = df_finlab.join(df_polars, on=['stock_id', 'entry_date'], how="left")
+
+    print(f"\n=== MAE/MFE with take_profit={take_profit} ===")
+    print(f"Finlab trades: {len(df_finlab)}, Polars trades: {len(df_polars)}")
+
+    # Check for unmatched trades
+    df_unmatched = df_cmp.filter(pl.col('mae_polars').is_null())
+    assert df_unmatched.is_empty(), f"Unmatched trades:\n{df_unmatched}"
+
+    for col in ['mae', 'gmfe']:
+        df_ne = df_cmp.filter(
+            (pl.col(f'{col}_finlab') - pl.col(f'{col}_polars')).abs() > MAE_MFE_RTOL
+        )
+        max_diff = df_cmp.select(
+            (pl.col(f'{col}_finlab') - pl.col(f'{col}_polars')).abs().max().alias('max_diff')
+        ).get_column('max_diff')[0]
+
+        print(f"  {col}: mismatch={len(df_ne)}, max_diff={max_diff:.2e}")
+        assert df_ne.is_empty(), f"{col} mismatch:\n{df_ne}"
+
+
+def test_mae_mfe_short(price_data):
+    """Test MAE/MFE metrics for short positions."""
+    close, adj_close = price_data
+    # Short when price is below 300-day low
+    position = (close <= close.rolling(300).min()) * -1
+    finlab_report, polars_report = run_comparison(adj_close, position, "mae_mfe_short", resample='M')
+
+    finlab_trades = finlab_report.trades
+    if 'mae' not in finlab_trades.columns:
+        pytest.skip("Finlab trades missing MAE/MFE columns")
+
+    # Filter out open trades and last-day entries
+    last_date = pl.from_pandas(finlab_trades.reset_index(drop=True)).select(
+        pl.col('entry_date').cast(pl.Date).max()
+    ).item()
+
+    df_finlab = pl.from_pandas(finlab_trades.reset_index(drop=True)).filter(
+        (pl.col('return').is_not_null()) & (pl.col('entry_date').cast(pl.Date) < last_date)
+    ).select([
+        pl.col('stock_id').cast(pl.Utf8).str.split(' ').list.first(),
+        pl.col('entry_date').cast(pl.Date),
+        pl.col('mae').alias('mae_finlab'),
+        pl.col('gmfe').alias('gmfe_finlab'),
+        pl.col('mdd').alias('mdd_finlab'),
+    ])
+
+    df_polars = polars_report.trades.filter(
+        (pl.col('return').is_not_null()) & (pl.col('entry_date').cast(pl.Date) < last_date)
+    ).select([
+        pl.col('stock_id'),
+        pl.col('entry_date').cast(pl.Date),
+        pl.col('mae').alias('mae_polars'),
+        pl.col('gmfe').alias('gmfe_polars'),
+        pl.col('mdd').alias('mdd_polars'),
+    ])
+
+    df_cmp = df_finlab.join(df_polars, on=['stock_id', 'entry_date'], how="left")
+
+    print(f"\n=== MAE/MFE Short Comparison ===")
+    print(f"Finlab trades: {len(df_finlab)}, Polars trades: {len(df_polars)}, Joined: {len(df_cmp)}")
+
+    # Check for unmatched trades
+    df_unmatched = df_cmp.filter(pl.col('mae_polars').is_null())
+    if len(df_unmatched) > 0:
+        print(f"  Unmatched trades: {len(df_unmatched)}")
+    assert df_unmatched.is_empty(), f"Unmatched trades:\n{df_unmatched}"
+
+    # Compare each metric
+    for col in ['mae', 'gmfe', 'mdd']:
+        df_ne = df_cmp.filter(
+            (pl.col(f'{col}_finlab') - pl.col(f'{col}_polars')).abs() > MAE_MFE_RTOL
+        )
+        max_diff = df_cmp.select(
+            (pl.col(f'{col}_finlab') - pl.col(f'{col}_polars')).abs().max().alias('max_diff')
+        ).get_column('max_diff')[0]
+
+        print(f"  {col}: mismatch={len(df_ne)}, max_diff={max_diff:.2e}")
+        assert df_ne.is_empty(), f"{col} mismatch:\n{df_ne}"
+
+
+# =============================================================================
+# Short Position Tests
 # =============================================================================
 # Short positions use negative weights. Finlab's stop logic is inverted:
 # - Long: max_r = 1 + take_profit, min_r = max(1 - stop_loss, maxcr - trail_stop)

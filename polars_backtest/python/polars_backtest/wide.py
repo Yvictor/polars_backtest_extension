@@ -405,6 +405,11 @@ class Report:
                     "return": [],
                     "trade_price@entry_date": [],
                     "trade_price@exit_date": [],
+                    "mae": [],
+                    "gmfe": [],
+                    "bmfe": [],
+                    "mdd": [],
+                    "pdays": [],
                 }
             )
 
@@ -447,6 +452,11 @@ class Report:
                     "return": t.trade_return,
                     "trade_price@entry_date": t.entry_price,
                     "trade_price@exit_date": t.exit_price,
+                    "mae": t.mae,
+                    "gmfe": t.gmfe,
+                    "bmfe": t.bmfe,
+                    "mdd": t.mdd,
+                    "pdays": t.pdays,
                 }
             )
 

@@ -34,6 +34,7 @@ pub fn is_valid_price(price: f64) -> bool {
 }
 
 pub mod config;
+pub mod mae_mfe;
 pub mod portfolio;
 pub mod position;
 pub mod returns;
@@ -54,3 +55,4 @@ pub use stats::{calc_cagr, max_drawdown, sharpe_ratio, sortino_ratio, BacktestSt
 pub use position::PositionSnapshot;
 pub use trades::TradeRecord as TradeBookRecord;
 pub use weights::IntoWeights;
+pub use mae_mfe::{MaeMfeConfig, MaeMfeMetrics, calculate_mae_mfe, calculate_mae_mfe_at_exit};

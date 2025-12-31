@@ -158,6 +158,19 @@ pub struct PyWideTradeRecord {
     pub exit_price: Option<f64>,
     #[pyo3(get)]
     pub trade_return: Option<f64>,
+    // MAE/MFE metrics
+    #[pyo3(get)]
+    pub mae: Option<f64>,
+    #[pyo3(get)]
+    pub gmfe: Option<f64>,
+    #[pyo3(get)]
+    pub bmfe: Option<f64>,
+    #[pyo3(get)]
+    pub mdd: Option<f64>,
+    #[pyo3(get)]
+    pub pdays: Option<u32>,
+    #[pyo3(get)]
+    pub period: Option<u32>,
 }
 
 #[pymethods]
@@ -190,6 +203,12 @@ impl From<WideTradeRecord> for PyWideTradeRecord {
             entry_price: r.entry_price,
             exit_price: r.exit_price,
             trade_return: r.trade_return,
+            mae: r.mae,
+            gmfe: r.gmfe,
+            bmfe: r.bmfe,
+            mdd: r.mdd,
+            pdays: r.pdays,
+            period: r.period,
         }
     }
 }
@@ -268,6 +287,19 @@ pub struct PyTradeRecord {
     pub exit_price: Option<f64>,
     #[pyo3(get)]
     pub trade_return: Option<f64>,
+    // MAE/MFE metrics
+    #[pyo3(get)]
+    pub mae: Option<f64>,
+    #[pyo3(get)]
+    pub gmfe: Option<f64>,
+    #[pyo3(get)]
+    pub bmfe: Option<f64>,
+    #[pyo3(get)]
+    pub mdd: Option<f64>,
+    #[pyo3(get)]
+    pub pdays: Option<u32>,
+    #[pyo3(get)]
+    pub period: Option<i32>,
 }
 
 #[pymethods]
@@ -300,6 +332,12 @@ impl From<TradeRecord> for PyTradeRecord {
             entry_price: r.entry_price,
             exit_price: r.exit_price,
             trade_return: r.trade_return,
+            mae: r.mae,
+            gmfe: r.gmfe,
+            bmfe: r.bmfe,
+            mdd: r.mdd,
+            pdays: r.pdays,
+            period: r.period,
         }
     }
 }
@@ -317,6 +355,11 @@ impl From<TradeRecord> for PyTradeRecord {
 /// - return: Float64 (trade return, optional)
 /// - entry_price: Float64
 /// - exit_price: Float64 (optional)
+/// - mae: Float64 (Maximum Adverse Excursion, optional)
+/// - gmfe: Float64 (Global Maximum Favorable Excursion, optional)
+/// - bmfe: Float64 (Before-MAE MFE, optional)
+/// - mdd: Float64 (Maximum Drawdown, optional)
+/// - pdays: UInt32 (Profitable days, optional)
 fn trades_to_dataframe(trades: &[TradeRecord]) -> PolarsResult<DataFrame> {
     // Build columns
     let stock_id: Vec<&str> = trades.iter().map(|t| t.symbol.as_str()).collect();
@@ -325,15 +368,16 @@ fn trades_to_dataframe(trades: &[TradeRecord]) -> PolarsResult<DataFrame> {
     let entry_sig_date: Vec<i32> = trades.iter().map(|t| t.entry_sig_date).collect();
     let exit_sig_date: Vec<Option<i32>> = trades.iter().map(|t| t.exit_sig_date).collect();
     let position: Vec<f64> = trades.iter().map(|t| t.position_weight).collect();
-    let period: Vec<Option<i32>> = trades.iter().map(|t| {
-        match (t.entry_date, t.exit_date) {
-            (Some(e), Some(x)) => Some(x - e),
-            _ => None,
-        }
-    }).collect();
+    let period: Vec<Option<i32>> = trades.iter().map(|t| t.period).collect();
     let trade_return: Vec<Option<f64>> = trades.iter().map(|t| t.trade_return).collect();
     let entry_price: Vec<f64> = trades.iter().map(|t| t.entry_price).collect();
     let exit_price: Vec<Option<f64>> = trades.iter().map(|t| t.exit_price).collect();
+    // MAE/MFE columns
+    let mae: Vec<Option<f64>> = trades.iter().map(|t| t.mae).collect();
+    let gmfe: Vec<Option<f64>> = trades.iter().map(|t| t.gmfe).collect();
+    let bmfe: Vec<Option<f64>> = trades.iter().map(|t| t.bmfe).collect();
+    let mdd: Vec<Option<f64>> = trades.iter().map(|t| t.mdd).collect();
+    let pdays: Vec<Option<u32>> = trades.iter().map(|t| t.pdays).collect();
 
     // Create Series
     let stock_id_series = Series::new("stock_id".into(), stock_id);
@@ -350,6 +394,12 @@ fn trades_to_dataframe(trades: &[TradeRecord]) -> PolarsResult<DataFrame> {
     let return_series = Series::new("return".into(), trade_return);
     let entry_price_series = Series::new("entry_price".into(), entry_price);
     let exit_price_series = Series::new("exit_price".into(), exit_price);
+    // MAE/MFE series
+    let mae_series = Series::new("mae".into(), mae);
+    let gmfe_series = Series::new("gmfe".into(), gmfe);
+    let bmfe_series = Series::new("bmfe".into(), bmfe);
+    let mdd_series = Series::new("mdd".into(), mdd);
+    let pdays_series = Series::new("pdays".into(), pdays);
 
     DataFrame::new(vec![
         stock_id_series.into_column(),
@@ -362,6 +412,11 @@ fn trades_to_dataframe(trades: &[TradeRecord]) -> PolarsResult<DataFrame> {
         return_series.into_column(),
         entry_price_series.into_column(),
         exit_price_series.into_column(),
+        mae_series.into_column(),
+        gmfe_series.into_column(),
+        bmfe_series.into_column(),
+        mdd_series.into_column(),
+        pdays_series.into_column(),
     ])
 }
 

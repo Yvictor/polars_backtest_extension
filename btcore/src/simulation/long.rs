@@ -278,6 +278,13 @@ where
             // STEP 1: Update positions (cr *= r, maxcr update)
             update_positions(&mut portfolio, &today_prices);
 
+            // Record prices for MAE/MFE calculation
+            for (sym, _pos) in portfolio.positions.iter() {
+                if let Some(&price) = today_prices.get(sym.as_str()) {
+                    tracker.record_price(sym, price, price);
+                }
+            }
+
             // STEP 2: Stop detection and execution
             if touched_exit_enabled {
                 // touched_exit mode: detect and execute IMMEDIATELY (T+0)
@@ -579,6 +586,13 @@ where
     if let Some(last_date) = current_date {
         if !today_prices.is_empty() {
             update_positions(&mut portfolio, &today_prices);
+
+            // Record prices for MAE/MFE calculation (final day)
+            for (sym, _pos) in portfolio.positions.iter() {
+                if let Some(&price) = today_prices.get(sym.as_str()) {
+                    tracker.record_price(sym, price, price);
+                }
+            }
 
             // Stop detection and execution (same logic as main loop)
             if touched_exit_enabled {
