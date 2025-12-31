@@ -1519,7 +1519,7 @@ def run_report_comparison(
     metrics_tol = 5e-2 if resample == "D" else 1e-2  # 5% for daily, 1% otherwise
 
     print(f"  Comparing {len(numeric_cols)} numeric columns...")
-    # Always print avgNStock and maxNStock
+    # Always print key metrics for debugging
     for key in ["avgNStock", "maxNStock"]:
         if key in wide_metrics.columns and key in long_metrics.columns:
             w = wide_metrics[key][0]

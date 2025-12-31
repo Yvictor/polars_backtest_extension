@@ -34,19 +34,48 @@ result = df.bt.backtest(trade_at_price="close", position="weight")
 ### With Report
 
 ```python
-report = pl_bt.backtest_with_report(
-    df,
-    trade_at_price="close",
-    position="weight",
-    resample="M",
-    fee_ratio=0.001425,
-    tax_ratio=0.003,
-    stop_loss=0.1,
-)
+report = pl_bt.backtest_with_report(df, trade_at_price="adj_close", resample="M")
+report
+```
 
-print(report.creturn)   # Cumulative returns
-print(report.trades)    # Trade records
-print(report.position)  # Position history
+```
+BacktestReport(
+  creturn_len=4219,
+  trades_count=6381,
+  total_return=8761.03%,
+  cagr=29.85%,
+  max_drawdown=-35.21%,
+  sharpe=1.13,
+  win_ratio=46.33%
+)
+```
+
+```python
+report.get_stats()  # or report.stats
+```
+
+```
+shape: (1, 15)
+┌────────────┬────────────┬──────┬──────────────┬──────────┬──────────────┬──────────────┐
+│ start      ┆ end        ┆ rf   ┆ total_return ┆ cagr     ┆ max_drawdown ┆ avg_drawdown │
+│ ---        ┆ ---        ┆ ---  ┆ ---          ┆ ---      ┆ ---          ┆ ---          │
+│ date       ┆ date       ┆ f64  ┆ f64          ┆ f64      ┆ f64          ┆ f64          │
+╞════════════╪════════════╪══════╪══════════════╪══════════╪══════════════╪══════════════╡
+│ 2008-10-31 ┆ 2025-12-31 ┆ 0.02 ┆ 87.610293    ┆ 0.298538 ┆ -0.352092    ┆ -0.042957    │
+└────────────┴────────────┴──────┴──────────────┴──────────┴──────────────┴──────────────┘
+┌────────────┬───────────┬──────────────┬───────────────┬──────────┬───────────┬─────────┬───────────┐
+│ daily_mean ┆ daily_vol ┆ daily_sharpe ┆ daily_sortino ┆ best_day ┆ worst_day ┆ calmar  ┆ win_ratio │
+│ ---        ┆ ---       ┆ ---          ┆ ---           ┆ ---      ┆ ---       ┆ ---     ┆ ---       │
+│ f64        ┆ f64       ┆ f64          ┆ f64           ┆ f64      ┆ f64       ┆ f64     ┆ f64       │
+╞════════════╪═══════════╪══════════════╪═══════════════╪══════════╪═══════════╪═════════╪═══════════╡
+│ 0.300815   ┆ 0.249645  ┆ 1.131947     ┆ 1.834553      ┆ 0.195416 ┆ -0.160707 ┆ 0.84784 ┆ 0.463303  │
+└────────────┴───────────┴──────────────┴───────────────┴──────────┴───────────┴─────────┴───────────┘
+```
+
+```python
+report.creturn   # Cumulative returns DataFrame
+report.trades    # Trade records with MAE/MFE metrics
+report.stats     # Statistics (same as get_stats())
 ```
 
 ### Statistics Expressions

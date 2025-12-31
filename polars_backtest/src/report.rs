@@ -112,6 +112,12 @@ impl PyBacktestReport {
         self.resample.as_deref()
     }
 
+    /// Get backtest statistics as a single-row DataFrame (with default riskfree_rate=0.02)
+    #[getter(stats)]
+    fn get_stats_default(&self) -> PyResult<PyDataFrame> {
+        self.get_stats(0.02)
+    }
+
     /// Get daily resampled cumulative return DataFrame
     fn daily_creturn(&self) -> PyResult<PyDataFrame> {
         let df = self.compute_daily_creturn().map_err(to_py_err)?;
@@ -381,10 +387,39 @@ impl PyBacktestReport {
     }
 
     fn __repr__(&self) -> String {
-        format!(
-            "BacktestReport(creturn_len={}, trades_count={})",
-            self.creturn_df.height(), self.trades_df.height(),
-        )
+        // Try to get stats for display
+        match self.get_stats(0.02) {
+            Ok(stats_df) => {
+                let df = &stats_df.0;
+                let get_f64 = |name: &str| -> Option<f64> {
+                    df.column(name).ok()?.f64().ok()?.get(0)
+                };
+
+                let total_ret = get_f64("total_return").unwrap_or(f64::NAN);
+                let cagr = get_f64("cagr").unwrap_or(f64::NAN);
+                let max_dd = get_f64("max_drawdown").unwrap_or(f64::NAN);
+                let sharpe = get_f64("daily_sharpe").unwrap_or(f64::NAN);
+                let win_ratio = get_f64("win_ratio").unwrap_or(f64::NAN);
+
+                format!(
+                    "BacktestReport(\n  creturn_len={},\n  trades_count={},\n  total_return={:.2}%,\n  cagr={:.2}%,\n  max_drawdown={:.2}%,\n  sharpe={:.2},\n  win_ratio={:.2}%\n)",
+                    self.creturn_df.height(),
+                    self.trades_df.height(),
+                    total_ret * 100.0,
+                    cagr * 100.0,
+                    max_dd * 100.0,
+                    sharpe,
+                    win_ratio * 100.0,
+                )
+            }
+            Err(_) => {
+                format!(
+                    "BacktestReport(creturn_len={}, trades_count={})",
+                    self.creturn_df.height(),
+                    self.trades_df.height(),
+                )
+            }
+        }
     }
 
     /// Get structured metrics as single-row DataFrame
@@ -695,7 +730,7 @@ impl PyBacktestReport {
         }
     }
 
-    /// Calculate average drawdown days
+    /// Calculate average drawdown days (calendar days, matching Wide format)
     fn calc_avg_drawdown_days(&self, daily: &DataFrame) -> PolarsResult<f64> {
         let dd_df = daily
             .clone()
@@ -713,20 +748,40 @@ impl PyBacktestReport {
                 .then(lit(1i32))
                 .otherwise(lit(0i32))
                 .cum_sum(false)
-                .alias("dd_period"),
+                .alias("dd_period_raw"),
             ])
-            .filter(col("drawdown").lt(lit(0.0)))
+            .with_column(
+                // Assign recovery day to previous period, null for non-drawdown days
+                when(
+                    col("drawdown").gt_eq(lit(0.0))
+                        .and(col("drawdown").shift(lit(1)).fill_null(lit(0.0)).lt(lit(0.0))),
+                )
+                .then(col("dd_period_raw").shift(lit(1)))
+                .otherwise(
+                    when(col("drawdown").lt(lit(0.0)))
+                        .then(col("dd_period_raw"))
+                        .otherwise(lit(NULL)),
+                )
+                .alias("dd_period"),
+            )
+            .filter(col("dd_period").is_not_null())
             .collect()?;
 
         if dd_df.height() == 0 {
             return Ok(0.0);
         }
 
-        // Count days per drawdown period and average
+        // Calculate length as (last_date - first_date) in calendar days
         let result = dd_df
             .lazy()
             .group_by([col("dd_period")])
-            .agg([col("drawdown").len().alias("length")])
+            .agg([
+                col("date").filter(col("drawdown").lt(lit(0.0))).first().alias("start"),
+                col("date").last().alias("end"),
+            ])
+            .with_column(
+                (col("end") - col("start")).dt().total_days(false).alias("length"),
+            )
             .select([col("length").mean()])
             .collect()?;
 

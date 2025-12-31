@@ -97,6 +97,16 @@ class BacktestReport:
         """Resample frequency if configured."""
         ...
 
+    @property
+    def stats(self) -> pl.DataFrame:
+        """Backtest statistics as single-row DataFrame (with default riskfree_rate=0.02).
+
+        Columns: start, end, rf, total_return, cagr, max_drawdown, avg_drawdown,
+                 daily_mean, daily_vol, daily_sharpe, daily_sortino,
+                 best_day, worst_day, calmar, win_ratio.
+        """
+        ...
+
     # Methods
     def daily_creturn(self) -> pl.DataFrame:
         """Get daily resampled cumulative return DataFrame.
