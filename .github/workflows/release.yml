@@ -1,12 +1,11 @@
 name: Release
 
 on:
-  push:
-    tags:
-      - "v*"
+  release:
+    types: [published]
 
 permissions:
-  contents: write
+  contents: read
 
 env:
   CARGO_TERM_COLOR: always
@@ -60,12 +59,33 @@ jobs:
           name: wheels-${{ matrix.os }}-py${{ matrix.python-version }}
           path: polars_backtest/dist
 
-  release:
-    needs: [build-sdist, build-wheels]
+  publish-crates:
     runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+      contents: read
     steps:
       - uses: actions/checkout@v4
 
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Get crates.io token (Trusted Publishing)
+        uses: rust-lang/crates-io-auth-action@v1
+        id: crates-io-auth
+
+      - name: Publish btcore to crates.io
+        run: cargo publish -p btcore
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ steps.crates-io-auth.outputs.token }}
+
+  publish-pypi:
+    needs: [build-sdist, build-wheels]
+    runs-on: ubuntu-latest
+    environment: pypi
+    permissions:
+      id-token: write
+    steps:
       - name: Download all artifacts
         uses: actions/download-artifact@v4
         with:
@@ -73,46 +93,7 @@ jobs:
           pattern: wheels-*
           merge-multiple: true
 
-      - name: List artifacts
-        run: ls -la dist/
-
-      - name: Create GitHub Release
-        uses: softprops/action-gh-release@v2
+      - name: Publish to PyPI
+        uses: pypa/gh-action-pypi-publish@release/v1
         with:
-          files: dist/*
-          generate_release_notes: true
-          draft: false
-          prerelease: ${{ contains(github.ref, 'alpha') || contains(github.ref, 'beta') || contains(github.ref, 'rc') }}
-
-  publish-crates:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Setup Rust
-        uses: dtolnay/rust-toolchain@stable
-
-      - name: Publish btcore to crates.io
-        run: cargo publish -p btcore
-        env:
-          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
-
-  # Uncomment to enable PyPI publishing
-  # publish-pypi:
-  #   needs: [build-sdist, build-wheels]
-  #   runs-on: ubuntu-latest
-  #   environment: pypi
-  #   permissions:
-  #     id-token: write
-  #   steps:
-  #     - name: Download all artifacts
-  #       uses: actions/download-artifact@v4
-  #       with:
-  #         path: dist
-  #         pattern: wheels-*
-  #         merge-multiple: true
-  #
-  #     - name: Publish to PyPI
-  #       uses: pypa/gh-action-pypi-publish@release/v1
-  #       with:
-  #         packages-dir: dist/
+          packages-dir: dist/
