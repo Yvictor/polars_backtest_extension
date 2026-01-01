@@ -8,7 +8,7 @@ members = [
 [workspace.package]
 version = "0.1.0"
 edition = "2021"
-license = "PolyForm-Noncommercial-1.0.0"
+license-file = "LICENSE"
 repository = "https://github.com/Yvictor/polars_backtest_extension"
 
 [workspace.dependencies]
