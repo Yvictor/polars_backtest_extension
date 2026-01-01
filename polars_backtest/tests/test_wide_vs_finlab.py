@@ -21,10 +21,14 @@ import polars as pl
 from dotenv import load_dotenv
 load_dotenv()
 
+# Skip entire module if finlab not installed or no API token
+finlab = pytest.importorskip("finlab")
+if not os.getenv('FINLAB_API_TOKEN'):
+    pytest.skip("FINLAB_API_TOKEN not set", allow_module_level=True)
+
 # Mark all tests in this file as slow (requires finlab data)
 pytestmark = pytest.mark.slow
 
-import finlab
 finlab.login(os.getenv('FINLAB_API_TOKEN'))
 
 from finlab import backtest as finlab_backtest
