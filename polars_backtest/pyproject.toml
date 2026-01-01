@@ -8,7 +8,7 @@ version = "0.1.0"
 description = "Polars extension for portfolio backtesting"
 readme = "README.md"
 license = { text = "PolyForm Noncommercial 1.0.0" }
-requires-python = ">=3.9,<3.14"
+requires-python = ">=3.9"
 classifiers = [
     "Development Status :: 3 - Alpha",
     "Intended Audience :: Financial and Insurance Industry",
@@ -20,6 +20,7 @@ classifiers = [
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
     "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
     "Programming Language :: Rust",
     "Topic :: Office/Business :: Financial :: Investment",
 ]
@@ -60,8 +61,9 @@ select = ["E", "F", "I", "W"]
 [dependency-groups]
 dev = [
     "dotenv>=0.9.9",
-    "finlab>=1.5.5",
+    "finlab>=1.5.5; python_version < '3.14'",
     "ipykernel>=6.31.0",
+    "maturin>=1.7,<2.0",
     "pandas>=2.3.3",
     "patchelf>=0.17.2.4; sys_platform == 'linux'",
     "pytest>=8.4.2",
