@@ -75,6 +75,7 @@ jobs:
         id: crates-io-auth
 
       - name: Publish btcore to crates.io
+        continue-on-error: true  # Skip if version already exists
         run: cargo publish -p btcore
         env:
           CARGO_REGISTRY_TOKEN: ${{ steps.crates-io-auth.outputs.token }}
