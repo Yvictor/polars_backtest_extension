@@ -1,0 +1,105 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build-sdist:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build sdist
+        uses: PyO3/maturin-action@v1
+        with:
+          command: sdist
+          args: --out dist
+          working-directory: polars_backtest
+
+      - name: Upload sdist
+        uses: actions/upload-artifact@v4
+        with:
+          name: wheels-sdist
+          path: polars_backtest/dist
+
+  build-wheels:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-13, macos-14, windows-latest]
+        python-version: ["3.9", "3.10", "3.11", "3.12", "3.13", "3.14"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Build wheels
+        uses: PyO3/maturin-action@v1
+        with:
+          target: ${{ matrix.os == 'macos-14' && 'aarch64-apple-darwin' || '' }}
+          args: --release --out dist -i python${{ matrix.python-version }}
+          sccache: 'true'
+          manylinux: auto
+          working-directory: polars_backtest
+
+      - name: Upload wheels
+        uses: actions/upload-artifact@v4
+        with:
+          name: wheels-${{ matrix.os }}-py${{ matrix.python-version }}
+          path: polars_backtest/dist
+
+  release:
+    needs: [build-sdist, build-wheels]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          pattern: wheels-*
+          merge-multiple: true
+
+      - name: List artifacts
+        run: ls -la dist/
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+          generate_release_notes: true
+          draft: false
+          prerelease: ${{ contains(github.ref, 'alpha') || contains(github.ref, 'beta') || contains(github.ref, 'rc') }}
+
+  # Uncomment to enable PyPI publishing
+  # publish-pypi:
+  #   needs: [build-sdist, build-wheels]
+  #   runs-on: ubuntu-latest
+  #   environment: pypi
+  #   permissions:
+  #     id-token: write
+  #   steps:
+  #     - name: Download all artifacts
+  #       uses: actions/download-artifact@v4
+  #       with:
+  #         path: dist
+  #         pattern: wheels-*
+  #         merge-multiple: true
+  #
+  #     - name: Publish to PyPI
+  #       uses: pypa/gh-action-pypi-publish@release/v1
+  #       with:
+  #         packages-dir: dist/
