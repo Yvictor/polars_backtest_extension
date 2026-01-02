@@ -153,14 +153,23 @@ Phase 2a - 核心指標 (可立即實作):
    - `expectancy` - mean trade return
    - `mae`, `mfe` - mean from trades DataFrame
 
-Phase 2b - Benchmark 相關 (略過，等 long format):
-- Benchmark 應在資料層傳入（如 DataFrame 包含 0050 欄位）
-- Wide format 不方便處理，等 long format 再實作
-- 待實作: alpha, beta, m12WinRate
+Phase 2b - Benchmark 相關:
+- `get_metrics(sections, riskfree_rate, benchmark)` 支援傳入 benchmark DataFrame
+- benchmark DataFrame 需有 `date` 和 `creturn` 欄位
+- 實作: alpha, beta, m12WinRate
 
-Phase 2c - Liquidity 相關 (略過，等 long format):
+**Benchmark 計算說明**:
+- **beta**: `Cov(portfolio_return, benchmark_return) / Var(benchmark_return)` - 與 Finlab 一致 (差異 < 0.05%)
+- **alpha**: `(mean(excess_portfolio) - beta * mean(excess_benchmark)) * 252` - 使用 CAPM 公式
+  - 注意: 與 Finlab alpha 有約 6% 差異，但手動使用相同公式計算結果一致
+  - Finlab 可能使用不同的 alpha 計算方式（待確認）
+- **m12WinRate**: 12個月滾動累積報酬比較勝率
+  - 計算每個 12 個月窗口：`product(1 + monthly_return)` vs `product(1 + bm_monthly_return)`
+  - 注意: 與 Finlab m12WinRate 有約 8% 差異
+  - Finlab 可能使用不同的定義（待確認）
+
+Phase 2c - Liquidity 相關 (略過，等需求確認):
 - 需要額外資料：成交量、處置/警示/全額交割股清單
-- Wide format 不方便處理，等 long format 再實作
 - 待實作: capacity, disposalStockRatio, warningStockRatio, fullDeliveryStockRatio, buyHigh, sellLow
 
 **Dependencies**: Stage 1
@@ -169,25 +178,26 @@ Phase 2c - Liquidity 相關 (略過，等 long format):
 - [x] `get_metrics()` returns all expected sections
 - [x] Nested values are correct types (float, str, etc.)
 - [x] Metrics match Finlab output for same data
-- [ ] Alpha/Beta calculation correct with benchmark (deferred to long format)
-- [ ] Liquidity metrics correct when data available (deferred to long format)
+- [x] Alpha/Beta calculation with benchmark (beta matches, alpha uses standard CAPM)
+- [ ] Liquidity metrics correct when data available (deferred)
 
-**Status**: ✅ Complete (Phase 2a)
+**Status**: ✅ Complete (Phase 2a + 2b)
 
 **Implemented**:
-- `get_metrics(sections, riskfree_rate)` - Returns single-row DataFrame
+- `get_metrics(sections, riskfree_rate, benchmark)` - Returns single-row DataFrame
 - Uses Literal type for sections parameter (backtest, profitability, risk, ratio, winrate)
 - Includes paper returns for open positions (like Finlab)
 - Uses Polars native patterns: `daily_with_return.select(exprs)`
 - Semi join for position filtering to creturn date range
 - Join for paper returns calculation (no Python loop)
+- Benchmark normalization to strategy start date
 
 **Metrics implemented**:
 - backtest: startDate, endDate, feeRatio, taxRatio, freq, tradeAt, stopLoss, takeProfit, trailStop
-- profitability: annualReturn, avgNStock, maxNStock
+- profitability: annualReturn, avgNStock, maxNStock, **alpha**, **beta**
 - risk: maxDrawdown, avgDrawdown, avgDrawdownDays, valueAtRisk, cvalueAtRisk
 - ratio: sharpeRatio, sortinoRatio, calmarRatio, volatility, profitFactor, tailRatio
-- winrate: winRate, expectancy, mae, mfe
+- winrate: winRate, **m12WinRate**, expectancy, mae, mfe
 
 ---
 

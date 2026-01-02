@@ -428,14 +428,17 @@ impl PyBacktestReport {
     ///     sections: List of sections to include. Options: "backtest", "profitability",
     ///              "risk", "ratio", "winrate". Defaults to all sections.
     ///     riskfree_rate: Annual risk-free rate for Sharpe/Sortino calculations.
+    ///     benchmark: Optional benchmark DataFrame with columns (date, creturn).
+    ///               If provided, alpha, beta, and m12WinRate will be calculated.
     ///
     /// Returns:
     ///     Single-row DataFrame with each metric as a column.
-    #[pyo3(signature = (sections=None, riskfree_rate=0.02))]
+    #[pyo3(signature = (sections=None, riskfree_rate=0.02, benchmark=None))]
     fn get_metrics(
         &self,
         sections: Option<Vec<String>>,
         riskfree_rate: f64,
+        benchmark: Option<PyDataFrame>,
     ) -> PyResult<PyDataFrame> {
         let all_sections = vec!["backtest", "profitability", "risk", "ratio", "winrate"];
         let sections_list: Vec<&str> = match &sections {
@@ -493,6 +496,21 @@ impl PyBacktestReport {
             .collect()
             .map_err(to_py_err)?;
 
+        // Process benchmark if provided
+        let benchmark_metrics = if let Some(bm) = benchmark {
+            let bm_df = bm.0;
+            // Validate benchmark has required columns
+            if bm_df.column("date").is_err() || bm_df.column("creturn").is_err() {
+                return Err(PyValueError::new_err(
+                    "Benchmark DataFrame must have 'date' and 'creturn' columns"
+                ));
+            }
+            Some(self.calc_benchmark_metrics(&daily_with_return, &monthly_with_return, bm_df, rf_periodic)
+                .map_err(to_py_err)?)
+        } else {
+            None
+        };
+
         // Build expressions based on sections
         let mut exprs: Vec<Expr> = Vec::new();
 
@@ -537,6 +555,15 @@ impl PyBacktestReport {
                 self.calc_position_stats().map_err(to_py_err)?;
             exprs.push(lit(avg_n_stock).alias("avgNStock"));
             exprs.push(lit(max_n_stock).alias("maxNStock"));
+
+            // Alpha and Beta (requires benchmark)
+            if let Some(ref bm) = benchmark_metrics {
+                exprs.push(lit(bm.alpha).alias("alpha"));
+                exprs.push(lit(bm.beta).alias("beta"));
+            } else {
+                exprs.push(lit(NULL).alias("alpha"));
+                exprs.push(lit(NULL).alias("beta"));
+            }
         }
 
         // === RISK SECTION ===
@@ -607,6 +634,14 @@ impl PyBacktestReport {
             let (mae, mfe) = self.calc_mae_mfe()?;
 
             exprs.push(lit(win_ratio).alias("winRate"));
+
+            // m12WinRate (12-month rolling win rate vs benchmark)
+            if let Some(ref bm) = benchmark_metrics {
+                exprs.push(lit(bm.m12_win_rate).alias("m12WinRate"));
+            } else {
+                exprs.push(lit(NULL).alias("m12WinRate"));
+            }
+
             exprs.push(lit(expectancy).alias("expectancy"));
             exprs.push(lit(mae).alias("mae"));
             exprs.push(lit(mfe).alias("mfe"));
@@ -624,6 +659,13 @@ impl PyBacktestReport {
 
         Ok(PyDataFrame(result))
     }
+}
+
+/// Benchmark-related metrics
+struct BenchmarkMetrics {
+    alpha: f64,
+    beta: f64,
+    m12_win_rate: f64,
 }
 
 // Helper methods (not exposed to Python)
@@ -1009,5 +1051,191 @@ impl PyBacktestReport {
         };
 
         Ok((mae, mfe))
+    }
+
+    /// Calculate benchmark-related metrics (alpha, beta, m12WinRate)
+    fn calc_benchmark_metrics(
+        &self,
+        daily_with_return: &DataFrame,
+        monthly_with_return: &DataFrame,
+        benchmark: DataFrame,
+        rf_periodic: f64,
+    ) -> PolarsResult<BenchmarkMetrics> {
+        // Get strategy start date for benchmark normalization
+        let start_date = daily_with_return
+            .column("date")?
+            .date()?
+            .physical()
+            .get(0)
+            .ok_or_else(|| PolarsError::ComputeError("Empty creturn data".into()))?;
+
+        // Prepare benchmark daily returns, filtered and normalized to strategy start date
+        let bm_daily = benchmark
+            .clone()
+            .lazy()
+            .with_column(col("date").cast(DataType::Date))
+            // Filter to strategy date range
+            .filter(col("date").gt_eq(lit(start_date)))
+            .group_by([col("date")])
+            .agg([col("creturn").last().alias("bm_creturn")])
+            .sort(["date"], Default::default())
+            // Normalize to start at 1.0 (like Finlab's daily_benchmark starting at 100)
+            .with_column(
+                (col("bm_creturn") / col("bm_creturn").first()).alias("bm_creturn")
+            )
+            .with_column(
+                (col("bm_creturn") / col("bm_creturn").shift(lit(1)) - lit(1.0))
+                    .fill_null(lit(0.0))
+                    .alias("bm_return"),
+            )
+            .collect()?;
+
+        // Join portfolio and benchmark daily returns
+        let joined = daily_with_return
+            .clone()
+            .lazy()
+            .join(
+                bm_daily.lazy(),
+                [col("date")],
+                [col("date")],
+                JoinArgs::new(JoinType::Inner),
+            )
+            .collect()?;
+
+        // Calculate beta = Cov(portfolio, benchmark) / Var(benchmark)
+        // Calculate alpha = mean(portfolio - rf) - beta * mean(benchmark - rf)
+        let stats = joined
+            .clone()
+            .lazy()
+            .with_columns([
+                (col("return") - lit(rf_periodic)).alias("excess_return"),
+                (col("bm_return") - lit(rf_periodic)).alias("bm_excess"),
+            ])
+            .select([
+                col("return").mean().alias("port_mean"),
+                col("bm_return").mean().alias("bm_mean"),
+                col("excess_return").mean().alias("excess_mean"),
+                col("bm_excess").mean().alias("bm_excess_mean"),
+                // Covariance and variance for beta calculation
+                ((col("return") - col("return").mean())
+                    * (col("bm_return") - col("bm_return").mean()))
+                    .mean()
+                    .alias("covariance"),
+                col("bm_return").var(1).alias("bm_variance"),
+            ])
+            .collect()?;
+
+        let covariance = stats.column("covariance")?.f64()?.get(0).unwrap_or(0.0);
+        let bm_variance = stats.column("bm_variance")?.f64()?.get(0).unwrap_or(1.0);
+
+        let beta = if bm_variance > 0.0 {
+            covariance / bm_variance
+        } else {
+            0.0
+        };
+
+        let excess_mean = stats.column("excess_mean")?.f64()?.get(0).unwrap_or(0.0);
+        let bm_excess_mean = stats.column("bm_excess_mean")?.f64()?.get(0).unwrap_or(0.0);
+
+        // Daily alpha, annualized
+        let alpha_daily = excess_mean - beta * bm_excess_mean;
+        let alpha = alpha_daily * 252.0;
+
+        // Calculate m12WinRate (12-month rolling win rate vs benchmark)
+        let m12_win_rate = self.calc_m12_win_rate(monthly_with_return, &benchmark, start_date)?;
+
+        Ok(BenchmarkMetrics {
+            alpha,
+            beta,
+            m12_win_rate,
+        })
+    }
+
+    /// Calculate 12-month rolling win rate vs benchmark
+    fn calc_m12_win_rate(
+        &self,
+        monthly_with_return: &DataFrame,
+        benchmark: &DataFrame,
+        start_date: i32,
+    ) -> PolarsResult<f64> {
+        // Prepare benchmark monthly returns, filtered and normalized to strategy start date
+        let bm_monthly = benchmark
+            .clone()
+            .lazy()
+            .with_column(col("date").cast(DataType::Date))
+            // Filter to strategy date range
+            .filter(col("date").gt_eq(lit(start_date)))
+            .with_column(col("date").dt().truncate(lit("1mo")).alias("month"))
+            .group_by([col("month")])
+            .agg([col("creturn").last().alias("bm_creturn")])
+            .sort(["month"], Default::default())
+            // Normalize to start at 1.0
+            .with_column(
+                (col("bm_creturn") / col("bm_creturn").first()).alias("bm_creturn")
+            )
+            .with_column(
+                (col("bm_creturn") / col("bm_creturn").shift(lit(1)) - lit(1.0))
+                    .fill_null(lit(0.0))
+                    .alias("bm_return"),
+            )
+            .collect()?;
+
+        // Join portfolio and benchmark monthly returns
+        let joined = monthly_with_return
+            .clone()
+            .lazy()
+            .join(
+                bm_monthly.lazy(),
+                [col("month")],
+                [col("month")],
+                JoinArgs::new(JoinType::Inner),
+            )
+            .collect()?;
+
+        if joined.height() < 12 {
+            // Not enough data for 12-month rolling
+            return Ok(f64::NAN);
+        }
+
+        // Calculate 12-month rolling returns and compare
+        // For each 12-month window: portfolio beats benchmark if product(1+ret) > product(1+bm_ret)
+        // Manual iteration since rolling expressions require additional features
+
+        // Get return arrays
+        let port_returns = joined
+            .column("return")?
+            .f64()?
+            .into_no_null_iter()
+            .collect::<Vec<_>>();
+        let bm_returns = joined
+            .column("bm_return")?
+            .f64()?
+            .into_no_null_iter()
+            .collect::<Vec<_>>();
+
+        let n = port_returns.len();
+        if n < 12 {
+            return Ok(f64::NAN);
+        }
+
+        let mut wins = 0usize;
+        let mut total = 0usize;
+
+        for i in 11..n {
+            // Calculate 12-month cumulative return: product(1 + r) for months [i-11, i]
+            let port_12m: f64 = (0..12).map(|j| 1.0 + port_returns[i - 11 + j]).product();
+            let bm_12m: f64 = (0..12).map(|j| 1.0 + bm_returns[i - 11 + j]).product();
+
+            if port_12m > bm_12m {
+                wins += 1;
+            }
+            total += 1;
+        }
+
+        if total == 0 {
+            Ok(f64::NAN)
+        } else {
+            Ok(wins as f64 / total as f64)
+        }
     }
 }

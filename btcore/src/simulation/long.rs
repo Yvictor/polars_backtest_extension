@@ -66,6 +66,10 @@ pub struct LongFormatArrowInput<'a> {
     pub high_prices: Option<&'a Float64Array>,
     /// Low prices for touched_exit (optional)
     pub low_prices: Option<&'a Float64Array>,
+    /// Factor for converting adj prices to raw prices (optional)
+    /// raw_price = adj_price / factor
+    /// Defaults to 1.0 if not provided
+    pub factor: Option<&'a Float64Array>,
 }
 
 /// Resample frequency for rebalancing
@@ -209,17 +213,19 @@ where
 /// * `get_symbol` - Closure to get symbol string at index
 /// * `get_price` - Closure to get price at index
 /// * `get_weight` - Closure to get weight at index (NaN = no signal)
+/// * `get_factor` - Closure to get factor at index (for raw price conversion, 1.0 if no factor)
 /// * `resample` - Rebalancing frequency
 /// * `offset` - Optional resample offset for delaying execution
 /// * `config` - Backtest configuration
 /// * `tracker` - Trade tracker (use NoopSymbolTracker::default() for no tracking)
 /// * `ohlc` - Optional OHLC getters for touched_exit mode
-fn backtest_impl<'a, FD, FS, FP, FW, T, FO, FH, FL>(
+fn backtest_impl<'a, FD, FS, FP, FW, FF, T, FO, FH, FL>(
     n_rows: usize,
     get_date: FD,
     get_symbol: FS,
     get_price: FP,
     get_weight: FW,
+    get_factor: FF,
     resample: ResampleFreq,
     offset: Option<ResampleOffset>,
     config: &BacktestConfig,
@@ -231,6 +237,7 @@ where
     FS: Fn(usize) -> &'a str,
     FP: Fn(usize) -> f64,
     FW: Fn(usize) -> f64,
+    FF: Fn(usize) -> f64,
     FO: Fn(usize) -> f64,
     FH: Fn(usize) -> f64,
     FL: Fn(usize) -> f64,
@@ -253,6 +260,7 @@ where
     let mut current_date: Option<i32> = None;
     let mut today_prices: HashMap<&str, f64> = HashMap::new();
     let mut today_weights: HashMap<&str, f64> = HashMap::new();
+    let mut today_factor: HashMap<&str, f64> = HashMap::new();
 
     // Delayed rebalance queue for offset support
     let mut delayed_rebalances: VecDeque<DelayedRebalance> = VecDeque::new();
@@ -295,6 +303,7 @@ where
                     stops,
                     &mut stopped_stocks,
                     &today_prices,
+                    &today_factor,
                     config,
                     prev_date,
                     Some(prev_date), // exit_sig_date = current date (same day)
@@ -314,6 +323,7 @@ where
                     pending_results,
                     &mut stopped_stocks,
                     &today_prices,
+                    &today_factor,
                     config,
                     prev_date,
                     None, // No exit_sig_date for regular stops
@@ -377,6 +387,7 @@ where
                     &mut portfolio,
                     &target_weights,
                     &today_prices,
+                    &today_factor,
                     &stopped_stocks,
                     config,
                     prev_date,
@@ -560,6 +571,7 @@ where
 
             today_prices.clear();
             today_weights.clear();
+            today_factor.clear();
             if touched_exit_enabled {
                 today_open.clear();
                 today_high.clear();
@@ -573,6 +585,11 @@ where
         }
         if !weight.is_nan() && weight.abs() > FLOAT_EPSILON {
             today_weights.insert(symbol, weight);
+        }
+        // Collect factor (for raw price calculation)
+        let factor = get_factor(i);
+        if factor.is_finite() && factor > 0.0 {
+            today_factor.insert(symbol, factor);
         }
         // Collect OHLC data AFTER date_changed processing (for correct date)
         if let Some(ref ohlc_getters) = ohlc {
@@ -604,6 +621,7 @@ where
                     stops,
                     &mut stopped_stocks,
                     &today_prices,
+                    &today_factor,
                     config,
                     last_date,
                     Some(last_date),
@@ -616,6 +634,7 @@ where
                     &mut pending_stop_exits,
                     &mut stopped_stocks,
                     &today_prices,
+                    &today_factor,
                     config,
                     last_date,
                     tracker,
@@ -631,6 +650,7 @@ where
                     &mut portfolio,
                     &target_weights,
                     &today_prices,
+                    &today_factor,
                     &stopped_stocks,
                     config,
                     last_date,
@@ -664,15 +684,17 @@ where
 /// * `get_symbol` - Closure to get symbol string at index
 /// * `get_price` - Closure to get price at index
 /// * `get_weight` - Closure to get weight at index (NaN = no signal)
+/// * `get_factor` - Closure to get factor at index (for raw price conversion, 1.0 if no factor)
 /// * `resample` - Rebalancing frequency
 /// * `offset` - Optional resample offset for delaying execution
 /// * `config` - Backtest configuration
-pub fn backtest_with_accessor<'a, FD, FS, FP, FW, FO, FH, FL>(
+pub fn backtest_with_accessor<'a, FD, FS, FP, FW, FF, FO, FH, FL>(
     n_rows: usize,
     get_date: FD,
     get_symbol: FS,
     get_price: FP,
     get_weight: FW,
+    get_factor: FF,
     ohlc_accessors: Option<(FO, FH, FL)>,
     resample: ResampleFreq,
     offset: Option<ResampleOffset>,
@@ -683,6 +705,7 @@ where
     FS: Fn(usize) -> &'a str,
     FP: Fn(usize) -> f64,
     FW: Fn(usize) -> f64,
+    FF: Fn(usize) -> f64,
     FO: Fn(usize) -> f64,
     FH: Fn(usize) -> f64,
     FL: Fn(usize) -> f64,
@@ -702,6 +725,7 @@ where
             get_symbol,
             get_price,
             get_weight,
+            get_factor,
             resample,
             offset,
             config,
@@ -716,6 +740,7 @@ where
             get_symbol,
             get_price,
             get_weight,
+            get_factor,
             resample,
             offset,
             config,
@@ -767,12 +792,20 @@ pub fn backtest_long_arrow(
         None
     };
 
+    // Build factor accessor (default to 1.0 if not provided)
+    let get_factor: Box<dyn Fn(usize) -> f64> = if let Some(factor_arr) = input.factor {
+        Box::new(move |i: usize| factor_arr.value(i))
+    } else {
+        Box::new(|_: usize| 1.0)
+    };
+
     backtest_with_accessor(
         input.dates.len(),
         |i| input.dates.value(i),
         |i| input.symbols.value(i),
         |i| input.prices.value(i),
         |i| input.weights.value(i),
+        |i| get_factor(i),
         ohlc_accessors,
         resample,
         offset,
@@ -788,6 +821,7 @@ pub fn backtest_long_slice(
     symbols: &[&str],
     prices: &[f64],
     weights: &[f64],
+    factor: Option<&[f64]>,
     open_prices: Option<&[f64]>,
     high_prices: Option<&[f64]>,
     low_prices: Option<&[f64]>,
@@ -810,12 +844,20 @@ pub fn backtest_long_slice(
             None
         };
 
+    // Build factor accessor (default to 1.0 if not provided)
+    let get_factor: Box<dyn Fn(usize) -> f64> = if let Some(f) = factor {
+        Box::new(move |i: usize| f[i])
+    } else {
+        Box::new(|_: usize| 1.0)
+    };
+
     backtest_with_accessor(
         dates.len(),
         |i| dates[i],
         |i| symbols[i],
         |i| prices[i],
         |i| weights[i],
+        |i| get_factor(i),
         ohlc_accessors,
         resample,
         offset,
@@ -841,6 +883,13 @@ pub fn backtest_with_report_long_arrow(
 ) -> BacktestResult {
     let mut tracker = SymbolTracker::new();
 
+    // Build factor accessor (default to 1.0 if not provided)
+    let get_factor: Box<dyn Fn(usize) -> f64> = if let Some(factor_arr) = input.factor {
+        Box::new(move |i: usize| factor_arr.value(i))
+    } else {
+        Box::new(|_: usize| 1.0)
+    };
+
     // Build OHLC getters if data is available and touched_exit is enabled
     let (dates, creturn) = if config.touched_exit
         && input.open_prices.is_some()
@@ -863,6 +912,7 @@ pub fn backtest_with_report_long_arrow(
             |i| input.symbols.value(i),
             |i| input.prices.value(i),
             |i| input.weights.value(i),
+            |i| get_factor(i),
             resample,
             offset,
             config,
@@ -877,6 +927,7 @@ pub fn backtest_with_report_long_arrow(
             |i| input.symbols.value(i),
             |i| input.prices.value(i),
             |i| input.weights.value(i),
+            |i| get_factor(i),
             resample,
             offset,
             config,
@@ -1161,6 +1212,7 @@ fn execute_pending_stops_impl<T>(
     pending_stops: &mut Vec<String>,
     stopped_stocks: &mut HashMap<String, bool>,
     today_prices: &HashMap<&str, f64>,
+    today_factor: &HashMap<&str, f64>,
     config: &BacktestConfig,
     current_date: i32,
     tracker: &mut T,
@@ -1171,11 +1223,13 @@ where
     for sym in pending_stops.drain(..) {
         if let Some(pos) = portfolio.positions.remove(&sym) {
             let exit_price = today_prices.get(sym.as_str()).copied().unwrap_or(pos.previous_price);
+            let exit_factor = today_factor.get(sym.as_str()).copied().unwrap_or(1.0);
             tracker.close_trade(
                 &sym,
                 current_date,
                 None, // Stop exit, no signal date
                 exit_price,
+                exit_factor,
                 config.fee_ratio,
                 config.tax_ratio,
             );
@@ -1326,6 +1380,7 @@ fn execute_stops_impl<T>(
     stops: Vec<StopResult>,
     stopped_stocks: &mut HashMap<String, bool>,
     today_prices: &HashMap<&str, f64>,
+    today_factor: &HashMap<&str, f64>,
     config: &BacktestConfig,
     current_date: i32,
     exit_sig_date: Option<i32>,  // Some(date) for touched_exit, None for regular
@@ -1342,11 +1397,13 @@ where
             // For touched_exit, adjust exit_price by exit_ratio (touched_price / close_price)
             let close_price = today_prices.get(stop.symbol.as_str()).copied().unwrap_or(pos.previous_price);
             let exit_price = close_price * stop.exit_ratio;
+            let exit_factor = today_factor.get(stop.symbol.as_str()).copied().unwrap_or(1.0);
             tracker.close_trade(
                 &stop.symbol,
                 current_date,
                 exit_sig_date,
                 exit_price,
+                exit_factor,
                 config.fee_ratio,
                 config.tax_ratio,
             );
@@ -1371,6 +1428,7 @@ fn execute_rebalance_impl<T>(
     portfolio: &mut Portfolio,
     target_weights: &HashMap<String, f64>,
     today_prices: &HashMap<&str, f64>,
+    today_factor: &HashMap<&str, f64>,
     stopped_stocks: &HashMap<String, bool>,
     config: &BacktestConfig,
     current_date: i32,
@@ -1390,11 +1448,13 @@ where
     let open_positions: Vec<String> = portfolio.positions.keys().cloned().collect();
     for sym in &open_positions {
         let exit_price = today_prices.get(sym.as_str()).copied().unwrap_or(f64::NAN);
+        let exit_factor = today_factor.get(sym.as_str()).copied().unwrap_or(1.0);
         tracker.close_trade(
             sym,
             current_date,
             Some(signal_date),
             exit_price,
+            exit_factor,
             config.fee_ratio,
             config.tax_ratio,
         );
@@ -1511,7 +1571,8 @@ where
 
                 if new_value.abs() > FLOAT_EPSILON {
                     // Finlab behavior: Open trade for ALL positions after rebalance
-                    tracker.open_trade(sym.clone(), current_date, signal_date, f64::NAN, target_weight);
+                    let entry_factor = today_factor.get(sym.as_str()).copied().unwrap_or(1.0);
+                    tracker.open_trade(sym.clone(), current_date, signal_date, f64::NAN, target_weight, entry_factor);
                     portfolio.positions.insert(
                         sym.clone(),
                         Position::new_with_nan_price(new_value),
@@ -1555,7 +1616,8 @@ where
         if new_position_value.abs() > FLOAT_EPSILON {
             // Finlab behavior: Open trade for ALL positions after rebalance
             // (All trades were closed at the start of rebalance)
-            tracker.open_trade(sym.clone(), current_date, signal_date, price, target_weight);
+            let entry_factor = today_factor.get(sym.as_str()).copied().unwrap_or(1.0);
+            tracker.open_trade(sym.clone(), current_date, signal_date, price, target_weight, entry_factor);
 
             // Determine if this is a continuing same-direction position
             let is_continuing = current_value.abs() > FLOAT_EPSILON && current_value * target_weight > 0.0;
@@ -1698,6 +1760,7 @@ mod tests {
             open_prices: None,
             high_prices: None,
             low_prices: None,
+            factor: None,
         }
     }
 
@@ -1854,7 +1917,7 @@ mod tests {
             ..Default::default()
         };
 
-        let result = backtest_long_slice(&dates, &symbols, &prices, &weights, None, None, None, ResampleFreq::Daily, None, &config);
+        let result = backtest_long_slice(&dates, &symbols, &prices, &weights, None, None, None, None, ResampleFreq::Daily, None, &config);
 
         assert_eq!(result.creturn.len(), 3);
         assert!((result.creturn[2] - 1.1).abs() < FLOAT_EPSILON);

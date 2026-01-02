@@ -15,6 +15,13 @@ use std::hash::Hash;
 
 use crate::mae_mfe::calculate_mae_mfe_at_exit;
 
+/// Round raw price to avoid floating point precision issues
+/// Uses 6 decimal places which is sufficient for price calculations
+#[inline]
+fn round_raw_price(price: f64) -> f64 {
+    (price * 1_000_000.0).round() / 1_000_000.0
+}
+
 // ============================================================================
 // Trade Records
 // ============================================================================
@@ -99,11 +106,15 @@ pub struct TradeRecord {
     pub exit_sig_date: Option<i32>,
     /// Position weight at entry
     pub position_weight: f64,
-    /// Entry price (original price, not adjusted)
+    /// Entry price (adjusted price, for return calculation)
     pub entry_price: f64,
-    /// Exit price (original price, not adjusted)
+    /// Exit price (adjusted price, for return calculation)
     pub exit_price: Option<f64>,
-    /// Trade return (calculated using original prices with fees)
+    /// Entry raw price (unadjusted = entry_price / factor, for liquidity metrics)
+    pub entry_raw_price: f64,
+    /// Exit raw price (unadjusted = exit_price / factor, for liquidity metrics)
+    pub exit_raw_price: Option<f64>,
+    /// Trade return (calculated using adjusted prices with fees)
     pub trade_return: Option<f64>,
 
     // MAE/MFE metrics (calculated at exit)
@@ -187,6 +198,7 @@ pub trait TradeTracker {
         Self: Sized;
 
     /// Record opening a new trade
+    /// - `entry_factor`: Factor at entry for raw price calculation (raw = adj / factor)
     fn open_trade(
         &mut self,
         key: Self::Key,
@@ -194,15 +206,18 @@ pub trait TradeTracker {
         signal_date: Self::Date,
         entry_price: f64,
         weight: f64,
+        entry_factor: f64,
     );
 
     /// Record closing a trade (rebalance or stop)
+    /// - `exit_factor`: Factor at exit for raw price calculation (raw = adj / factor)
     fn close_trade(
         &mut self,
         key: &Self::Key,
         exit_date: Self::Date,
         exit_sig_date: Option<Self::Date>,
         exit_price: f64,
+        exit_factor: f64,
         fee_ratio: f64,
         tax_ratio: f64,
     );
@@ -255,7 +270,7 @@ where
     }
 
     #[inline]
-    fn open_trade(&mut self, _: Self::Key, _: Self::Date, _: Self::Date, _: f64, _: f64) {}
+    fn open_trade(&mut self, _: Self::Key, _: Self::Date, _: Self::Date, _: f64, _: f64, _: f64) {}
 
     #[inline]
     fn close_trade(
@@ -263,6 +278,7 @@ where
         _: &Self::Key,
         _: Self::Date,
         _: Option<Self::Date>,
+        _: f64,
         _: f64,
         _: f64,
         _: f64,
@@ -302,6 +318,8 @@ struct OpenTradeInfo<K: Clone, D: Copy> {
     signal_date: D,
     weight: f64,
     entry_price: f64,
+    /// Factor at entry (for raw price calculation: raw = adj / factor)
+    entry_factor: f64,
     /// Close prices during the trade (for MAE/MFE calculation)
     close_prices: Vec<f64>,
     /// Trade prices during the trade (for MAE/MFE calculation)
@@ -323,6 +341,8 @@ pub trait RecordBuilder: Sized {
         weight: f64,
         entry_price: f64,
         exit_price: f64,
+        entry_raw_price: f64,
+        exit_raw_price: f64,
         fee_ratio: f64,
         tax_ratio: f64,
     ) -> Self;
@@ -337,6 +357,8 @@ pub trait RecordBuilder: Sized {
         weight: f64,
         entry_price: f64,
         exit_price: f64,
+        entry_raw_price: f64,
+        exit_raw_price: f64,
         fee_ratio: f64,
         tax_ratio: f64,
         close_prices: &[f64],
@@ -353,6 +375,7 @@ pub trait RecordBuilder: Sized {
         signal_date: Self::Date,
         weight: f64,
         entry_price: f64,
+        entry_raw_price: f64,
     ) -> Self;
 }
 
@@ -369,6 +392,8 @@ impl RecordBuilder for WideTradeRecord {
         weight: f64,
         entry_price: f64,
         exit_price: f64,
+        _entry_raw_price: f64,
+        _exit_raw_price: f64,
         fee_ratio: f64,
         tax_ratio: f64,
     ) -> Self {
@@ -404,6 +429,8 @@ impl RecordBuilder for WideTradeRecord {
         weight: f64,
         entry_price: f64,
         exit_price: f64,
+        _entry_raw_price: f64,
+        _exit_raw_price: f64,
         fee_ratio: f64,
         tax_ratio: f64,
         close_prices: &[f64],
@@ -473,6 +500,7 @@ impl RecordBuilder for WideTradeRecord {
         signal_date: usize,
         weight: f64,
         entry_price: f64,
+        _entry_raw_price: f64,
     ) -> Self {
         Self {
             stock_id: key,
@@ -507,6 +535,8 @@ impl RecordBuilder for TradeRecord {
         weight: f64,
         entry_price: f64,
         exit_price: f64,
+        entry_raw_price: f64,
+        exit_raw_price: f64,
         fee_ratio: f64,
         tax_ratio: f64,
     ) -> Self {
@@ -519,6 +549,8 @@ impl RecordBuilder for TradeRecord {
             position_weight: weight,
             entry_price,
             exit_price: Some(exit_price),
+            entry_raw_price,
+            exit_raw_price: Some(exit_raw_price),
             trade_return: None,
             mae: None,
             gmfe: None,
@@ -542,6 +574,8 @@ impl RecordBuilder for TradeRecord {
         weight: f64,
         entry_price: f64,
         exit_price: f64,
+        entry_raw_price: f64,
+        exit_raw_price: f64,
         fee_ratio: f64,
         tax_ratio: f64,
         close_prices: &[f64],
@@ -571,6 +605,8 @@ impl RecordBuilder for TradeRecord {
             position_weight: weight,
             entry_price,
             exit_price: Some(exit_price),
+            entry_raw_price,
+            exit_raw_price: Some(exit_raw_price),
             trade_return: None,
             mae: Some(metrics.mae),
             gmfe: Some(metrics.gmfe),
@@ -595,6 +631,8 @@ impl RecordBuilder for TradeRecord {
             position_weight: weight,
             entry_price: f64::NAN,
             exit_price: None,
+            entry_raw_price: f64::NAN,
+            exit_raw_price: None,
             trade_return: None,
             mae: None,
             gmfe: None,
@@ -611,6 +649,7 @@ impl RecordBuilder for TradeRecord {
         signal_date: i32,
         weight: f64,
         entry_price: f64,
+        entry_raw_price: f64,
     ) -> Self {
         Self {
             symbol: key,
@@ -621,6 +660,8 @@ impl RecordBuilder for TradeRecord {
             position_weight: weight,
             entry_price,
             exit_price: None,
+            entry_raw_price,
+            exit_raw_price: None,
             trade_return: None,
             mae: None,
             gmfe: None,
@@ -657,6 +698,7 @@ impl<R: RecordBuilder> TradeTracker for GenericTracker<R> {
         signal_date: Self::Date,
         entry_price: f64,
         weight: f64,
+        entry_factor: f64,
     ) {
         // Initialize with the entry price as first price point
         self.open_trades.insert(
@@ -667,6 +709,7 @@ impl<R: RecordBuilder> TradeTracker for GenericTracker<R> {
                 signal_date,
                 weight,
                 entry_price,
+                entry_factor,
                 close_prices: vec![entry_price],
                 trade_prices: vec![entry_price],
             },
@@ -679,10 +722,15 @@ impl<R: RecordBuilder> TradeTracker for GenericTracker<R> {
         exit_date: Self::Date,
         exit_sig_date: Option<Self::Date>,
         exit_price: f64,
+        exit_factor: f64,
         fee_ratio: f64,
         tax_ratio: f64,
     ) {
         if let Some(open_trade) = self.open_trades.remove(key) {
+            // Calculate raw prices with rounding to avoid floating point precision issues
+            let entry_raw_price = round_raw_price(open_trade.entry_price / open_trade.entry_factor);
+            let exit_raw_price = round_raw_price(exit_price / exit_factor);
+
             // Use MAE/MFE calculation if we have price history (more than just entry price)
             if open_trade.close_prices.len() > 1 {
                 self.completed_trades.push(R::build_completed_with_mae_mfe(
@@ -694,6 +742,8 @@ impl<R: RecordBuilder> TradeTracker for GenericTracker<R> {
                     open_trade.weight,
                     open_trade.entry_price,
                     exit_price,
+                    entry_raw_price,
+                    exit_raw_price,
                     fee_ratio,
                     tax_ratio,
                     &open_trade.close_prices,
@@ -710,6 +760,8 @@ impl<R: RecordBuilder> TradeTracker for GenericTracker<R> {
                     open_trade.weight,
                     open_trade.entry_price,
                     exit_price,
+                    entry_raw_price,
+                    exit_raw_price,
                     fee_ratio,
                     tax_ratio,
                 ));
@@ -735,12 +787,15 @@ impl<R: RecordBuilder> TradeTracker for GenericTracker<R> {
 
     fn finalize(mut self, _fee_ratio: f64, _tax_ratio: f64) -> Vec<R> {
         for (_, open_trade) in self.open_trades.drain() {
+            // Calculate raw price for open positions with rounding
+            let entry_raw_price = round_raw_price(open_trade.entry_price / open_trade.entry_factor);
             self.completed_trades.push(R::build_open(
                 open_trade.key,
                 open_trade.entry_date,
                 open_trade.signal_date,
                 open_trade.weight,
                 open_trade.entry_price,
+                entry_raw_price,
             ));
         }
         self.completed_trades
@@ -806,7 +861,7 @@ mod tests {
     #[test]
     fn test_noop_tracker() {
         let mut tracker: NoopIndexTracker = NoopTracker::new();
-        tracker.open_trade(0, 1, 0, 100.0, 0.5);
+        tracker.open_trade(0, 1, 0, 100.0, 0.5, 1.0);
         assert!(!tracker.has_open_trade(&0));
 
         let trades = tracker.finalize(0.001, 0.003);
@@ -817,11 +872,11 @@ mod tests {
     fn test_index_tracker_open_close() {
         let mut tracker = IndexTracker::new();
 
-        tracker.open_trade(0, 1, 0, 100.0, 0.5);
+        tracker.open_trade(0, 1, 0, 100.0, 0.5, 1.0);
         assert!(tracker.has_open_trade(&0));
         assert!(!tracker.has_open_trade(&1));
 
-        tracker.close_trade(&0, 10, Some(9), 110.0, 0.001425, 0.003);
+        tracker.close_trade(&0, 10, Some(9), 110.0, 1.0, 0.001425, 0.003);
         assert!(!tracker.has_open_trade(&0));
 
         let trades = tracker.finalize(0.001425, 0.003);
@@ -846,11 +901,12 @@ mod tests {
     fn test_symbol_tracker_open_close() {
         let mut tracker = SymbolTracker::new();
 
-        tracker.open_trade("2330".to_string(), 19000, 18999, 100.0, 0.5);
+        // factor = 1.0 means raw price equals adj price
+        tracker.open_trade("2330".to_string(), 19000, 18999, 100.0, 0.5, 1.0);
         assert!(tracker.has_open_trade(&"2330".to_string()));
         assert!(!tracker.has_open_trade(&"2317".to_string()));
 
-        tracker.close_trade(&"2330".to_string(), 19010, Some(19009), 110.0, 0.001425, 0.003);
+        tracker.close_trade(&"2330".to_string(), 19010, Some(19009), 110.0, 1.0, 0.001425, 0.003);
         assert!(!tracker.has_open_trade(&"2330".to_string()));
 
         let trades = tracker.finalize(0.001425, 0.003);
@@ -858,6 +914,27 @@ mod tests {
         assert_eq!(trades[0].symbol, "2330");
         assert_eq!(trades[0].entry_date, Some(19000));
         assert_eq!(trades[0].exit_date, Some(19010));
+        // With factor = 1.0, raw_price should equal adj price
+        assert_eq!(trades[0].entry_raw_price, 100.0);
+        assert_eq!(trades[0].exit_raw_price, Some(110.0));
+    }
+
+    #[test]
+    fn test_symbol_tracker_with_factor() {
+        let mut tracker = SymbolTracker::new();
+
+        // adj_price = 100.0, factor = 2.0 => raw_price = 50.0
+        tracker.open_trade("2330".to_string(), 19000, 18999, 100.0, 0.5, 2.0);
+
+        // adj_price = 110.0, factor = 2.2 => raw_price = 50.0
+        tracker.close_trade(&"2330".to_string(), 19010, Some(19009), 110.0, 2.2, 0.001425, 0.003);
+
+        let trades = tracker.finalize(0.001425, 0.003);
+        assert_eq!(trades.len(), 1);
+        assert_eq!(trades[0].entry_price, 100.0);        // adj price
+        assert_eq!(trades[0].exit_price, Some(110.0));   // adj price
+        assert_eq!(trades[0].entry_raw_price, 50.0);     // 100.0 / 2.0
+        assert_eq!(trades[0].exit_raw_price, Some(50.0)); // 110.0 / 2.2 = 50.0 (rounded)
     }
 
     #[test]
@@ -869,6 +946,7 @@ mod tests {
         assert_eq!(trades.len(), 1);
         assert_eq!(trades[0].entry_date, None);
         assert!(trades[0].entry_price.is_nan());
+        assert!(trades[0].entry_raw_price.is_nan());
     }
 
     #[test]
@@ -882,6 +960,8 @@ mod tests {
             position_weight: 0.5,
             entry_price: 100.0,
             exit_price: Some(110.0),
+            entry_raw_price: 100.0,
+            exit_raw_price: Some(110.0),
             trade_return: None,
             mae: None,
             gmfe: None,

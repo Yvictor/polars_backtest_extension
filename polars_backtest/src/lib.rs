@@ -375,6 +375,9 @@ fn trades_to_dataframe(trades: &[TradeRecord]) -> PolarsResult<DataFrame> {
     let trade_return: Vec<Option<f64>> = trades.iter().map(|t| t.trade_return).collect();
     let entry_price: Vec<f64> = trades.iter().map(|t| t.entry_price).collect();
     let exit_price: Vec<Option<f64>> = trades.iter().map(|t| t.exit_price).collect();
+    // Raw prices (adj_price / factor, for liquidity calculations)
+    let entry_raw_price: Vec<f64> = trades.iter().map(|t| t.entry_raw_price).collect();
+    let exit_raw_price: Vec<Option<f64>> = trades.iter().map(|t| t.exit_raw_price).collect();
     // MAE/MFE columns
     let mae: Vec<Option<f64>> = trades.iter().map(|t| t.mae).collect();
     let gmfe: Vec<Option<f64>> = trades.iter().map(|t| t.gmfe).collect();
@@ -397,6 +400,8 @@ fn trades_to_dataframe(trades: &[TradeRecord]) -> PolarsResult<DataFrame> {
     let return_series = Series::new("return".into(), trade_return);
     let entry_price_series = Series::new("entry_price".into(), entry_price);
     let exit_price_series = Series::new("exit_price".into(), exit_price);
+    let entry_raw_price_series = Series::new("entry_raw_price".into(), entry_raw_price);
+    let exit_raw_price_series = Series::new("exit_raw_price".into(), exit_raw_price);
     // MAE/MFE series
     let mae_series = Series::new("mae".into(), mae);
     let gmfe_series = Series::new("gmfe".into(), gmfe);
@@ -415,6 +420,8 @@ fn trades_to_dataframe(trades: &[TradeRecord]) -> PolarsResult<DataFrame> {
         return_series.into_column(),
         entry_price_series.into_column(),
         exit_price_series.into_column(),
+        entry_raw_price_series.into_column(),
+        exit_raw_price_series.into_column(),
         mae_series.into_column(),
         gmfe_series.into_column(),
         bmfe_series.into_column(),
@@ -443,6 +450,9 @@ fn trades_to_dataframe(trades: &[TradeRecord]) -> PolarsResult<DataFrame> {
 ///     open: Name of open price column (default: "open", for touched_exit)
 ///     high: Name of high price column (default: "high", for touched_exit)
 ///     low: Name of low price column (default: "low", for touched_exit)
+///     factor: Name of factor column for raw price calculation (default: None)
+///             If provided, raw_price = adj_price / factor
+///             If column doesn't exist, factor defaults to 1.0
 ///     resample: Rebalancing frequency ("D", "W", "M", or None for daily)
 ///     config: BacktestConfig (optional)
 ///     skip_sort: Skip sorting if data is already sorted by date (default: false)
@@ -459,6 +469,7 @@ fn trades_to_dataframe(trades: &[TradeRecord]) -> PolarsResult<DataFrame> {
     open="open",
     high="high",
     low="low",
+    factor=None,
     resample=None,
     resample_offset=None,
     config=None,
@@ -473,6 +484,7 @@ fn backtest(
     open: &str,
     high: &str,
     low: &str,
+    factor: Option<&str>,
     resample: Option<&str>,
     resample_offset: Option<&str>,
     config: Option<PyBacktestConfig>,
@@ -690,6 +702,45 @@ fn backtest(
     profile!("[PROFILE] OHLC processing: {:?}", step_start.elapsed());
     step_start = Instant::now();
 
+    // Process factor column if provided
+    let factor_rs = if let Some(factor_col) = factor {
+        // Check if column exists
+        if df.column(factor_col).is_ok() {
+            let col_ref = df.column(factor_col)
+                .map_err(|e| PyValueError::new_err(format!("Failed to get {} column: {}", factor_col, e)))?;
+            let col_series = if col_ref.dtype() == &DataType::Float64 {
+                col_ref.clone()
+            } else {
+                col_ref.cast(&DataType::Float64)
+                    .map_err(|e| PyValueError::new_err(format!("Failed to cast {}: {}", factor_col, e)))?
+            };
+            let col_f64 = col_series.f64()
+                .map_err(|e| PyValueError::new_err(format!("{} must be f64: {}", factor_col, e)))?;
+            let col_rechunked;
+            let col_ca: &Float64Chunked = if col_f64.chunks().len() > 1 {
+                col_rechunked = col_f64.rechunk();
+                &col_rechunked
+            } else {
+                col_f64
+            };
+            let col_chunks = col_ca.chunks();
+            let col_arrow = col_chunks[0]
+                .as_any()
+                .downcast_ref::<PrimitiveArray<f64>>()
+                .ok_or_else(|| PyValueError::new_err(format!("Failed to downcast {} array", factor_col)))?;
+            Some(ffi_convert::polars_f64_to_arrow(col_arrow)
+                .map_err(|e| PyValueError::new_err(format!("FFI {} conversion failed: {}", factor_col, e)))?)
+        } else {
+            // Column doesn't exist, use None (defaults to 1.0 in btcore)
+            None
+        }
+    } else {
+        None
+    };
+
+    profile!("[PROFILE] Factor processing: {:?}", step_start.elapsed());
+    step_start = Instant::now();
+
     // Parse resample frequency and offset
     let resample_freq = ResampleFreq::from_str(resample);
     let offset = ResampleOffset::from_str(resample_offset);
@@ -703,6 +754,7 @@ fn backtest(
         open_prices: open_rs.as_ref(),
         high_prices: high_rs.as_ref(),
         low_prices: low_rs.as_ref(),
+        factor: factor_rs.as_ref(),
     };
 
     // Run backtest using btcore with arrow-rs arrays
@@ -786,6 +838,9 @@ fn backtest(
 ///     open: Name of open price column (default: "open", for touched_exit)
 ///     high: Name of high price column (default: "high", for touched_exit)
 ///     low: Name of low price column (default: "low", for touched_exit)
+///     factor: Name of factor column for raw price calculation (default: None)
+///             If provided, raw_price = adj_price / factor
+///             If column doesn't exist, factor defaults to 1.0
 ///     resample: Rebalancing frequency ("D", "W", "M", or None for daily)
 ///     resample_offset: Optional offset for rebalance dates (e.g., "1d", "2d", "1W")
 ///     config: BacktestConfig (optional)
@@ -803,6 +858,7 @@ fn backtest(
     open="open",
     high="high",
     low="low",
+    factor=None,
     resample=None,
     resample_offset=None,
     config=None,
@@ -817,6 +873,7 @@ fn backtest_with_report(
     open: &str,
     high: &str,
     low: &str,
+    factor: Option<&str>,
     resample: Option<&str>,
     resample_offset: Option<&str>,
     config: Option<PyBacktestConfig>,
@@ -1012,6 +1069,42 @@ fn backtest_with_report(
         (None, None, None)
     };
 
+    // Process factor column if provided
+    let factor_rs = if let Some(factor_col) = factor {
+        // Check if column exists
+        if df.column(factor_col).is_ok() {
+            let col_ref = df.column(factor_col)
+                .map_err(|e| PyValueError::new_err(format!("Failed to get {} column: {}", factor_col, e)))?;
+            let col_series = if col_ref.dtype() == &DataType::Float64 {
+                col_ref.clone()
+            } else {
+                col_ref.cast(&DataType::Float64)
+                    .map_err(|e| PyValueError::new_err(format!("Failed to cast {}: {}", factor_col, e)))?
+            };
+            let col_f64 = col_series.f64()
+                .map_err(|e| PyValueError::new_err(format!("{} must be f64: {}", factor_col, e)))?;
+            let col_rechunked;
+            let col_ca: &Float64Chunked = if col_f64.chunks().len() > 1 {
+                col_rechunked = col_f64.rechunk();
+                &col_rechunked
+            } else {
+                col_f64
+            };
+            let col_chunks = col_ca.chunks();
+            let col_arrow = col_chunks[0]
+                .as_any()
+                .downcast_ref::<PrimitiveArray<f64>>()
+                .ok_or_else(|| PyValueError::new_err(format!("Failed to downcast {} array", factor_col)))?;
+            Some(ffi_convert::polars_f64_to_arrow(col_arrow)
+                .map_err(|e| PyValueError::new_err(format!("FFI {} conversion failed: {}", factor_col, e)))?)
+        } else {
+            // Column doesn't exist, use None (defaults to 1.0 in btcore)
+            None
+        }
+    } else {
+        None
+    };
+
     // Parse resample frequency and offset
     let resample_freq = ResampleFreq::from_str(resample);
     let offset = ResampleOffset::from_str(resample_offset);
@@ -1025,6 +1118,7 @@ fn backtest_with_report(
         open_prices: open_rs.as_ref(),
         high_prices: high_rs.as_ref(),
         low_prices: low_rs.as_ref(),
+        factor: factor_rs.as_ref(),
     };
 
     // Run backtest with report using btcore

@@ -115,7 +115,8 @@ fn simulate_backtest_finlab<T: TradeTracker<Key = usize, Date = usize>>(
                             }
 
                             let exit_price = trade_prices[t].get(touched.stock_id).copied().unwrap_or(1.0);
-                            tracker.close_trade(&touched.stock_id, t, Some(t), exit_price, config.fee_ratio, config.tax_ratio);
+                            // Wide format: no factor concept, use 1.0
+                            tracker.close_trade(&touched.stock_id, t, Some(t), exit_price, 1.0, config.fee_ratio, config.tax_ratio);
                         }
                     }
                 }
@@ -159,7 +160,8 @@ fn simulate_backtest_finlab<T: TradeTracker<Key = usize, Date = usize>>(
                         }
 
                         let exit_price = trade_prices[t].get(stock_id).copied().unwrap_or(1.0);
-                        tracker.close_trade(&stock_id, t, None, exit_price, config.fee_ratio, config.tax_ratio);
+                        // Wide format: no factor concept, use 1.0
+                        tracker.close_trade(&stock_id, t, None, exit_price, 1.0, config.fee_ratio, config.tax_ratio);
                         today_stops.retain(|&x| x != stock_id);
                     }
                 }
@@ -191,7 +193,8 @@ fn simulate_backtest_finlab<T: TradeTracker<Key = usize, Date = usize>>(
                 // Close all trades during rebalance
                 for stock_id in portfolio.positions.keys().copied().collect::<Vec<_>>() {
                     let exit_price = trade_prices[t].get(stock_id).copied().unwrap_or(1.0);
-                    tracker.close_trade(&stock_id, t, Some(signal_index), exit_price, config.fee_ratio, config.tax_ratio);
+                    // Wide format: no factor concept, use 1.0
+                    tracker.close_trade(&stock_id, t, Some(signal_index), exit_price, 1.0, config.fee_ratio, config.tax_ratio);
                 }
 
                 execute_finlab_rebalance(&mut portfolio, &target_weights, &close_prices[t], config);
@@ -200,7 +203,8 @@ fn simulate_backtest_finlab<T: TradeTracker<Key = usize, Date = usize>>(
                 for (stock_id, &target_weight) in target_weights.iter().enumerate() {
                     if target_weight != 0.0 && portfolio.positions.contains_key(&stock_id) {
                         let entry_price = trade_prices[t].get(stock_id).copied().unwrap_or(1.0);
-                        tracker.open_trade(stock_id, t, signal_index, entry_price, target_weight);
+                        // Wide format: no factor concept, use 1.0
+                        tracker.open_trade(stock_id, t, signal_index, entry_price, target_weight, 1.0);
                     }
                 }
 
@@ -273,7 +277,8 @@ fn simulate_backtest_standard<T: TradeTracker<Key = usize, Date = usize>>(
                 for (&stock_id, _) in portfolio.positions.iter() {
                     if stock_id < target_weights.len() && target_weights[stock_id] == 0.0 {
                         let exit_price = trade_prices[t].get(stock_id).copied().unwrap_or(1.0);
-                        tracker.close_trade(&stock_id, t, Some(signal_index), exit_price, config.fee_ratio, config.tax_ratio);
+                        // Wide format: no factor concept, use 1.0
+                        tracker.close_trade(&stock_id, t, Some(signal_index), exit_price, 1.0, config.fee_ratio, config.tax_ratio);
                     }
                 }
 
@@ -283,7 +288,8 @@ fn simulate_backtest_standard<T: TradeTracker<Key = usize, Date = usize>>(
                 for (stock_id, &target_weight) in target_weights.iter().enumerate() {
                     if target_weight != 0.0 && portfolio.positions.contains_key(&stock_id) && !tracker.has_open_trade(&stock_id) {
                         let entry_price = trade_prices[t].get(stock_id).copied().unwrap_or(1.0);
-                        tracker.open_trade(stock_id, t, signal_index, entry_price, target_weight);
+                        // Wide format: no factor concept, use 1.0
+                        tracker.open_trade(stock_id, t, signal_index, entry_price, target_weight, 1.0);
                     }
                 }
 
@@ -304,7 +310,8 @@ fn simulate_backtest_standard<T: TradeTracker<Key = usize, Date = usize>>(
                         }
 
                         let exit_price = trade_prices[t].get(stock_id).copied().unwrap_or(1.0);
-                        tracker.close_trade(&stock_id, t, None, exit_price, config.fee_ratio, config.tax_ratio);
+                        // Wide format: no factor concept, use 1.0
+                        tracker.close_trade(&stock_id, t, None, exit_price, 1.0, config.fee_ratio, config.tax_ratio);
                     }
                 }
                 pending_stop_exits.clear();

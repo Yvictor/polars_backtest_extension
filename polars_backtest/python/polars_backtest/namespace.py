@@ -92,6 +92,7 @@ class BacktestNamespace:
         open: ColumnSpec = "open",
         high: ColumnSpec = "high",
         low: ColumnSpec = "low",
+        factor: str = "factor",
         resample: str | None = "D",
         resample_offset: str | None = None,
         fee_ratio: float = 0.001425,
@@ -115,6 +116,8 @@ class BacktestNamespace:
             open: Open price column name or Expr (default: "open", for touched_exit)
             high: High price column name or Expr (default: "high", for touched_exit)
             low: Low price column name or Expr (default: "low", for touched_exit)
+            factor: Factor column name for raw price calculation (default: "factor").
+                   raw_price = adj_price / factor. If column doesn't exist, uses 1.0.
             resample: Rebalance frequency ('D', 'W', 'M', 'Q', 'Y', None)
             resample_offset: Optional offset for rebalance dates
             fee_ratio: Transaction fee ratio
@@ -210,6 +213,9 @@ class BacktestNamespace:
         # Check if already sorted by date
         skip_sort = df.get_column(date_col).is_sorted()
 
+        # factor column: pass column name if exists, else None (defaults to 1.0 in Rust)
+        factor_col = factor if factor in df.columns else None
+
         result = _rust_backtest(
             df,
             date_col,
@@ -219,6 +225,7 @@ class BacktestNamespace:
             open_col,
             high_col,
             low_col,
+            factor_col,
             resample,
             resample_offset,
             config,
@@ -236,6 +243,7 @@ class BacktestNamespace:
         open: ColumnSpec = "open",
         high: ColumnSpec = "high",
         low: ColumnSpec = "low",
+        factor: str = "factor",
         resample: str | None = "D",
         resample_offset: str | None = None,
         fee_ratio: float = 0.001425,
@@ -262,6 +270,8 @@ class BacktestNamespace:
             open: Open price column name or Expr (default: "open", for touched_exit)
             high: High price column name or Expr (default: "high", for touched_exit)
             low: Low price column name or Expr (default: "low", for touched_exit)
+            factor: Factor column name for raw price calculation (default: "factor").
+                   raw_price = adj_price / factor. If column doesn't exist, uses 1.0.
             resample: Rebalance frequency ('D', 'W', 'M', 'Q', 'Y', None)
             resample_offset: Optional offset for rebalance dates
             fee_ratio: Transaction fee ratio
@@ -340,6 +350,8 @@ class BacktestNamespace:
 
         # Use Rust backtest_with_report directly (returns BacktestReport with trades DataFrame)
         # OHLC columns are only used when touched_exit=True
+        # factor column: pass column name, Rust checks if it exists (defaults to 1.0 if not)
+        factor_col = factor if factor in df.columns else None
         return _rust_backtest_with_report(
             df,
             date_col,
@@ -349,6 +361,7 @@ class BacktestNamespace:
             open_col if open_col else "open",
             high_col if high_col else "high",
             low_col if low_col else "low",
+            factor_col,
             resample,
             resample_offset,
             config,
@@ -369,6 +382,7 @@ def backtest(
     open: ColumnSpec = "open",
     high: ColumnSpec = "high",
     low: ColumnSpec = "low",
+    factor: str = "factor",
     resample: str | None = "D",
     resample_offset: str | None = None,
     fee_ratio: float = 0.001425,
@@ -393,6 +407,8 @@ def backtest(
         open: Open price column name or Expr (default: "open", for touched_exit)
         high: High price column name or Expr (default: "high", for touched_exit)
         low: Low price column name or Expr (default: "low", for touched_exit)
+        factor: Factor column name for raw price calculation (default: "factor").
+               raw_price = adj_price / factor. If column doesn't exist, uses 1.0.
         resample: Rebalance frequency ('D', 'W', 'M', 'Q', 'Y', None)
         resample_offset: Optional offset for rebalance dates
         fee_ratio: Transaction fee ratio
@@ -421,6 +437,7 @@ def backtest(
         open=open,
         high=high,
         low=low,
+        factor=factor,
         resample=resample,
         resample_offset=resample_offset,
         fee_ratio=fee_ratio,
@@ -445,6 +462,7 @@ def backtest_with_report(
     open: ColumnSpec = "open",
     high: ColumnSpec = "high",
     low: ColumnSpec = "low",
+    factor: str = "factor",
     resample: str | None = "D",
     resample_offset: str | None = None,
     fee_ratio: float = 0.001425,
@@ -471,6 +489,8 @@ def backtest_with_report(
         open: Open price column name or Expr (default: "open", for touched_exit)
         high: High price column name or Expr (default: "high", for touched_exit)
         low: Low price column name or Expr (default: "low", for touched_exit)
+        factor: Factor column name for raw price calculation (default: "factor").
+               raw_price = adj_price / factor. If column doesn't exist, uses 1.0.
         resample: Rebalance frequency ('D', 'W', 'M', 'Q', 'Y', None)
         resample_offset: Optional offset for rebalance dates
         fee_ratio: Transaction fee ratio
@@ -501,6 +521,7 @@ def backtest_with_report(
         open=open,
         high=high,
         low=low,
+        factor=factor,
         resample=resample,
         resample_offset=resample_offset,
         fee_ratio=fee_ratio,
