@@ -25,6 +25,7 @@ pub struct PyBacktestReport {
     pub(crate) trades_df: DataFrame,
     pub(crate) config: BacktestConfig,
     pub(crate) resample: Option<String>,
+    pub(crate) benchmark_df: Option<DataFrame>,
 }
 
 impl PyBacktestReport {
@@ -40,6 +41,24 @@ impl PyBacktestReport {
             trades_df,
             config,
             resample,
+            benchmark_df: None,
+        }
+    }
+
+    /// Create a new PyBacktestReport with benchmark
+    pub fn new_with_benchmark(
+        creturn_df: DataFrame,
+        trades_df: DataFrame,
+        config: BacktestConfig,
+        resample: Option<String>,
+        benchmark_df: Option<DataFrame>,
+    ) -> Self {
+        Self {
+            creturn_df,
+            trades_df,
+            config,
+            resample,
+            benchmark_df,
         }
     }
 }
@@ -110,6 +129,38 @@ impl PyBacktestReport {
     #[getter]
     fn get_resample(&self) -> Option<&str> {
         self.resample.as_deref()
+    }
+
+    /// Get benchmark DataFrame (if set)
+    /// Returns DataFrame with columns (date, creturn)
+    #[getter]
+    fn benchmark(&self) -> Option<PyDataFrame> {
+        self.benchmark_df.as_ref().map(|df| PyDataFrame(df.clone()))
+    }
+
+    /// Set benchmark DataFrame
+    ///
+    /// Args:
+    ///     benchmark: DataFrame with columns (date, creturn).
+    ///               creturn should be cumulative return values (e.g., 1.0, 1.01, 1.02).
+    #[setter]
+    fn set_benchmark(&mut self, benchmark: Option<PyDataFrame>) -> PyResult<()> {
+        match benchmark {
+            Some(bm) => {
+                let df = bm.0;
+                // Validate benchmark has required columns
+                if df.column("date").is_err() || df.column("creturn").is_err() {
+                    return Err(PyValueError::new_err(
+                        "Benchmark DataFrame must have 'date' and 'creturn' columns"
+                    ));
+                }
+                self.benchmark_df = Some(df);
+            }
+            None => {
+                self.benchmark_df = None;
+            }
+        }
+        Ok(())
     }
 
     /// Get backtest statistics as a single-row DataFrame (with default riskfree_rate=0.02)
@@ -428,17 +479,15 @@ impl PyBacktestReport {
     ///     sections: List of sections to include. Options: "backtest", "profitability",
     ///              "risk", "ratio", "winrate". Defaults to all sections.
     ///     riskfree_rate: Annual risk-free rate for Sharpe/Sortino calculations.
-    ///     benchmark: Optional benchmark DataFrame with columns (date, creturn).
-    ///               If provided, alpha, beta, and m12WinRate will be calculated.
     ///
     /// Returns:
     ///     Single-row DataFrame with each metric as a column.
-    #[pyo3(signature = (sections=None, riskfree_rate=0.02, benchmark=None))]
+    ///     If benchmark is set (via setter), alpha, beta, and m12WinRate will be calculated.
+    #[pyo3(signature = (sections=None, riskfree_rate=0.02))]
     fn get_metrics(
         &self,
         sections: Option<Vec<String>>,
         riskfree_rate: f64,
-        benchmark: Option<PyDataFrame>,
     ) -> PyResult<PyDataFrame> {
         let all_sections = vec!["backtest", "profitability", "risk", "ratio", "winrate"];
         let sections_list: Vec<&str> = match &sections {
@@ -496,15 +545,8 @@ impl PyBacktestReport {
             .collect()
             .map_err(to_py_err)?;
 
-        // Process benchmark if provided
-        let benchmark_metrics = if let Some(bm) = benchmark {
-            let bm_df = bm.0;
-            // Validate benchmark has required columns
-            if bm_df.column("date").is_err() || bm_df.column("creturn").is_err() {
-                return Err(PyValueError::new_err(
-                    "Benchmark DataFrame must have 'date' and 'creturn' columns"
-                ));
-            }
+        // Use stored benchmark (set via setter or backtest_with_report)
+        let benchmark_metrics = if let Some(bm_df) = self.benchmark_df.clone() {
             Some(self.calc_benchmark_metrics(&daily_with_return, &monthly_with_return, bm_df, rf_periodic)
                 .map_err(to_py_err)?)
         } else {

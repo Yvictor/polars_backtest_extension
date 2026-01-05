@@ -862,7 +862,8 @@ fn backtest(
     resample=None,
     resample_offset=None,
     config=None,
-    skip_sort=false
+    skip_sort=false,
+    benchmark=None
 ))]
 fn backtest_with_report(
     df: PyDataFrame,
@@ -878,6 +879,7 @@ fn backtest_with_report(
     resample_offset: Option<&str>,
     config: Option<PyBacktestConfig>,
     skip_sort: bool,
+    benchmark: Option<Py<PyAny>>,
 ) -> PyResult<PyBacktestReport> {
     use polars_arrow::array::{PrimitiveArray, Utf8ViewArray};
 
@@ -1124,6 +1126,45 @@ fn backtest_with_report(
     // Run backtest with report using btcore
     let result = backtest_with_report_long_arrow(&input, resample_freq, offset, &cfg);
 
+    // Process benchmark parameter (can be str column name or PyDataFrame)
+    let benchmark_df: Option<DataFrame> = if let Some(bm_obj) = benchmark {
+        Python::attach(|py| -> PyResult<Option<DataFrame>> {
+            // Try to extract as string (column name)
+            if let Ok(bm_col) = bm_obj.extract::<&str>(py) {
+                // Extract benchmark from df: group by date, take first value per date
+                let bm_df = df
+                    .clone()
+                    .lazy()
+                    .group_by([col(date)])
+                    .agg([col(bm_col).first().alias("creturn")])
+                    .sort([date], Default::default())
+                    .with_column(col(date).alias("date"))
+                    .select([col("date"), col("creturn")])
+                    .collect()
+                    .map_err(|e| PyValueError::new_err(format!("Failed to extract benchmark column '{}': {}", bm_col, e)))?;
+                Ok(Some(bm_df))
+            }
+            // Try to extract as PyDataFrame
+            else if let Ok(bm_pydf) = bm_obj.extract::<PyDataFrame>(py) {
+                let bm_df = bm_pydf.0;
+                // Validate benchmark has required columns
+                if bm_df.column("date").is_err() || bm_df.column("creturn").is_err() {
+                    return Err(PyValueError::new_err(
+                        "Benchmark DataFrame must have 'date' and 'creturn' columns"
+                    ));
+                }
+                Ok(Some(bm_df))
+            }
+            else {
+                Err(PyValueError::new_err(
+                    "benchmark must be a column name (str) or DataFrame with 'date' and 'creturn' columns"
+                ))
+            }
+        })?
+    } else {
+        None
+    };
+
     // Handle empty result (no signals/trades)
     if result.dates.is_empty() {
         let empty_dates = Series::new_empty(date.into(), &DataType::Date);
@@ -1136,11 +1177,12 @@ fn backtest_with_report(
         let trades_df = trades_to_dataframe(&result.trades)
             .map_err(|e| PyValueError::new_err(format!("Failed to create trades DataFrame: {}", e)))?;
 
-        return Ok(PyBacktestReport::new(
+        return Ok(PyBacktestReport::new_with_benchmark(
             creturn_df,
             trades_df,
             cfg,
             resample.map(|s| s.to_string()),
+            benchmark_df.clone(),
         ));
     }
 
@@ -1193,11 +1235,12 @@ fn backtest_with_report(
 
     profile!("[PROFILE] backtest_with_report: {} rows, {} trades", n_rows, result.trades.len());
 
-    Ok(PyBacktestReport::new(
+    Ok(PyBacktestReport::new_with_benchmark(
         creturn_df,
         trades_df,
         cfg,
         resample.map(|s| s.to_string()),
+        benchmark_df,
     ))
 }
 

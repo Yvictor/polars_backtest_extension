@@ -98,6 +98,14 @@ class BacktestReport:
         ...
 
     @property
+    def benchmark(self) -> pl.DataFrame | None:
+        """Benchmark DataFrame if set (date, creturn columns)."""
+        ...
+
+    @benchmark.setter
+    def benchmark(self, value: pl.DataFrame | None) -> None: ...
+
+    @property
     def stats(self) -> pl.DataFrame:
         """Backtest statistics as single-row DataFrame (with default riskfree_rate=0.02).
 
@@ -195,6 +203,9 @@ class BacktestReport:
             - ratio: sharpeRatio, sortinoRatio, calmarRatio, volatility,
                     profitFactor, tailRatio
             - winrate: winRate, expectancy, mae, mfe
+
+            If benchmark is set (via setter or backtest_with_report), additional columns:
+            - alpha, beta, m12WinRate (12-month rolling win rate vs benchmark)
         """
         ...
 

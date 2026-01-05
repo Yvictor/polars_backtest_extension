@@ -244,6 +244,7 @@ class BacktestNamespace:
         high: ColumnSpec = "high",
         low: ColumnSpec = "low",
         factor: str = "factor",
+        benchmark: str | pl.DataFrame | None = None,
         resample: str | None = "D",
         resample_offset: str | None = None,
         fee_ratio: float = 0.001425,
@@ -272,6 +273,10 @@ class BacktestNamespace:
             low: Low price column name or Expr (default: "low", for touched_exit)
             factor: Factor column name for raw price calculation (default: "factor").
                    raw_price = adj_price / factor. If column doesn't exist, uses 1.0.
+            benchmark: Benchmark for alpha/beta/m12WinRate calculation. Can be:
+                      - str: Symbol value (e.g., "0050"), uses that symbol's price as benchmark
+                      - pl.DataFrame: DataFrame with 'date' and 'creturn' columns
+                      If provided, alpha/beta/m12WinRate will be auto-calculated in get_metrics().
             resample: Rebalance frequency ('D', 'W', 'M', 'Q', 'Y', None)
             resample_offset: Optional offset for rebalance dates
             fee_ratio: Transaction fee ratio
@@ -348,6 +353,37 @@ class BacktestNamespace:
         # Check if already sorted
         skip_sort = df.get_column(date_col).is_sorted()
 
+        # Process benchmark parameter
+        # - str: symbol 值，用該 symbol 的價格計算 creturn
+        # - pl.DataFrame: 直接使用
+        benchmark_arg: pl.DataFrame | None = None
+        if benchmark is not None:
+            if isinstance(benchmark, pl.DataFrame):
+                # Validate DataFrame has required columns
+                if "date" not in benchmark.columns or "creturn" not in benchmark.columns:
+                    raise ValueError(
+                        "Benchmark DataFrame must have 'date' and 'creturn' columns"
+                    )
+                benchmark_arg = benchmark
+            elif isinstance(benchmark, str):
+                # str = symbol 值，用該 symbol 的價格計算 creturn
+                bm_df = (
+                    df.filter(pl.col(symbol_col) == benchmark)
+                    .select([pl.col(date_col).alias("date"), pl.col(price_col)])
+                    .sort("date")
+                    .with_columns(
+                        (pl.col(price_col) / pl.col(price_col).first()).alias("creturn")
+                    )
+                    .select(["date", "creturn"])
+                )
+                if bm_df.height == 0:
+                    raise ValueError(f"Symbol '{benchmark}' not found in DataFrame")
+                benchmark_arg = bm_df
+            else:
+                raise TypeError(
+                    f"benchmark must be str or pl.DataFrame, got {type(benchmark)}"
+                )
+
         # Use Rust backtest_with_report directly (returns BacktestReport with trades DataFrame)
         # OHLC columns are only used when touched_exit=True
         # factor column: pass column name, Rust checks if it exists (defaults to 1.0 if not)
@@ -366,6 +402,7 @@ class BacktestNamespace:
             resample_offset,
             config,
             skip_sort,
+            benchmark_arg,
         )
 
 # =============================================================================
@@ -463,6 +500,7 @@ def backtest_with_report(
     high: ColumnSpec = "high",
     low: ColumnSpec = "low",
     factor: str = "factor",
+    benchmark: str | pl.DataFrame | None = None,
     resample: str | None = "D",
     resample_offset: str | None = None,
     fee_ratio: float = 0.001425,
@@ -491,6 +529,10 @@ def backtest_with_report(
         low: Low price column name or Expr (default: "low", for touched_exit)
         factor: Factor column name for raw price calculation (default: "factor").
                raw_price = adj_price / factor. If column doesn't exist, uses 1.0.
+        benchmark: Benchmark for alpha/beta/m12WinRate calculation. Can be:
+                  - str: Symbol value (e.g., "0050"), uses that symbol's price as benchmark
+                  - pl.DataFrame: DataFrame with 'date' and 'creturn' columns
+                  If provided, alpha/beta/m12WinRate will be auto-calculated in get_metrics().
         resample: Rebalance frequency ('D', 'W', 'M', 'Q', 'Y', None)
         resample_offset: Optional offset for rebalance dates
         fee_ratio: Transaction fee ratio
@@ -522,6 +564,7 @@ def backtest_with_report(
         high=high,
         low=low,
         factor=factor,
+        benchmark=benchmark,
         resample=resample,
         resample_offset=resample_offset,
         fee_ratio=fee_ratio,
