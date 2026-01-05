@@ -4,7 +4,7 @@ build-backend = "maturin"
 
 [project]
 name = "polars_backtest"
-version = "0.1.0"
+version = "0.1.1"
 description = "Polars extension for portfolio backtesting"
 readme = "README.md"
 license = { text = "PolyForm Noncommercial 1.0.0" }

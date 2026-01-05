@@ -1,6 +1,6 @@
 {
   "name": "polars-backtest",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Polars backtest extension development helper - backtesting with polars expressions",
   "author": {
     "name": "Yvictor",
