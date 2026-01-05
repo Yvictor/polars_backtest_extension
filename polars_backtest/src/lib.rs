@@ -863,7 +863,9 @@ fn backtest(
     resample_offset=None,
     config=None,
     skip_sort=false,
-    benchmark=None
+    benchmark=None,
+    limit_up="limit_up",
+    limit_down="limit_down"
 ))]
 fn backtest_with_report(
     df: PyDataFrame,
@@ -880,6 +882,8 @@ fn backtest_with_report(
     config: Option<PyBacktestConfig>,
     skip_sort: bool,
     benchmark: Option<Py<PyAny>>,
+    limit_up: &str,
+    limit_down: &str,
 ) -> PyResult<PyBacktestReport> {
     use polars_arrow::array::{PrimitiveArray, Utf8ViewArray};
 
@@ -1165,6 +1169,26 @@ fn backtest_with_report(
         None
     };
 
+    // Extract limit_prices_df if limit_up or limit_down columns exist
+    let limit_prices_df: Option<DataFrame> = {
+        let has_limit_up = df.column(limit_up).is_ok();
+        let has_limit_down = df.column(limit_down).is_ok();
+
+        if has_limit_up || has_limit_down {
+            let mut select_cols = vec![col(date).alias("date"), col(symbol).alias("symbol")];
+            if has_limit_up {
+                select_cols.push(col(limit_up).alias("limit_up"));
+            }
+            if has_limit_down {
+                select_cols.push(col(limit_down).alias("limit_down"));
+            }
+            Some(df.clone().lazy().select(select_cols).collect()
+                .map_err(|e| PyValueError::new_err(format!("Failed to extract limit prices: {}", e)))?)
+        } else {
+            None
+        }
+    };
+
     // Handle empty result (no signals/trades)
     if result.dates.is_empty() {
         let empty_dates = Series::new_empty(date.into(), &DataType::Date);
@@ -1177,12 +1201,13 @@ fn backtest_with_report(
         let trades_df = trades_to_dataframe(&result.trades)
             .map_err(|e| PyValueError::new_err(format!("Failed to create trades DataFrame: {}", e)))?;
 
-        return Ok(PyBacktestReport::new_with_benchmark(
+        return Ok(PyBacktestReport::new(
             creturn_df,
             trades_df,
             cfg,
             resample.map(|s| s.to_string()),
             benchmark_df.clone(),
+            limit_prices_df.clone(),
         ));
     }
 
@@ -1235,12 +1260,13 @@ fn backtest_with_report(
 
     profile!("[PROFILE] backtest_with_report: {} rows, {} trades", n_rows, result.trades.len());
 
-    Ok(PyBacktestReport::new_with_benchmark(
+    Ok(PyBacktestReport::new(
         creturn_df,
         trades_df,
         cfg,
         resample.map(|s| s.to_string()),
         benchmark_df,
+        limit_prices_df,
     ))
 }
 

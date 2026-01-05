@@ -69,6 +69,8 @@ class BacktestNamespace:
         stop_trading_next_period: bool = True,
         finlab_mode: bool = True,
         touched_exit: bool = False,
+        limit_up: str = "limit_up",
+        limit_down: str = "limit_down",
     ) -> BacktestReport:
         """Run backtest with trade tracking.
 
@@ -128,6 +130,8 @@ def backtest_with_report(
     stop_trading_next_period: bool = True,
     finlab_mode: bool = True,
     touched_exit: bool = False,
+    limit_up: str = "limit_up",
+    limit_down: str = "limit_down",
 ) -> BacktestReport:
     """Standalone function for backtest with report."""
     ...

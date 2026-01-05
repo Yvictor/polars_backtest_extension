@@ -26,6 +26,8 @@ pub struct PyBacktestReport {
     pub(crate) config: BacktestConfig,
     pub(crate) resample: Option<String>,
     pub(crate) benchmark_df: Option<DataFrame>,
+    /// Limit prices for liquidity metrics (date, symbol, limit_up, limit_down)
+    pub(crate) limit_prices_df: Option<DataFrame>,
 }
 
 impl PyBacktestReport {
@@ -35,23 +37,8 @@ impl PyBacktestReport {
         trades_df: DataFrame,
         config: BacktestConfig,
         resample: Option<String>,
-    ) -> Self {
-        Self {
-            creturn_df,
-            trades_df,
-            config,
-            resample,
-            benchmark_df: None,
-        }
-    }
-
-    /// Create a new PyBacktestReport with benchmark
-    pub fn new_with_benchmark(
-        creturn_df: DataFrame,
-        trades_df: DataFrame,
-        config: BacktestConfig,
-        resample: Option<String>,
         benchmark_df: Option<DataFrame>,
+        limit_prices_df: Option<DataFrame>,
     ) -> Self {
         Self {
             creturn_df,
@@ -59,6 +46,7 @@ impl PyBacktestReport {
             config,
             resample,
             benchmark_df,
+            limit_prices_df,
         }
     }
 }
@@ -489,7 +477,7 @@ impl PyBacktestReport {
         sections: Option<Vec<String>>,
         riskfree_rate: f64,
     ) -> PyResult<PyDataFrame> {
-        let all_sections = vec!["backtest", "profitability", "risk", "ratio", "winrate"];
+        let all_sections = vec!["backtest", "profitability", "risk", "ratio", "winrate", "liquidity"];
         let sections_list: Vec<&str> = match &sections {
             Some(s) => {
                 // Validate sections
@@ -687,6 +675,19 @@ impl PyBacktestReport {
             exprs.push(lit(expectancy).alias("expectancy"));
             exprs.push(lit(mae).alias("mae"));
             exprs.push(lit(mfe).alias("mfe"));
+        }
+
+        // === LIQUIDITY SECTION ===
+        if sections_list.contains(&"liquidity") {
+            let (buy_high, sell_low) = self.calc_liquidity_metrics().map_err(to_py_err)?;
+            exprs.push(match buy_high {
+                Some(v) => lit(v).alias("buyHigh"),
+                None => lit(NULL).alias("buyHigh"),
+            });
+            exprs.push(match sell_low {
+                Some(v) => lit(v).alias("sellLow"),
+                None => lit(NULL).alias("sellLow"),
+            });
         }
 
         if exprs.is_empty() {
@@ -1279,5 +1280,109 @@ impl PyBacktestReport {
         } else {
             Ok(wins as f64 / total as f64)
         }
+    }
+
+    /// Calculate liquidity metrics (buyHigh, sellLow) using join with limit_prices_df
+    ///
+    /// buyHigh: ratio of trades where entry_raw_price >= limit_up
+    /// sellLow: ratio of trades where exit_raw_price <= limit_down
+    fn calc_liquidity_metrics(&self) -> PolarsResult<(Option<f64>, Option<f64>)> {
+        let Some(limit_df) = &self.limit_prices_df else {
+            return Ok((None, None));
+        };
+
+        let trades = &self.trades_df;
+        if trades.height() == 0 {
+            return Ok((None, None));
+        }
+
+        // Check if entry_raw_price column exists
+        let has_entry_raw_price = trades.column("entry_raw_price").is_ok();
+        let has_exit_raw_price = trades.column("exit_raw_price").is_ok();
+        let has_limit_up = limit_df.column("limit_up").is_ok();
+        let has_limit_down = limit_df.column("limit_down").is_ok();
+
+        // Calculate buyHigh: join trades with limit_df on (entry_date, stock_id)
+        let buy_high = if has_entry_raw_price && has_limit_up {
+            let with_entry_limit = trades
+                .clone()
+                .lazy()
+                .join(
+                    limit_df.clone().lazy().select([
+                        col("date"),
+                        col("symbol"),
+                        col("limit_up"),
+                    ]),
+                    [col("entry_date"), col("stock_id")],
+                    [col("date"), col("symbol")],
+                    JoinArgs::new(JoinType::Left),
+                )
+                .filter(col("limit_up").is_not_null())
+                .select([
+                    col("entry_raw_price").gt_eq(col("limit_up")).alias("at_limit"),
+                ])
+                .collect()?;
+
+            if with_entry_limit.height() == 0 {
+                None
+            } else {
+                let stats = with_entry_limit
+                    .lazy()
+                    .select([
+                        col("at_limit").sum().alias("count_at_limit"),
+                        col("at_limit").count().alias("total"),
+                    ])
+                    .collect()?;
+
+                let count = stats.column("count_at_limit")?.u32()?.get(0).unwrap_or(0) as f64;
+                let total = stats.column("total")?.u32()?.get(0).unwrap_or(1) as f64;
+                if total > 0.0 { Some(count / total) } else { None }
+            }
+        } else {
+            None
+        };
+
+        // Calculate sellLow: join trades with limit_df on (exit_date, stock_id)
+        let sell_low = if has_exit_raw_price && has_limit_down {
+            let with_exit_limit = trades
+                .clone()
+                .lazy()
+                .filter(col("exit_date").is_not_null())
+                .join(
+                    limit_df.clone().lazy().select([
+                        col("date"),
+                        col("symbol"),
+                        col("limit_down"),
+                    ]),
+                    [col("exit_date"), col("stock_id")],
+                    [col("date"), col("symbol")],
+                    JoinArgs::new(JoinType::Left),
+                )
+                .filter(col("limit_down").is_not_null())
+                .select([
+                    col("exit_raw_price").lt_eq(col("limit_down")).alias("at_limit"),
+                ])
+                .collect()?;
+
+            if with_exit_limit.height() == 0 {
+                None
+            } else {
+                let stats = with_exit_limit
+                    .lazy()
+                    .select([
+                        col("at_limit").sum().alias("count_at_limit"),
+                        col("at_limit").count().alias("total"),
+                    ])
+                    .collect()?;
+
+                let count = stats.column("count_at_limit")?.u32()?.get(0).unwrap_or(0) as f64;
+                let total = stats.column("total")?.u32()?.get(0).unwrap_or(1) as f64;
+                if total > 0.0 { Some(count / total) } else { None }
+            }
+        } else {
+            None
+        };
+
+        Ok((buy_high, sell_low))
     }
 }

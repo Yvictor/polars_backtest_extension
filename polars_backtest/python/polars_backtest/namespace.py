@@ -257,6 +257,8 @@ class BacktestNamespace:
         stop_trading_next_period: bool = True,
         finlab_mode: bool = True,
         touched_exit: bool = False,
+        limit_up: str = "limit_up",
+        limit_down: str = "limit_down",
     ) -> BacktestReport:
         """Run backtest with trade tracking, returning a BacktestReport object.
 
@@ -403,6 +405,8 @@ class BacktestNamespace:
             config,
             skip_sort,
             benchmark_arg,
+            limit_up,
+            limit_down,
         )
 
 # =============================================================================
@@ -513,6 +517,8 @@ def backtest_with_report(
     stop_trading_next_period: bool = True,
     finlab_mode: bool = True,
     touched_exit: bool = False,
+    limit_up: str = "limit_up",
+    limit_down: str = "limit_down",
 ) -> BacktestReport:
     """Run backtest with trade tracking on long format DataFrame.
 
@@ -577,4 +583,6 @@ def backtest_with_report(
         stop_trading_next_period=stop_trading_next_period,
         finlab_mode=finlab_mode,
         touched_exit=touched_exit,
+        limit_up=limit_up,
+        limit_down=limit_down,
     )

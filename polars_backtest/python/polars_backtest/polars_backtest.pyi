@@ -8,7 +8,7 @@ import polars as pl
 
 from polars_backtest.namespace import BacktestNamespace
 
-MetricsSection = Literal["backtest", "profitability", "risk", "ratio", "winrate"]
+MetricsSection = Literal["backtest", "profitability", "risk", "ratio", "winrate", "liquidity"]
 
 
 class DataFrame(pl.DataFrame):
@@ -191,7 +191,7 @@ class BacktestReport:
 
         Args:
             sections: List of sections to include. Options: 'backtest', 'profitability',
-                     'risk', 'ratio', 'winrate'. Defaults to all sections.
+                     'risk', 'ratio', 'winrate', 'liquidity'. Defaults to all sections.
             riskfree_rate: Annual risk-free rate for Sharpe/Sortino calculations.
 
         Returns:
@@ -203,6 +203,7 @@ class BacktestReport:
             - ratio: sharpeRatio, sortinoRatio, calmarRatio, volatility,
                     profitFactor, tailRatio
             - winrate: winRate, expectancy, mae, mfe
+            - liquidity: buyHigh, sellLow (requires limit_up/limit_down columns in input DataFrame)
 
             If benchmark is set (via setter or backtest_with_report), additional columns:
             - alpha, beta, m12WinRate (12-month rolling win rate vs benchmark)
