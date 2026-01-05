@@ -203,7 +203,7 @@ class BacktestReport:
             - ratio: sharpeRatio, sortinoRatio, calmarRatio, volatility,
                     profitFactor, tailRatio
             - winrate: winRate, expectancy, mae, mfe
-            - liquidity: buyHigh, sellLow (requires limit_up/limit_down columns in input DataFrame)
+            - liquidity: buyHigh, sellLow, capacity (requires limit_up/limit_down/trading_value columns in input DataFrame)
 
             If benchmark is set (via setter or backtest_with_report), additional columns:
             - alpha, beta, m12WinRate (12-month rolling win rate vs benchmark)

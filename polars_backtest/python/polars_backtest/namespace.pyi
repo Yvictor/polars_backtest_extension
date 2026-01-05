@@ -71,6 +71,7 @@ class BacktestNamespace:
         touched_exit: bool = False,
         limit_up: str = "limit_up",
         limit_down: str = "limit_down",
+        trading_value: str = "trading_value",
     ) -> BacktestReport:
         """Run backtest with trade tracking.
 
@@ -132,6 +133,7 @@ def backtest_with_report(
     touched_exit: bool = False,
     limit_up: str = "limit_up",
     limit_down: str = "limit_down",
+    trading_value: str = "trading_value",
 ) -> BacktestReport:
     """Standalone function for backtest with report."""
     ...

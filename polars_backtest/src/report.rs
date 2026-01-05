@@ -28,6 +28,8 @@ pub struct PyBacktestReport {
     pub(crate) benchmark_df: Option<DataFrame>,
     /// Limit prices for liquidity metrics (date, symbol, limit_up, limit_down)
     pub(crate) limit_prices_df: Option<DataFrame>,
+    /// Trading values for capacity metric (date, symbol, trading_value)
+    pub(crate) trading_value_df: Option<DataFrame>,
 }
 
 impl PyBacktestReport {
@@ -39,6 +41,7 @@ impl PyBacktestReport {
         resample: Option<String>,
         benchmark_df: Option<DataFrame>,
         limit_prices_df: Option<DataFrame>,
+        trading_value_df: Option<DataFrame>,
     ) -> Self {
         Self {
             creturn_df,
@@ -47,6 +50,7 @@ impl PyBacktestReport {
             resample,
             benchmark_df,
             limit_prices_df,
+            trading_value_df,
         }
     }
 }
@@ -687,6 +691,13 @@ impl PyBacktestReport {
             exprs.push(match sell_low {
                 Some(v) => lit(v).alias("sellLow"),
                 None => lit(NULL).alias("sellLow"),
+            });
+
+            // capacity: strategy capacity based on trading value
+            let capacity = self.calc_capacity().map_err(to_py_err)?;
+            exprs.push(match capacity {
+                Some(v) => lit(v).alias("capacity"),
+                None => lit(NULL).alias("capacity"),
             });
         }
 
@@ -1384,5 +1395,83 @@ impl PyBacktestReport {
         };
 
         Ok((buy_high, sell_low))
+    }
+
+    /// Calculate capacity metric using join with trading_value_df
+    ///
+    /// Formula (matching finlab):
+    /// accepted_money_flow = (trading_value@entry * 0.05 / |position| +
+    ///                        trading_value@exit * 0.05 / |position|) / 2
+    /// capacity = accepted_money_flow.quantile(0.1)
+    fn calc_capacity(&self) -> PolarsResult<Option<f64>> {
+        let Some(trading_value_df) = &self.trading_value_df else {
+            return Ok(None);
+        };
+
+        let trades = &self.trades_df;
+        if trades.height() == 0 {
+            return Ok(None);
+        }
+
+        let percentage_of_volume = 0.05;
+
+        // Step 1: Join trades with trading_value on (entry_date, stock_id) to get trading_value@entry
+        let with_entry_value = trades
+            .clone()
+            .lazy()
+            .join(
+                trading_value_df.clone().lazy().select([
+                    col("date"),
+                    col("symbol"),
+                    col("trading_value").alias("trading_value_entry"),
+                ]),
+                [col("entry_date"), col("stock_id")],
+                [col("date"), col("symbol")],
+                JoinArgs::new(JoinType::Left),
+            )
+            .collect()?;
+
+        // Step 2: Join with trading_value on (exit_date, stock_id) to get trading_value@exit
+        let with_both_value = with_entry_value
+            .lazy()
+            .filter(col("exit_date").is_not_null())
+            .join(
+                trading_value_df.clone().lazy().select([
+                    col("date"),
+                    col("symbol"),
+                    col("trading_value").alias("trading_value_exit"),
+                ]),
+                [col("exit_date"), col("stock_id")],
+                [col("date"), col("symbol")],
+                JoinArgs::new(JoinType::Left),
+            )
+            .collect()?;
+
+        // Step 3: Calculate accepted_money_flow for each trade
+        // Formula: ((trading_value_entry * 0.05 / |position|) + (trading_value_exit * 0.05 / |position|)) / 2
+        let with_capacity = with_both_value
+            .lazy()
+            .filter(
+                col("trading_value_entry").is_not_null()
+                    .and(col("trading_value_exit").is_not_null())
+                    .and(col("position").abs().gt(lit(0.0)))
+            )
+            .with_column(
+                (((col("trading_value_entry") * lit(percentage_of_volume) / col("position").abs())
+                    + (col("trading_value_exit") * lit(percentage_of_volume) / col("position").abs()))
+                    / lit(2.0))
+                .alias("accepted_money_flow")
+            )
+            .collect()?;
+
+        if with_capacity.height() == 0 {
+            return Ok(None);
+        }
+
+        // Step 4: Calculate 10th percentile (quantile 0.1)
+        let capacity_col = with_capacity.column("accepted_money_flow")?.f64()?;
+        let capacity = capacity_col.quantile(0.1, QuantileMethod::Linear)?;
+
+        Ok(capacity)
     }
 }

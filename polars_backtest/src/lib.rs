@@ -865,7 +865,8 @@ fn backtest(
     skip_sort=false,
     benchmark=None,
     limit_up="limit_up",
-    limit_down="limit_down"
+    limit_down="limit_down",
+    trading_value="trading_value"
 ))]
 fn backtest_with_report(
     df: PyDataFrame,
@@ -884,6 +885,7 @@ fn backtest_with_report(
     benchmark: Option<Py<PyAny>>,
     limit_up: &str,
     limit_down: &str,
+    trading_value: &str,
 ) -> PyResult<PyBacktestReport> {
     use polars_arrow::array::{PrimitiveArray, Utf8ViewArray};
 
@@ -1189,6 +1191,18 @@ fn backtest_with_report(
         }
     };
 
+    // Extract trading_value_df if trading_value column exists (for capacity metric)
+    let trading_value_df: Option<DataFrame> = if df.column(trading_value).is_ok() {
+        Some(df.clone().lazy().select([
+            col(date).alias("date"),
+            col(symbol).alias("symbol"),
+            col(trading_value).alias("trading_value"),
+        ]).collect()
+            .map_err(|e| PyValueError::new_err(format!("Failed to extract trading value: {}", e)))?)
+    } else {
+        None
+    };
+
     // Handle empty result (no signals/trades)
     if result.dates.is_empty() {
         let empty_dates = Series::new_empty(date.into(), &DataType::Date);
@@ -1208,6 +1222,7 @@ fn backtest_with_report(
             resample.map(|s| s.to_string()),
             benchmark_df.clone(),
             limit_prices_df.clone(),
+            trading_value_df.clone(),
         ));
     }
 
@@ -1267,6 +1282,7 @@ fn backtest_with_report(
         resample.map(|s| s.to_string()),
         benchmark_df,
         limit_prices_df,
+        trading_value_df,
     ))
 }
 

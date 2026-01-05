@@ -239,3 +239,51 @@ print(metrics2['sellLow'])  # null
 
 這些指標需要額外的資料欄位 (警示股/處置股 flag, 成交金額等)，
 未來可以用相同的模式實作：DataFrame 有欄位就計算，沒有就 null。
+
+---
+
+## Reference: finlab capacity 計算公式
+
+以下是 finlab `Metrics._calc_capacity` 的計算邏輯 (來源: `finlab/core/metrics.pyx`):
+
+```python
+def _calc_capacity(self, percentage_of_volume=0.05):
+    """Calculate capacity metric."""
+    if 'turnover@entry_date' not in self.report.trades.columns:
+        return 0
+
+    accepted_money_flow = (
+        self.report.trades['turnover@entry_date'] * percentage_of_volume / self.report.trades.position.abs() +
+        self.report.trades['turnover@exit_date'] * percentage_of_volume / self.report.trades.position.abs()
+    ) / 2
+
+    return accepted_money_flow.quantile(0.1)
+```
+
+### 計算公式解釋
+
+1. **percentage_of_volume** = 0.05 (預設 5%)
+   - 假設每筆交易只能吃掉當日成交額的 5%
+
+2. **accepted_money_flow** = 平均值(entry 容量 + exit 容量)
+   - Entry 容量 = `turnover@entry_date * 0.05 / |position|`
+   - Exit 容量 = `turnover@exit_date * 0.05 / |position|`
+   - 其中 `|position|` 是持倉比例的絕對值
+
+3. **最終結果** = `accepted_money_flow.quantile(0.1)`
+   - 取第 10 百分位數作為保守估計的策略容量上限
+
+### 所需資料欄位
+
+| 欄位 | 說明 |
+|------|------|
+| `turnover@entry_date` | 進場日的成交金額 |
+| `turnover@exit_date` | 出場日的成交金額 |
+| `position` | 持倉比例 |
+
+### 實作考量
+
+若要在 polars_backtest 實作：
+- 需要用戶傳入 `turnover` 欄位 (成交金額)
+- 在 backtest_with_report 時 join 到 trades
+- 使用相同公式計算
