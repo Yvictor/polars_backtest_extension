@@ -167,6 +167,34 @@ metrics = report.get_metrics()
 # Includes: alpha, beta, m12WinRate (12-month rolling win rate vs benchmark)
 ```
 
+### Liquidity Metrics
+
+Get liquidity metrics by providing optional columns in your DataFrame:
+
+```python
+df = pl.DataFrame({
+    "date": dates,
+    "symbol": symbols,
+    "close": prices,
+    "weight": weights,
+    "limit_up": limit_up_prices,      # For buyHigh metric
+    "limit_down": limit_down_prices,  # For sellLow metric
+    "trading_value": trading_values,  # For capacity metric (e.g., close_raw * volume)
+})
+
+report = df.bt.backtest_with_report(position="weight")
+metrics = report.get_metrics(sections=["liquidity"])
+# Includes: buyHigh, sellLow, capacity
+```
+
+| Metric | Required Column | Description |
+|--------|-----------------|-------------|
+| `buyHigh` | `limit_up` | Ratio of entries at limit-up price |
+| `sellLow` | `limit_down` | Ratio of exits at limit-down price |
+| `capacity` | `trading_value` | Strategy capacity (10th percentile of accepted money flow) |
+
+Metrics return `null` if the required column is not present.
+
 ### Parameters
 
 | Parameter | Default | Description |
