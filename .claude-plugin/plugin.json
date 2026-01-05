@@ -1,0 +1,13 @@
+{
+  "name": "polars-backtest",
+  "version": "0.1.0",
+  "description": "Polars backtest extension development helper - backtesting with polars expressions",
+  "author": {
+    "name": "Yvictor",
+    "url": "https://github.com/Yvictor"
+  },
+  "repository": "https://github.com/Yvictor/polars_backtest_extension",
+  "license": "PolyForm Noncommercial 1.0.0",
+  "keywords": ["polars", "backtest", "trading", "quantitative", "finance"],
+  "skills": "./skills/"
+}

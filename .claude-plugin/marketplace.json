@@ -1,0 +1,14 @@
+{
+  "name": "polars-backtest-marketplace",
+  "owner": {
+    "name": "Yvictor",
+    "url": "https://github.com/Yvictor"
+  },
+  "plugins": [
+    {
+      "name": "polars-backtest",
+      "source": "..",
+      "description": "Polars backtest extension development helper - backtesting with polars expressions"
+    }
+  ]
+}

@@ -66,6 +66,27 @@ just bench  # Run benchmarks
 - **T+1 Execution** - Realistic trading simulation
 - **Risk Management** - Stop loss, take profit, trailing stop, touched exit (OHLC)
 - **Flexible Rebalancing** - Daily, weekly, monthly, or on position change
+- **Claude Code Skill** - AI-powered assistance for backtesting
+
+## Claude Code Integration
+
+Get AI-powered assistance for writing and analyzing backtests.
+
+### Install the Skill
+
+```bash
+# 1. Add the marketplace
+/plugin marketplace add Yvictor/polars_backtest_extension
+
+# 2. Install the plugin
+/plugin install polars-backtest@polars-backtest-marketplace
+```
+
+After installation, Claude Code can help you:
+- Write backtest strategies using Polars expressions
+- Understand all parameters and their effects
+- Analyze results with `get_metrics()`, `get_stats()`, etc.
+- Debug and optimize your trading strategies
 
 ---
 
