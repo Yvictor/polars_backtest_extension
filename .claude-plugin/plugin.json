@@ -9,5 +9,5 @@
   "repository": "https://github.com/Yvictor/polars_backtest_extension",
   "license": "PolyForm Noncommercial 1.0.0",
   "keywords": ["polars", "backtest", "trading", "quantitative", "finance"],
-  "skills": "./skills/"
+  "skills": "./../skills/"
 }

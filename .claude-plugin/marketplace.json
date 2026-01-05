@@ -7,7 +7,7 @@
   "plugins": [
     {
       "name": "polars-backtest",
-      "source": "..",
+      "source": "./",
       "description": "Polars backtest extension development helper - backtesting with polars expressions"
     }
   ]
