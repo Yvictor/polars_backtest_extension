@@ -140,6 +140,32 @@ report.trades    # Trade records with MAE/MFE metrics
 report.stats     # Statistics (same as get_stats())
 ```
 
+### Benchmark Comparison
+
+Compare strategy performance against a benchmark to get alpha, beta, and rolling win rate:
+
+```python
+# Method 1: Use a symbol from your data as benchmark
+report = df.bt.backtest_with_report(
+    position="weight",
+    benchmark="0050",  # Symbol value (e.g., ETF ticker)
+)
+
+# Method 2: Provide a benchmark DataFrame
+benchmark_df = pl.DataFrame({
+    "date": [...],
+    "creturn": [...],  # Cumulative return starting at 1.0
+})
+report = df.bt.backtest_with_report(position="weight", benchmark=benchmark_df)
+
+# Method 3: Set benchmark after creation
+report = df.bt.backtest_with_report(position="weight")
+report.benchmark = benchmark_df
+
+# get_metrics includes benchmark metrics when benchmark is set
+metrics = report.get_metrics()
+# Includes: alpha, beta, m12WinRate (12-month rolling win rate vs benchmark)
+```
 
 ### Parameters
 
@@ -147,7 +173,9 @@ report.stats     # Statistics (same as get_stats())
 |-----------|---------|-------------|
 | `trade_at_price` | `"close"` | Price column for execution |
 | `position` | `"weight"` | Position/weight column |
+| `benchmark` | `None` | Benchmark: symbol str or DataFrame with (date, creturn) |
 | `resample` | `"D"` | Rebalance frequency |
+| `resample_offset` | `None` | Delay rebalance by N days (e.g., `"1d"`, `"2d"`, `"1W"`) |
 | `fee_ratio` | `0.001425` | Transaction fee |
 | `tax_ratio` | `0.003` | Transaction tax |
 | `stop_loss` | `1.0` | Stop loss threshold (1.0 = disabled) |

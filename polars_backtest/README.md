@@ -78,6 +78,19 @@ report.trades    # Trade records with MAE/MFE metrics
 report.stats     # Statistics (same as get_stats())
 ```
 
+### Benchmark Comparison
+
+```python
+# Use a symbol from your data as benchmark
+report = df.bt.backtest_with_report(position="weight", benchmark="0050")
+
+# Or provide a benchmark DataFrame with (date, creturn) columns
+report = df.bt.backtest_with_report(position="weight", benchmark=benchmark_df)
+
+# get_metrics includes alpha, beta, m12WinRate when benchmark is set
+metrics = report.get_metrics()
+```
+
 ### Statistics Expressions
 
 ```python
