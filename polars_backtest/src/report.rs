@@ -350,31 +350,55 @@ impl PyBacktestReport {
     }
 
     /// Get trade actions (enter/exit/hold)
+    ///
+    /// Action logic (Finlab compatible):
+    /// - "enter": entry_date is null AND entry_sig_date == last_sig_date (pending entry)
+    /// - "exit": exit_date is null AND exit_sig_date == last_sig_date (pending exit)
+    /// - "hold": exit_date is null AND entry_date is not null AND not exit (open position)
     fn actions(&self) -> PyResult<PyDataFrame> {
         let trades = &self.trades_df;
         if trades.height() == 0 {
             let empty = DataFrame::new(vec![
-                Series::new_empty("stock_id".into(), &DataType::String).into_column(),
+                Series::new_empty("symbol".into(), &DataType::String).into_column(),
                 Series::new_empty("action".into(), &DataType::String).into_column(),
             ]).map_err(to_py_err)?;
             return Ok(PyDataFrame(empty));
         }
 
-        let last_date = self.get_last_date_expr()?;
-
+        // Compute last signal date as max of entry_sig_date and exit_sig_date
+        // Then determine action based on comparison with last signal date
         let result = trades
             .clone()
             .lazy()
+            // Add last_sig_date column: max of all entry_sig_date and exit_sig_date
+            .with_columns([
+                col("entry_sig_date").max().alias("_max_entry_sig"),
+                col("exit_sig_date").max().alias("_max_exit_sig"),
+            ])
+            .with_column(
+                // Use max_horizontal equivalent: when one is null, use the other
+                when(col("_max_entry_sig").is_null())
+                    .then(col("_max_exit_sig"))
+                    .when(col("_max_exit_sig").is_null())
+                    .then(col("_max_entry_sig"))
+                    .when(col("_max_entry_sig").gt(col("_max_exit_sig")))
+                    .then(col("_max_entry_sig"))
+                    .otherwise(col("_max_exit_sig"))
+                    .alias("_last_sig_date")
+            )
             .select([
-                col("stock_id"),
-                when(col("entry_date").eq(lit(last_date)))
+                col("stock_id").alias("symbol"),
+                // Pending entry: entry_date is null AND entry_sig_date == last_sig_date
+                when(col("entry_date").is_null().and(col("entry_sig_date").eq(col("_last_sig_date"))))
                     .then(lit("enter"))
-                    .when(col("exit_date").eq(lit(last_date)))
+                // Pending exit: exit_date is null AND exit_sig_date == last_sig_date
+                .when(col("exit_date").is_null().and(col("exit_sig_date").eq(col("_last_sig_date"))))
                     .then(lit("exit"))
-                    .when(col("exit_date").is_null())
+                // Open position: has entry_date, no exit_date
+                .when(col("entry_date").is_not_null().and(col("exit_date").is_null()))
                     .then(lit("hold"))
-                    .otherwise(lit("closed"))
-                    .alias("action"),
+                .otherwise(lit("closed"))
+                .alias("action"),
             ])
             .filter(col("action").neq(lit("closed")))
             .collect()

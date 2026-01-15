@@ -112,7 +112,7 @@ report = df.bt.backtest_with_report(position="weight")
 
 # Properties
 report.creturn      # DataFrame with date, creturn columns
-report.trades       # DataFrame with trade records (entry/exit dates, prices, returns, MAE/MFE)
+report.trades       # DataFrame with trade records (see Trades DataFrame section)
 report.stats        # Statistics DataFrame (shortcut for get_stats())
 report.fee_ratio    # Fee ratio used
 report.tax_ratio    # Tax ratio used
@@ -125,6 +125,58 @@ report.benchmark    # Benchmark DataFrame (can be set after creation)
 
 # Set benchmark after creation
 report.benchmark = benchmark_df
+```
+
+## Trades DataFrame
+
+The `report.trades` property returns a DataFrame with detailed trade records:
+
+| Column | Type | Description |
+|--------|------|-------------|
+| `stock_id` | str | Stock symbol/ticker |
+| `entry_date` | Date | Trade entry execution date. `null` for pending entry trades. |
+| `exit_date` | Date | Trade exit execution date. `null` for open/pending positions. |
+| `entry_sig_date` | Date | Date when entry signal was generated. |
+| `exit_sig_date` | Date | Date when exit signal was generated. `null` if no exit signal yet. |
+| `position` | f64 | Position weight at entry. |
+| `period` | i32 | Number of trading days held. |
+| `return` | f64 | Trade return ratio (e.g., 0.05 = 5% profit). |
+| `entry_price` | f64 | Entry execution price (adjusted price, for return calculation). |
+| `exit_price` | f64 | Exit execution price (adjusted price). `null` for open positions. |
+| `entry_raw_price` | f64 | Entry raw price (unadjusted = entry_price / factor, for liquidity metrics). |
+| `exit_raw_price` | f64 | Exit raw price (unadjusted = exit_price / factor). `null` for open positions. |
+| `mae` | f64 | Maximum Adverse Excursion - worst drawdown during trade (negative value). |
+| `gmfe` | f64 | Gross Maximum Favorable Excursion - best unrealized gain during trade. |
+| `bmfe` | f64 | Before-MAE MFE - MFE at the time when MAE occurred. |
+| `mdd` | f64 | Maximum drawdown during the trade. |
+| `pdays` | i32 | Number of profitable days during the trade. |
+
+### Pending Trades
+
+Pending trades represent signals that exist but haven't been executed yet (T+1 execution model):
+
+- **Pending entry**: `entry_date = null`, `entry_sig_date = latest signal date`
+  - Stock has a buy signal but trade hasn't executed yet
+- **Pending exit**: `exit_date = null`, `exit_sig_date = latest signal date`
+  - Stock has a sell signal but trade hasn't closed yet
+
+```python
+# Get pending entry trades
+pending_entries = report.trades.filter(pl.col("entry_date").is_null())
+
+# Get pending exit trades (open positions with exit signal)
+pending_exits = report.trades.filter(
+    pl.col("entry_date").is_not_null() &
+    pl.col("exit_date").is_null() &
+    pl.col("exit_sig_date").is_not_null()
+)
+
+# Get open positions (no exit signal yet)
+open_positions = report.trades.filter(
+    pl.col("entry_date").is_not_null() &
+    pl.col("exit_date").is_null() &
+    pl.col("exit_sig_date").is_null()
+)
 ```
 
 ## BacktestReport Methods
@@ -172,12 +224,24 @@ report.current_trades()
 ```
 
 ### actions()
-Get trade actions for current positions.
+Get trade actions for current positions. Finlab-compatible logic.
 
 ```python
 report.actions()
-# Returns: stock_id, action ('enter', 'exit', 'hold')
+# Returns DataFrame with columns: symbol, action
 ```
+
+| Column | Type | Description |
+|--------|------|-------------|
+| `symbol` | str | Stock symbol/ticker |
+| `action` | str | Action type: `"enter"`, `"exit"`, or `"hold"` |
+
+Action logic:
+- **enter**: Pending entry trade (signal exists, not yet executed). `entry_date` is null, `entry_sig_date` equals latest signal date.
+- **exit**: Pending exit trade (exit signal exists, not yet executed). `exit_date` is null, `exit_sig_date` equals latest signal date.
+- **hold**: Active position continuing. `entry_date` is set, `exit_date` is null.
+
+Note: Closed trades (both `entry_date` and `exit_date` set) are excluded from actions.
 
 ### is_stop_triggered()
 Check if any trade was triggered by stop loss or take profit.

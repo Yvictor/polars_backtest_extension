@@ -1035,6 +1035,11 @@ class Report:
     def actions(self) -> pl.DataFrame:
         """Trade actions for current positions (enter/exit/hold).
 
+        Finlab-compatible logic:
+        - enter: entry_date is null AND entry_sig_date == max(entry_sig_date) (pending entry)
+        - exit: exit_date is null AND exit_sig_date == max(entry_sig_date) (pending exit)
+        - hold: entry_date is not null AND exit_date is null (open position)
+
         Returns:
             DataFrame with stock_id and action columns.
         """
@@ -1042,24 +1047,24 @@ class Report:
         if trades.height == 0:
             return pl.DataFrame({"stock_id": [], "action": []})
 
-        last_date = self.creturn.select(pl.col("date").last()).item()
-        last_date_str = str(last_date)[:10] if last_date else None
+        # Get max entry_sig_date as the latest signal date
+        last_sig_date = trades.select(pl.col("entry_sig_date").max()).item()
 
-        # Determine action for each trade
-        return trades.select(
+        # Determine action for each trade using Finlab-compatible logic
+        return trades.lazy().select(
             pl.col("stock_id"),
             pl.when(
-                pl.col("entry_date").cast(pl.Utf8).str.slice(0, 10) == last_date_str
+                pl.col("entry_date").is_null() & (pl.col("entry_sig_date") == last_sig_date)
             ).then(pl.lit("enter"))
             .when(
-                pl.col("exit_date").cast(pl.Utf8).str.slice(0, 10) == last_date_str
+                pl.col("exit_date").is_null() & (pl.col("exit_sig_date") == last_sig_date)
             ).then(pl.lit("exit"))
             .when(
-                pl.col("exit_date").is_null()
+                pl.col("entry_date").is_not_null() & pl.col("exit_date").is_null()
             ).then(pl.lit("hold"))
             .otherwise(pl.lit("closed"))
             .alias("action"),
-        ).filter(pl.col("action") != "closed")
+        ).filter(pl.col("action") != "closed").collect()
 
     def position_info(self) -> pl.DataFrame:
         """Get position information for API/dashboard.

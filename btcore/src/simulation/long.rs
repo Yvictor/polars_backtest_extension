@@ -17,7 +17,7 @@ use arrow::array::{Float64Array, Int32Array, StringViewArray};
 
 use crate::config::BacktestConfig;
 use crate::position::{Position, PositionSnapshot};
-use crate::tracker::{BacktestResult, TradeRecord, NoopSymbolTracker, SymbolTracker, TradeTracker};
+use crate::tracker::{BacktestResult, StockOperations, TradeRecord, NoopSymbolTracker, SymbolTracker, TradeTracker};
 use crate::{is_valid_price, FLOAT_EPSILON};
 
 /// Portfolio with string symbol keys (for zero-copy backtest)
@@ -753,6 +753,7 @@ where
         dates,
         creturn,
         trades: vec![],
+        stock_operations: None,
     }
 }
 
@@ -937,9 +938,193 @@ pub fn backtest_with_report_long_arrow(
     };
 
     // Finalize trades (include open positions)
-    let trades = tracker.finalize(config.fee_ratio, config.tax_ratio);
+    let mut trades = tracker.finalize(config.fee_ratio, config.tax_ratio);
 
-    BacktestResult { dates, creturn, trades }
+    // Calculate stock_operations (actions, weights, next_weights)
+    // This matches Finlab's behavior where actions are computed at the end of backtest
+    let stock_operations = calculate_stock_operations(input, &trades, &dates);
+
+    // Post-process trades based on stock_operations (Finlab compatible)
+    // 1. For "exit" actions: set exit_sig_date on open trades
+    // 2. For "enter" actions: create pending entry trades
+    if let Some(next_date) = stock_operations.next_weight_date {
+        // Update exit_sig_date for "exit" actions
+        for trade in trades.iter_mut() {
+            if trade.entry_date.is_some() && trade.exit_date.is_none() {
+                if let Some(action) = stock_operations.actions.get(&trade.symbol) {
+                    if action == "exit" {
+                        trade.exit_sig_date = Some(next_date);
+                    }
+                }
+            }
+        }
+
+        // Create pending entry trades for "enter" actions
+        for (symbol, action) in &stock_operations.actions {
+            if action == "enter" {
+                let weight = stock_operations.next_weights.get(symbol).copied().unwrap_or(0.0);
+                let pending_trade = TradeRecord {
+                    symbol: symbol.clone(),
+                    entry_date: None,
+                    exit_date: None,
+                    entry_sig_date: next_date,
+                    exit_sig_date: None,
+                    position_weight: weight,
+                    entry_price: f64::NAN,
+                    exit_price: None,
+                    entry_raw_price: f64::NAN,
+                    exit_raw_price: None,
+                    trade_return: None,
+                    mae: None,
+                    gmfe: None,
+                    bmfe: None,
+                    mdd: None,
+                    pdays: None,
+                    period: None,
+                };
+                trades.push(pending_trade);
+            }
+        }
+    }
+
+    BacktestResult {
+        dates,
+        creturn,
+        trades,
+        stock_operations: Some(stock_operations),
+    }
+}
+
+/// Calculate stock operations (actions, weights, next_weights) at the end of backtest
+///
+/// This function computes the trading actions by comparing:
+/// - Current positions (open trades with entry_date but no exit_date)
+/// - Latest signal weights (last signal date's weights from input)
+///
+/// Actions:
+/// - "enter": not in current positions, but in latest signal weights
+/// - "exit": in current positions, but not in latest signal weights
+/// - "hold": in both current positions and latest signal weights
+fn calculate_stock_operations(
+    input: &LongFormatArrowInput,
+    trades: &[TradeRecord],
+    dates: &[i32],
+) -> StockOperations {
+    use std::collections::HashSet;
+
+    let mut ops = StockOperations::new();
+
+    if input.dates.len() == 0 || dates.is_empty() {
+        return ops;
+    }
+
+    // Find the last creturn date (last price date)
+    let last_price_date = *dates.last().unwrap();
+
+    // Find current positions: trades with entry_date but no exit_date
+    let current_positions: HashSet<String> = trades
+        .iter()
+        .filter(|t| t.entry_date.is_some() && t.exit_date.is_none())
+        .map(|t| t.symbol.clone())
+        .collect();
+
+    // Find the latest signal date and weights from input
+    // Signal date is the date with non-zero weights that is <= last_price_date
+    // We scan from the end to find the latest signal date
+    let n = input.dates.len();
+    let mut latest_signal_date: Option<i32> = None;
+    let mut signal_weights: HashMap<String, f64> = HashMap::new();
+
+    // Find the latest date with any signal (non-zero weight)
+    for i in (0..n).rev() {
+        let date = input.dates.value(i);
+        let weight = input.weights.value(i);
+
+        // Skip if this date is after the last price date
+        // (we want signals that could have been executed)
+        if date > last_price_date {
+            continue;
+        }
+
+        // Check if this is a new date
+        if latest_signal_date.is_none() || date == latest_signal_date.unwrap() {
+            if !weight.is_nan() && weight.abs() > FLOAT_EPSILON {
+                latest_signal_date = Some(date);
+                let symbol = input.symbols.value(i).to_string();
+                signal_weights.insert(symbol, weight);
+            }
+        } else if latest_signal_date.is_some() && date < latest_signal_date.unwrap() {
+            // We've moved past the latest signal date
+            break;
+        }
+    }
+
+    // If no signal found, return empty operations
+    let Some(signal_date) = latest_signal_date else {
+        return ops;
+    };
+
+    // Normalize signal weights
+    let total_weight: f64 = signal_weights.values().map(|w| w.abs()).sum();
+    if total_weight > 1.0 {
+        for w in signal_weights.values_mut() {
+            *w /= total_weight;
+        }
+    }
+
+    // Find current weights (from current positions)
+    // For simplicity, we use position_weight from trades
+    let current_weights: HashMap<String, f64> = trades
+        .iter()
+        .filter(|t| t.entry_date.is_some() && t.exit_date.is_none())
+        .map(|t| (t.symbol.clone(), t.position_weight))
+        .collect();
+
+    // Calculate total current weight for normalization
+    let total_current: f64 = current_weights.values().map(|w| w.abs()).sum();
+    let normalized_current: HashMap<String, f64> = if total_current > 1.0 {
+        current_weights
+            .iter()
+            .map(|(k, v)| (k.clone(), v / total_current))
+            .collect()
+    } else {
+        current_weights.clone()
+    };
+
+    // Calculate actions by comparing current positions and signal weights
+    let signal_stocks: HashSet<String> = signal_weights
+        .iter()
+        .filter(|(_, &w)| w.abs() > FLOAT_EPSILON)
+        .map(|(k, _)| k.clone())
+        .collect();
+
+    for symbol in current_positions.union(&signal_stocks) {
+        let in_current = current_positions.contains(symbol);
+        let in_signal = signal_stocks.contains(symbol);
+
+        let action = match (in_current, in_signal) {
+            (false, true) => "enter",   // new position
+            (true, false) => "exit",    // close position
+            (true, true) => "hold",     // keep position
+            (false, false) => continue, // should not happen
+        };
+        ops.actions.insert(symbol.clone(), action.to_string());
+    }
+
+    // Set weight dates
+    // weight_date: the date of current weights (entry_sig_date of most recent entry)
+    let weight_date = trades
+        .iter()
+        .filter(|t| t.entry_date.is_some() && t.exit_date.is_none())
+        .map(|t| t.entry_sig_date)
+        .max();
+
+    ops.weights = normalized_current;
+    ops.next_weights = signal_weights;
+    ops.weight_date = weight_date;
+    ops.next_weight_date = Some(signal_date);
+
+    ops
 }
 
 /// Check if prev_date is a month-end using i32 dates (days since 1970-01-01)

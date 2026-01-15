@@ -153,6 +153,31 @@ impl TradeRecord {
 // Backtest Results
 // ============================================================================
 
+/// Stock operations calculated at the end of backtest
+///
+/// This structure captures the actions (enter/exit/hold) for each stock
+/// based on comparing current positions vs the latest signal weights.
+/// Matches Finlab's `stock_operations` dictionary.
+#[derive(Debug, Clone, Default)]
+pub struct StockOperations {
+    /// Actions for each stock: "enter", "exit", "hold", "sl", "tp", etc.
+    pub actions: HashMap<String, String>,
+    /// Current normalized weights (at weight_date)
+    pub weights: HashMap<String, f64>,
+    /// Next signal weights (at next_weight_date)
+    pub next_weights: HashMap<String, f64>,
+    /// Date of current weights (days since epoch)
+    pub weight_date: Option<i32>,
+    /// Date of next weights/signal (days since epoch)
+    pub next_weight_date: Option<i32>,
+}
+
+impl StockOperations {
+    pub fn new() -> Self {
+        Self::default()
+    }
+}
+
 /// Result of a backtest simulation including trades (wide format)
 #[derive(Debug, Clone)]
 pub struct WideBacktestResult {
@@ -171,6 +196,8 @@ pub struct BacktestResult {
     pub creturn: Vec<f64>,
     /// List of completed trades
     pub trades: Vec<TradeRecord>,
+    /// Stock operations (actions, weights, next_weights) - Finlab compatible
+    pub stock_operations: Option<StockOperations>,
 }
 
 // ============================================================================

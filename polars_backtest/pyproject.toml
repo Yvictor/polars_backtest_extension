@@ -4,7 +4,7 @@ build-backend = "maturin"
 
 [project]
 name = "polars_backtest"
-version = "0.1.1"
+version = "0.1.2"
 description = "Polars extension for portfolio backtesting"
 readme = "README.md"
 license = { text = "PolyForm Noncommercial 1.0.0" }
@@ -68,4 +68,5 @@ dev = [
     "patchelf>=0.17.2.4; sys_platform == 'linux'",
     "pytest>=8.4.2",
     "ruff>=0.14.10",
+    "yfinance>=1.0",
 ]
