@@ -47,7 +47,7 @@ use btcore::{
     PriceData, TradeRecord, WideTradeRecord,
     simulation::{
         backtest_long_arrow, backtest_with_report_long_arrow,
-        LongFormatArrowInput, ResampleFreq, ResampleOffset,
+        LongFormatArrowInput, ResampleFreq, ResampleOffset, StockOperations,
     },
 };
 
@@ -428,6 +428,41 @@ fn trades_to_dataframe(trades: &[TradeRecord]) -> PolarsResult<DataFrame> {
         mdd_series.into_column(),
         pdays_series.into_column(),
     ])
+}
+
+/// Convert StockOperations to weights and next_weights DataFrames
+///
+/// Returns (weights_df, next_weights_df) where each DataFrame has columns:
+/// - symbol: String
+/// - weight: Float64
+fn stock_operations_to_dataframes(
+    ops: &StockOperations,
+) -> PolarsResult<(Option<DataFrame>, Option<DataFrame>)> {
+    // Create weights DataFrame
+    let weights_df = if ops.weights.is_empty() {
+        None
+    } else {
+        let symbols: Vec<&str> = ops.weights.keys().map(|s| s.as_str()).collect();
+        let weights: Vec<f64> = ops.weights.values().copied().collect();
+        Some(DataFrame::new(vec![
+            Series::new("symbol".into(), symbols).into_column(),
+            Series::new("weight".into(), weights).into_column(),
+        ])?)
+    };
+
+    // Create next_weights DataFrame
+    let next_weights_df = if ops.next_weights.is_empty() {
+        None
+    } else {
+        let symbols: Vec<&str> = ops.next_weights.keys().map(|s| s.as_str()).collect();
+        let weights: Vec<f64> = ops.next_weights.values().copied().collect();
+        Some(DataFrame::new(vec![
+            Series::new("symbol".into(), symbols).into_column(),
+            Series::new("weight".into(), weights).into_column(),
+        ])?)
+    };
+
+    Ok((weights_df, next_weights_df))
 }
 
 // PyBacktestReport is now defined in report.rs
@@ -1223,6 +1258,8 @@ fn backtest_with_report(
             benchmark_df.clone(),
             limit_prices_df.clone(),
             trading_value_df.clone(),
+            None,
+            None,
         ));
     }
 
@@ -1275,6 +1312,14 @@ fn backtest_with_report(
 
     profile!("[PROFILE] backtest_with_report: {} rows, {} trades", n_rows, result.trades.len());
 
+    // Extract weights and next_weights from stock_operations
+    let (weights_df, next_weights_df) = if let Some(ref ops) = result.stock_operations {
+        stock_operations_to_dataframes(ops)
+            .map_err(|e| PyValueError::new_err(format!("Failed to create weights DataFrames: {}", e)))?
+    } else {
+        (None, None)
+    };
+
     Ok(PyBacktestReport::new(
         creturn_df,
         trades_df,
@@ -1283,6 +1328,8 @@ fn backtest_with_report(
         benchmark_df,
         limit_prices_df,
         trading_value_df,
+        weights_df,
+        next_weights_df,
     ))
 }
 

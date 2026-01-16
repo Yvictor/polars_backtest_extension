@@ -224,24 +224,101 @@ report.current_trades()
 ```
 
 ### actions()
-Get trade actions for current positions. Finlab-compatible logic.
+Get trade actions for current positions with weights. Finlab-compatible logic.
 
 ```python
 report.actions()
-# Returns DataFrame with columns: symbol, action
+# Returns DataFrame with columns: symbol, action, weight, next_weight
 ```
+
+#### Output Columns
 
 | Column | Type | Description |
 |--------|------|-------------|
 | `symbol` | str | Stock symbol/ticker |
 | `action` | str | Action type: `"enter"`, `"exit"`, or `"hold"` |
+| `weight` | f64 | Current position weight (0 for enter, value for hold/exit) |
+| `next_weight` | f64 | Next period target weight (0 for exit, value for hold/enter) |
 
-Action logic:
-- **enter**: Pending entry trade (signal exists, not yet executed). `entry_date` is null, `entry_sig_date` equals latest signal date.
-- **exit**: Pending exit trade (exit signal exists, not yet executed). `exit_date` is null, `exit_sig_date` equals latest signal date.
-- **hold**: Active position continuing. `entry_date` is set, `exit_date` is null.
+#### Action Types Summary
+
+| action | weight | next_weight | 說明 |
+|--------|--------|-------------|------|
+| `enter` | 0 | >0 | 待進場，尚未持有 |
+| `exit` | >0 | 0 | 待出場，將離開投資組合 |
+| `hold` | >0 | >0 | 持續持有 |
+
+#### Weight Properties
+
+- `sum(weight)` ≤ 1.0 — 當前投資組合的總權重
+- `sum(next_weight)` ≤ 1.0 — 下期目標投資組合的總權重
+- **hold + enter 的權重不會超過 1**，因為：
+  - `weight` 只計算當前持有的股票（hold + exit）
+  - `next_weight` 是下期目標權重（hold + enter，已正規化）
+
+#### Usage Example
+
+```python
+report = df.bt.backtest_with_report(position="weight", resample="M")
+
+# Get actions with weights
+actions = report.actions()
+print(actions)
+# shape: (115, 4)
+# ┌────────┬────────┬──────────┬─────────────┐
+# │ symbol ┆ action ┆ weight   ┆ next_weight │
+# │ str    ┆ str    ┆ f64      ┆ f64         │
+# ╞════════╪════════╪══════════╪═════════════╡
+# │ 2330   ┆ hold   ┆ 0.023809 ┆ 0.017543    │
+# │ 2317   ┆ exit   ┆ 0.023809 ┆ 0.0         │
+# │ 2454   ┆ enter  ┆ 0.0      ┆ 0.017543    │
+# └────────┴────────┴──────────┴─────────────┘
+
+# Filter by action type
+entering = actions.filter(pl.col("action") == "enter")
+exiting = actions.filter(pl.col("action") == "exit")
+holding = actions.filter(pl.col("action") == "hold")
+
+# Verify weight sums
+print(f"Current portfolio weight: {actions['weight'].sum():.4f}")      # ≤ 1.0
+print(f"Next portfolio weight: {actions['next_weight'].sum():.4f}")    # ≤ 1.0
+```
 
 Note: Closed trades (both `entry_date` and `exit_date` set) are excluded from actions.
+
+### weights()
+Get current position weights (normalized). Finlab-compatible.
+
+```python
+report.weights()
+# Returns DataFrame with columns: symbol, weight
+```
+
+| Column | Type | Description |
+|--------|------|-------------|
+| `symbol` | str | Stock symbol/ticker |
+| `weight` | f64 | Normalized weight (sum ≤ 1.0) |
+
+Returns weights for currently held positions only (stocks with `entry_date` set, `exit_date` null).
+
+### next_weights()
+Get next period target weights (normalized). Finlab-compatible.
+
+```python
+report.next_weights()
+# Returns DataFrame with columns: symbol, weight
+```
+
+| Column | Type | Description |
+|--------|------|-------------|
+| `symbol` | str | Stock symbol/ticker |
+| `weight` | f64 | Normalized weight (sum ≤ 1.0) |
+
+Returns target weights for the next rebalancing period. Includes:
+- Hold stocks: continuing positions
+- Enter stocks: pending entry positions
+
+Excludes stocks with pending exit signals.
 
 ### is_stop_triggered()
 Check if any trade was triggered by stop loss or take profit.
@@ -382,6 +459,13 @@ current = report.current_trades()
 
 # Get recommended actions
 actions = report.actions()  # enter/exit/hold per stock
+
+# Get current and next weights (Finlab compatible)
+weights = report.weights()        # Currently held positions (sum ≤ 1)
+next_wts = report.next_weights()  # Target portfolio for next period (sum ≤ 1)
+
+# Note: hold + enter positions are in next_weights
+# This avoids double-counting weights when comparing current vs next portfolio
 ```
 
 ## Resample Options

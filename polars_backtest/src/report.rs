@@ -30,6 +30,10 @@ pub struct PyBacktestReport {
     pub(crate) limit_prices_df: Option<DataFrame>,
     /// Trading values for capacity metric (date, symbol, trading_value)
     pub(crate) trading_value_df: Option<DataFrame>,
+    /// Current position weights (symbol -> normalized weight)
+    pub(crate) weights_df: Option<DataFrame>,
+    /// Next period target weights (symbol -> normalized weight)
+    pub(crate) next_weights_df: Option<DataFrame>,
 }
 
 impl PyBacktestReport {
@@ -42,6 +46,8 @@ impl PyBacktestReport {
         benchmark_df: Option<DataFrame>,
         limit_prices_df: Option<DataFrame>,
         trading_value_df: Option<DataFrame>,
+        weights_df: Option<DataFrame>,
+        next_weights_df: Option<DataFrame>,
     ) -> Self {
         Self {
             creturn_df,
@@ -51,6 +57,8 @@ impl PyBacktestReport {
             benchmark_df,
             limit_prices_df,
             trading_value_df,
+            weights_df,
+            next_weights_df,
         }
     }
 }
@@ -349,25 +357,33 @@ impl PyBacktestReport {
         Ok(PyDataFrame(current))
     }
 
-    /// Get trade actions (enter/exit/hold)
+    /// Get trade actions (enter/exit/hold) with weights
+    ///
+    /// Returns DataFrame with columns: symbol, action, weight, next_weight
     ///
     /// Action logic (Finlab compatible):
     /// - "enter": entry_date is null AND entry_sig_date == last_sig_date (pending entry)
     /// - "exit": exit_date is null AND exit_sig_date == last_sig_date (pending exit)
     /// - "hold": exit_date is null AND entry_date is not null AND not exit (open position)
+    ///
+    /// Weight columns:
+    /// - weight: current position weight (0 for enter, value for hold/exit)
+    /// - next_weight: next period target weight (0 for exit, value for hold/enter)
     fn actions(&self) -> PyResult<PyDataFrame> {
         let trades = &self.trades_df;
         if trades.height() == 0 {
             let empty = DataFrame::new(vec![
                 Series::new_empty("symbol".into(), &DataType::String).into_column(),
                 Series::new_empty("action".into(), &DataType::String).into_column(),
+                Series::new_empty("weight".into(), &DataType::Float64).into_column(),
+                Series::new_empty("next_weight".into(), &DataType::Float64).into_column(),
             ]).map_err(to_py_err)?;
             return Ok(PyDataFrame(empty));
         }
 
         // Compute last signal date as max of entry_sig_date and exit_sig_date
         // Then determine action based on comparison with last signal date
-        let result = trades
+        let actions_df = trades
             .clone()
             .lazy()
             // Add last_sig_date column: max of all entry_sig_date and exit_sig_date
@@ -404,7 +420,93 @@ impl PyBacktestReport {
             .collect()
             .map_err(to_py_err)?;
 
+        // Join with weights_df to get current weight
+        let with_weight = if let Some(weights) = &self.weights_df {
+            actions_df
+                .lazy()
+                .join(
+                    weights.clone().lazy(),
+                    [col("symbol")],
+                    [col("symbol")],
+                    JoinArgs::new(JoinType::Left),
+                )
+                .with_column(
+                    col("weight").fill_null(lit(0.0))
+                )
+                .collect()
+                .map_err(to_py_err)?
+        } else {
+            actions_df
+                .lazy()
+                .with_column(lit(0.0).alias("weight"))
+                .collect()
+                .map_err(to_py_err)?
+        };
+
+        // Join with next_weights_df to get next_weight
+        let result = if let Some(next_weights) = &self.next_weights_df {
+            with_weight
+                .lazy()
+                .join(
+                    next_weights.clone().lazy().select([
+                        col("symbol"),
+                        col("weight").alias("next_weight"),
+                    ]),
+                    [col("symbol")],
+                    [col("symbol")],
+                    JoinArgs::new(JoinType::Left),
+                )
+                .with_column(
+                    col("next_weight").fill_null(lit(0.0))
+                )
+                .collect()
+                .map_err(to_py_err)?
+        } else {
+            with_weight
+                .lazy()
+                .with_column(lit(0.0).alias("next_weight"))
+                .collect()
+                .map_err(to_py_err)?
+        };
+
         Ok(PyDataFrame(result))
+    }
+
+    /// Get current position weights (Finlab compatible)
+    ///
+    /// Returns normalized weights for currently held positions (hold stocks).
+    /// Sum of weights <= 1.0
+    fn weights(&self) -> PyResult<PyDataFrame> {
+        match &self.weights_df {
+            Some(df) => Ok(PyDataFrame(df.clone())),
+            None => {
+                // Return empty DataFrame if no weights
+                let empty = DataFrame::new(vec![
+                    Series::new_empty("symbol".into(), &DataType::String).into_column(),
+                    Series::new_empty("weight".into(), &DataType::Float64).into_column(),
+                ]).map_err(to_py_err)?;
+                Ok(PyDataFrame(empty))
+            }
+        }
+    }
+
+    /// Get next period target weights (Finlab compatible)
+    ///
+    /// Returns normalized weights for the next rebalancing period.
+    /// Includes both hold and enter stocks.
+    /// Sum of weights <= 1.0
+    fn next_weights(&self) -> PyResult<PyDataFrame> {
+        match &self.next_weights_df {
+            Some(df) => Ok(PyDataFrame(df.clone())),
+            None => {
+                // Return empty DataFrame if no weights
+                let empty = DataFrame::new(vec![
+                    Series::new_empty("symbol".into(), &DataType::String).into_column(),
+                    Series::new_empty("weight".into(), &DataType::Float64).into_column(),
+                ]).map_err(to_py_err)?;
+                Ok(PyDataFrame(empty))
+            }
+        }
     }
 
     /// Check if any trade was triggered by stop loss or take profit

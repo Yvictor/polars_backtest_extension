@@ -210,3 +210,152 @@ class TestTradesCount:
 
         # Should have at least 2 trades: A (open) and B (pending)
         assert trades.height >= 2, f"Expected at least 2 trades, got {trades.height}"
+
+
+class TestWeights:
+    """Test weights() and next_weights() methods."""
+
+    def test_weights_returns_current_positions(self, simple_data_with_pending_entry):
+        """Test that weights() returns only currently held positions."""
+        df = simple_data_with_pending_entry
+
+        report = df.bt.backtest_with_report(
+            trade_at_price="close", position="weight", fee_ratio=0.0, tax_ratio=0.0, resample=None
+        )
+
+        weights = report.weights()
+
+        # Only A is currently held (B is pending entry, not yet entered)
+        symbols = weights["symbol"].to_list()
+        assert "A" in symbols, f"A should be in weights, got {symbols}"
+
+        # Weights should be normalized
+        total = weights["weight"].sum()
+        assert abs(total - 1.0) < 0.01 or total == 0.0, f"Weights should sum to 1, got {total}"
+
+    def test_next_weights_includes_pending_entries(self, simple_data_with_pending_entry):
+        """Test that next_weights() includes pending entry stocks."""
+        df = simple_data_with_pending_entry
+
+        report = df.bt.backtest_with_report(
+            trade_at_price="close", position="weight", fee_ratio=0.0, tax_ratio=0.0, resample=None
+        )
+
+        next_weights = report.next_weights()
+
+        # Both A (continuing) and B (entering) should be in next_weights
+        symbols = next_weights["symbol"].to_list()
+        assert "A" in symbols, f"A should be in next_weights, got {symbols}"
+        assert "B" in symbols, f"B should be in next_weights (pending entry), got {symbols}"
+
+        # Weights should be normalized
+        total = next_weights["weight"].sum()
+        assert abs(total - 1.0) < 0.01, f"Next weights should sum to 1, got {total}"
+
+    def test_weights_excludes_pending_exit(self, simple_data_with_pending_exit):
+        """Test weights with pending exit scenario."""
+        df = simple_data_with_pending_exit
+
+        report = df.bt.backtest_with_report(
+            trade_at_price="close", position="weight", fee_ratio=0.0, tax_ratio=0.0, resample=None
+        )
+
+        weights = report.weights()
+        next_weights = report.next_weights()
+
+        # Current weights should include B (still holding)
+        current_symbols = weights["symbol"].to_list()
+        assert "B" in current_symbols, f"B should be in current weights, got {current_symbols}"
+
+        # Next weights should NOT include B (exiting)
+        next_symbols = next_weights["symbol"].to_list()
+        assert "B" not in next_symbols, f"B should NOT be in next_weights (pending exit), got {next_symbols}"
+        assert "A" in next_symbols, f"A should be in next_weights, got {next_symbols}"
+
+    def test_weights_sum_normalized(self, simple_data_with_pending_entry):
+        """Test that both weights and next_weights are properly normalized."""
+        df = simple_data_with_pending_entry
+
+        report = df.bt.backtest_with_report(
+            trade_at_price="close", position="weight", fee_ratio=0.0, tax_ratio=0.0, resample=None
+        )
+
+        weights = report.weights()
+        next_weights = report.next_weights()
+
+        if weights.height > 0:
+            weights_sum = weights["weight"].sum()
+            assert weights_sum <= 1.0 + 0.01, f"Weights sum {weights_sum} should be <= 1"
+
+        if next_weights.height > 0:
+            next_sum = next_weights["weight"].sum()
+            assert next_sum <= 1.0 + 0.01, f"Next weights sum {next_sum} should be <= 1"
+
+
+class TestActionsWithWeights:
+    """Test actions() with weight and next_weight columns."""
+
+    def test_actions_has_weight_columns(self, simple_data_with_pending_entry):
+        """Test that actions() returns weight and next_weight columns."""
+        df = simple_data_with_pending_entry
+
+        report = df.bt.backtest_with_report(
+            trade_at_price="close", position="weight", fee_ratio=0.0, tax_ratio=0.0, resample=None
+        )
+
+        actions = report.actions()
+
+        # Check columns exist
+        assert "weight" in actions.columns, f"actions should have 'weight' column, got {actions.columns}"
+        assert "next_weight" in actions.columns, f"actions should have 'next_weight' column, got {actions.columns}"
+
+    def test_enter_action_has_zero_weight(self, simple_data_with_pending_entry):
+        """Test that 'enter' action has weight=0 (not yet held)."""
+        df = simple_data_with_pending_entry
+
+        report = df.bt.backtest_with_report(
+            trade_at_price="close", position="weight", fee_ratio=0.0, tax_ratio=0.0, resample=None
+        )
+
+        actions = report.actions()
+
+        # B is entering, so weight should be 0
+        b_action = actions.filter(pl.col("symbol") == "B")
+        assert b_action.height == 1
+        assert b_action["action"][0] == "enter"
+        assert b_action["weight"][0] == 0.0, f"Enter stock should have weight=0, got {b_action['weight'][0]}"
+        assert b_action["next_weight"][0] > 0.0, f"Enter stock should have next_weight>0, got {b_action['next_weight'][0]}"
+
+    def test_hold_action_has_weight(self, simple_data_with_pending_entry):
+        """Test that 'hold' action has both weight and next_weight."""
+        df = simple_data_with_pending_entry
+
+        report = df.bt.backtest_with_report(
+            trade_at_price="close", position="weight", fee_ratio=0.0, tax_ratio=0.0, resample=None
+        )
+
+        actions = report.actions()
+
+        # A is holding, should have both weights
+        a_action = actions.filter(pl.col("symbol") == "A")
+        assert a_action.height == 1
+        assert a_action["action"][0] == "hold"
+        assert a_action["weight"][0] > 0.0, f"Hold stock should have weight>0, got {a_action['weight'][0]}"
+        assert a_action["next_weight"][0] > 0.0, f"Hold stock should have next_weight>0, got {a_action['next_weight'][0]}"
+
+    def test_exit_action_has_zero_next_weight(self, simple_data_with_pending_exit):
+        """Test that 'exit' action has next_weight=0 (leaving portfolio)."""
+        df = simple_data_with_pending_exit
+
+        report = df.bt.backtest_with_report(
+            trade_at_price="close", position="weight", fee_ratio=0.0, tax_ratio=0.0, resample=None
+        )
+
+        actions = report.actions()
+
+        # B is exiting, so next_weight should be 0
+        b_action = actions.filter(pl.col("symbol") == "B")
+        assert b_action.height == 1
+        assert b_action["action"][0] == "exit"
+        assert b_action["weight"][0] > 0.0, f"Exit stock should have weight>0, got {b_action['weight'][0]}"
+        assert b_action["next_weight"][0] == 0.0, f"Exit stock should have next_weight=0, got {b_action['next_weight'][0]}"

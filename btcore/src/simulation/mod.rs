@@ -36,5 +36,5 @@ pub use long::{
 
 // Re-export from other modules for convenience
 pub use crate::config::BacktestConfig;
-pub use crate::tracker::{BacktestResult, WideBacktestResult, TradeRecord, WideTradeRecord};
+pub use crate::tracker::{BacktestResult, WideBacktestResult, TradeRecord, WideTradeRecord, StockOperations};
 pub use crate::weights::IntoWeights;
