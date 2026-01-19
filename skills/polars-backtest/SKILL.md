@@ -228,7 +228,7 @@ Get trade actions for current positions with weights. Finlab-compatible logic.
 
 ```python
 report.actions()
-# Returns DataFrame with columns: symbol, action, weight, next_weight
+# Returns DataFrame with columns: symbol, action, weight, next_weight, weight_date, next_weight_date
 ```
 
 #### Output Columns
@@ -239,6 +239,8 @@ report.actions()
 | `action` | str | Action type: `"enter"`, `"exit"`, or `"hold"` |
 | `weight` | f64 | Current position weight (0 for enter, value for hold/exit) |
 | `next_weight` | f64 | Next period target weight (0 for exit, value for hold/enter) |
+| `weight_date` | Date | Date of current weights (signal date) |
+| `next_weight_date` | Date | Date of next weights (next rebalance date) |
 
 #### Action Types Summary
 
@@ -261,18 +263,18 @@ report.actions()
 ```python
 report = df.bt.backtest_with_report(position="weight", resample="M")
 
-# Get actions with weights
+# Get actions with weights and dates
 actions = report.actions()
 print(actions)
-# shape: (115, 4)
-# ┌────────┬────────┬──────────┬─────────────┐
-# │ symbol ┆ action ┆ weight   ┆ next_weight │
-# │ str    ┆ str    ┆ f64      ┆ f64         │
-# ╞════════╪════════╪══════════╪═════════════╡
-# │ 2330   ┆ hold   ┆ 0.023809 ┆ 0.017543    │
-# │ 2317   ┆ exit   ┆ 0.023809 ┆ 0.0         │
-# │ 2454   ┆ enter  ┆ 0.0      ┆ 0.017543    │
-# └────────┴────────┴──────────┴─────────────┘
+# shape: (115, 6)
+# ┌────────┬────────┬──────────┬─────────────┬─────────────┬──────────────────┐
+# │ symbol ┆ action ┆ weight   ┆ weight_date ┆ next_weight ┆ next_weight_date │
+# │ str    ┆ str    ┆ f64      ┆ date        ┆ f64         ┆ date             │
+# ╞════════╪════════╪══════════╪═════════════╪═════════════╪══════════════════╡
+# │ 2330   ┆ hold   ┆ 0.023809 ┆ 2026-01-15  ┆ 0.017543    ┆ 2026-02-15       │
+# │ 2317   ┆ exit   ┆ 0.023809 ┆ 2026-01-15  ┆ 0.0         ┆ null             │
+# │ 2454   ┆ enter  ┆ 0.0      ┆ null        ┆ 0.017543    ┆ 2026-02-15       │
+# └────────┴────────┴──────────┴─────────────┴─────────────┴──────────────────┘
 
 # Filter by action type
 entering = actions.filter(pl.col("action") == "enter")
@@ -291,13 +293,14 @@ Get current position weights (normalized). Finlab-compatible.
 
 ```python
 report.weights()
-# Returns DataFrame with columns: symbol, weight
+# Returns DataFrame with columns: symbol, weight, date
 ```
 
 | Column | Type | Description |
 |--------|------|-------------|
 | `symbol` | str | Stock symbol/ticker |
 | `weight` | f64 | Normalized weight (sum ≤ 1.0) |
+| `date` | Date | Date of current weights (signal date) |
 
 Returns weights for currently held positions only (stocks with `entry_date` set, `exit_date` null).
 
@@ -306,13 +309,14 @@ Get next period target weights (normalized). Finlab-compatible.
 
 ```python
 report.next_weights()
-# Returns DataFrame with columns: symbol, weight
+# Returns DataFrame with columns: symbol, weight, date
 ```
 
 | Column | Type | Description |
 |--------|------|-------------|
 | `symbol` | str | Stock symbol/ticker |
 | `weight` | f64 | Normalized weight (sum ≤ 1.0) |
+| `date` | Date | Date of next weights (next rebalance date) |
 
 Returns target weights for the next rebalancing period. Includes:
 - Hold stocks: continuing positions

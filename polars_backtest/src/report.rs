@@ -377,6 +377,8 @@ impl PyBacktestReport {
                 Series::new_empty("action".into(), &DataType::String).into_column(),
                 Series::new_empty("weight".into(), &DataType::Float64).into_column(),
                 Series::new_empty("next_weight".into(), &DataType::Float64).into_column(),
+                Series::new_empty("weight_date".into(), &DataType::Date).into_column(),
+                Series::new_empty("next_weight_date".into(), &DataType::Date).into_column(),
             ]).map_err(to_py_err)?;
             return Ok(PyDataFrame(empty));
         }
@@ -420,12 +422,16 @@ impl PyBacktestReport {
             .collect()
             .map_err(to_py_err)?;
 
-        // Join with weights_df to get current weight
+        // Join with weights_df to get current weight and weight_date
         let with_weight = if let Some(weights) = &self.weights_df {
             actions_df
                 .lazy()
                 .join(
-                    weights.clone().lazy(),
+                    weights.clone().lazy().select([
+                        col("symbol"),
+                        col("weight"),
+                        col("date").alias("weight_date"),
+                    ]),
                     [col("symbol")],
                     [col("symbol")],
                     JoinArgs::new(JoinType::Left),
@@ -438,12 +444,15 @@ impl PyBacktestReport {
         } else {
             actions_df
                 .lazy()
-                .with_column(lit(0.0).alias("weight"))
+                .with_columns([
+                    lit(0.0).alias("weight"),
+                    lit(NULL).cast(DataType::Date).alias("weight_date"),
+                ])
                 .collect()
                 .map_err(to_py_err)?
         };
 
-        // Join with next_weights_df to get next_weight
+        // Join with next_weights_df to get next_weight and next_weight_date
         let result = if let Some(next_weights) = &self.next_weights_df {
             with_weight
                 .lazy()
@@ -451,6 +460,7 @@ impl PyBacktestReport {
                     next_weights.clone().lazy().select([
                         col("symbol"),
                         col("weight").alias("next_weight"),
+                        col("date").alias("next_weight_date"),
                     ]),
                     [col("symbol")],
                     [col("symbol")],
@@ -464,7 +474,10 @@ impl PyBacktestReport {
         } else {
             with_weight
                 .lazy()
-                .with_column(lit(0.0).alias("next_weight"))
+                .with_columns([
+                    lit(0.0).alias("next_weight"),
+                    lit(NULL).cast(DataType::Date).alias("next_weight_date"),
+                ])
                 .collect()
                 .map_err(to_py_err)?
         };
@@ -475,6 +488,7 @@ impl PyBacktestReport {
     /// Get current position weights (Finlab compatible)
     ///
     /// Returns normalized weights for currently held positions (hold stocks).
+    /// Columns: symbol, weight, date
     /// Sum of weights <= 1.0
     fn weights(&self) -> PyResult<PyDataFrame> {
         match &self.weights_df {
@@ -484,6 +498,7 @@ impl PyBacktestReport {
                 let empty = DataFrame::new(vec![
                     Series::new_empty("symbol".into(), &DataType::String).into_column(),
                     Series::new_empty("weight".into(), &DataType::Float64).into_column(),
+                    Series::new_empty("date".into(), &DataType::Date).into_column(),
                 ]).map_err(to_py_err)?;
                 Ok(PyDataFrame(empty))
             }
@@ -494,6 +509,7 @@ impl PyBacktestReport {
     ///
     /// Returns normalized weights for the next rebalancing period.
     /// Includes both hold and enter stocks.
+    /// Columns: symbol, weight, date
     /// Sum of weights <= 1.0
     fn next_weights(&self) -> PyResult<PyDataFrame> {
         match &self.next_weights_df {
@@ -503,6 +519,7 @@ impl PyBacktestReport {
                 let empty = DataFrame::new(vec![
                     Series::new_empty("symbol".into(), &DataType::String).into_column(),
                     Series::new_empty("weight".into(), &DataType::Float64).into_column(),
+                    Series::new_empty("date".into(), &DataType::Date).into_column(),
                 ]).map_err(to_py_err)?;
                 Ok(PyDataFrame(empty))
             }

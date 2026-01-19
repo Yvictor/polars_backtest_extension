@@ -404,6 +404,23 @@ pub trait RecordBuilder: Sized {
         entry_price: f64,
         entry_raw_price: f64,
     ) -> Self;
+
+    /// Build an open position record with calculated metrics
+    ///
+    /// This calculates unrealized return, MAE/MFE using the last price
+    /// as a "virtual exit" without exit transaction costs.
+    fn build_open_with_metrics(
+        key: Self::Key,
+        entry_date: Self::Date,
+        signal_date: Self::Date,
+        weight: f64,
+        entry_price: f64,
+        entry_raw_price: f64,
+        close_prices: &[f64],
+        trade_prices: &[f64],
+        fee_ratio: f64,
+        tax_ratio: f64,
+    ) -> Self;
 }
 
 impl RecordBuilder for WideTradeRecord {
@@ -545,6 +562,55 @@ impl RecordBuilder for WideTradeRecord {
             mdd: None,
             pdays: None,
             period: None,
+        }
+    }
+
+    fn build_open_with_metrics(
+        key: usize,
+        entry_date: usize,
+        signal_date: usize,
+        weight: f64,
+        entry_price: f64,
+        _entry_raw_price: f64,
+        close_prices: &[f64],
+        trade_prices: &[f64],
+        fee_ratio: f64,
+        _tax_ratio: f64,
+    ) -> Self {
+        // Calculate MAE/MFE metrics for open position
+        // Use last price as "virtual exit" WITHOUT exit transaction costs
+        let is_long = weight >= 0.0;
+        let exit_idx = close_prices.len().saturating_sub(1);
+        let metrics = calculate_mae_mfe_at_exit(
+            close_prices,
+            trade_prices,
+            0,         // entry is at index 0 in our collected prices
+            exit_idx,  // exit is at the last index
+            is_long,
+            true,   // has_entry_transaction
+            false,  // NO exit transaction (still open)
+            fee_ratio,
+            0.0,    // No tax for unrealized return
+        );
+
+        let period = close_prices.len().saturating_sub(1) as u32;
+
+        Self {
+            stock_id: key,
+            entry_index: Some(entry_date),
+            exit_index: None,
+            entry_sig_index: signal_date,
+            exit_sig_index: None,
+            position_weight: weight,
+            entry_price,
+            exit_price: None,
+            trade_return: Some(metrics.ret),
+            mae: Some(metrics.mae),
+            gmfe: Some(metrics.gmfe),
+            bmfe: Some(metrics.bmfe),
+            mdd: Some(metrics.mdd),
+            pdays: Some(metrics.pdays),
+            period: Some(period),
         }
     }
 }
@@ -698,6 +764,57 @@ impl RecordBuilder for TradeRecord {
             period: None,
         }
     }
+
+    fn build_open_with_metrics(
+        key: String,
+        entry_date: i32,
+        signal_date: i32,
+        weight: f64,
+        entry_price: f64,
+        entry_raw_price: f64,
+        close_prices: &[f64],
+        trade_prices: &[f64],
+        fee_ratio: f64,
+        _tax_ratio: f64,
+    ) -> Self {
+        // Calculate MAE/MFE metrics for open position
+        // Use last price as "virtual exit" WITHOUT exit transaction costs
+        let is_long = weight >= 0.0;
+        let exit_idx = close_prices.len().saturating_sub(1);
+        let metrics = calculate_mae_mfe_at_exit(
+            close_prices,
+            trade_prices,
+            0,         // entry is at index 0 in our collected prices
+            exit_idx,  // exit is at the last index
+            is_long,
+            true,   // has_entry_transaction
+            false,  // NO exit transaction (still open)
+            fee_ratio,
+            0.0,    // No tax for unrealized return
+        );
+
+        let period = close_prices.len().saturating_sub(1) as i32;
+
+        Self {
+            symbol: key,
+            entry_date: Some(entry_date),
+            exit_date: None,
+            entry_sig_date: signal_date,
+            exit_sig_date: None,
+            position_weight: weight,
+            entry_price,
+            exit_price: None,
+            entry_raw_price,
+            exit_raw_price: None,
+            trade_return: Some(metrics.ret),
+            mae: Some(metrics.mae),
+            gmfe: Some(metrics.gmfe),
+            bmfe: Some(metrics.bmfe),
+            mdd: Some(metrics.mdd),
+            pdays: Some(metrics.pdays),
+            period: Some(period),
+        }
+    }
 }
 
 /// Generic trade tracker - unified implementation for both formats
@@ -812,17 +929,25 @@ impl<R: RecordBuilder> TradeTracker for GenericTracker<R> {
         }
     }
 
-    fn finalize(mut self, _fee_ratio: f64, _tax_ratio: f64) -> Vec<R> {
+    fn finalize(mut self, fee_ratio: f64, tax_ratio: f64) -> Vec<R> {
         for (_, open_trade) in self.open_trades.drain() {
             // Calculate raw price for open positions with rounding
             let entry_raw_price = round_raw_price(open_trade.entry_price / open_trade.entry_factor);
-            self.completed_trades.push(R::build_open(
+
+            // Always calculate metrics for open positions
+            // Even if close_prices.len() == 1 (entry day only), we can still calculate
+            // basic metrics (period=0, return=-fee, mae=-fee, gmfe=0)
+            self.completed_trades.push(R::build_open_with_metrics(
                 open_trade.key,
                 open_trade.entry_date,
                 open_trade.signal_date,
                 open_trade.weight,
                 open_trade.entry_price,
                 entry_raw_price,
+                &open_trade.close_prices,
+                &open_trade.trade_prices,
+                fee_ratio,
+                tax_ratio,
             ));
         }
         self.completed_trades

@@ -435,30 +435,39 @@ fn trades_to_dataframe(trades: &[TradeRecord]) -> PolarsResult<DataFrame> {
 /// Returns (weights_df, next_weights_df) where each DataFrame has columns:
 /// - symbol: String
 /// - weight: Float64
+/// - date: Date (weight_date for weights, next_weight_date for next_weights)
 fn stock_operations_to_dataframes(
     ops: &StockOperations,
 ) -> PolarsResult<(Option<DataFrame>, Option<DataFrame>)> {
-    // Create weights DataFrame
+    // Create weights DataFrame with date column
     let weights_df = if ops.weights.is_empty() {
         None
     } else {
+        let n = ops.weights.len();
         let symbols: Vec<&str> = ops.weights.keys().map(|s| s.as_str()).collect();
         let weights: Vec<f64> = ops.weights.values().copied().collect();
+        // Add date column (same date for all rows)
+        let dates: Vec<Option<i32>> = vec![ops.weight_date; n];
         Some(DataFrame::new(vec![
             Series::new("symbol".into(), symbols).into_column(),
             Series::new("weight".into(), weights).into_column(),
+            Series::new("date".into(), dates).cast(&DataType::Date)?.into_column(),
         ])?)
     };
 
-    // Create next_weights DataFrame
+    // Create next_weights DataFrame with date column
     let next_weights_df = if ops.next_weights.is_empty() {
         None
     } else {
+        let n = ops.next_weights.len();
         let symbols: Vec<&str> = ops.next_weights.keys().map(|s| s.as_str()).collect();
         let weights: Vec<f64> = ops.next_weights.values().copied().collect();
+        // Add date column (same date for all rows)
+        let dates: Vec<Option<i32>> = vec![ops.next_weight_date; n];
         Some(DataFrame::new(vec![
             Series::new("symbol".into(), symbols).into_column(),
             Series::new("weight".into(), weights).into_column(),
+            Series::new("date".into(), dates).cast(&DataType::Date)?.into_column(),
         ])?)
     };
 

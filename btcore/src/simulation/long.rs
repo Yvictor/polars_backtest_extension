@@ -942,7 +942,7 @@ pub fn backtest_with_report_long_arrow(
 
     // Calculate stock_operations (actions, weights, next_weights)
     // This matches Finlab's behavior where actions are computed at the end of backtest
-    let stock_operations = calculate_stock_operations(input, &trades, &dates);
+    let stock_operations = calculate_stock_operations(input, &trades, &dates, resample, offset);
 
     // Post-process trades based on stock_operations (Finlab compatible)
     // 1. For "exit" actions: set exit_sig_date on open trades
@@ -995,6 +995,88 @@ pub fn backtest_with_report_long_arrow(
     }
 }
 
+/// Calculate the next signal date based on resample frequency and offset
+///
+/// Given a base date (typically the current signal date), calculate when the
+/// next signal should occur based on the resample pattern.
+///
+/// For example:
+/// - Monthly with 15D offset: if base = Jan 15, next = Feb 15
+/// - Monthly (no offset): if base = Jan 31, next = Feb 28/29
+fn calculate_next_signal_date(
+    base_date: i32,
+    resample: ResampleFreq,
+    offset: Option<ResampleOffset>,
+) -> i32 {
+    let offset_days = offset.map(|o| o.days).unwrap_or(0);
+
+    match resample {
+        ResampleFreq::Monthly | ResampleFreq::MonthStart => {
+            // Get current year/month from base_date
+            let (year, month) = days_to_year_month(base_date);
+
+            // Calculate next month
+            let (next_year, next_month) = if month == 12 {
+                (year + 1, 1)
+            } else {
+                (year, month + 1)
+            };
+
+            // If offset is provided, signal is on (1 + offset_days) day of month
+            // Otherwise, signal is at month end
+            if offset_days > 0 {
+                // Signal on offset_days-th day of month (e.g., 15D means 15th)
+                let signal_day = offset_days.min(days_in_month(next_year, next_month) as i32);
+                ymd_to_days(next_year, next_month, signal_day as u32)
+            } else {
+                // Month end
+                ymd_to_days(next_year, next_month, days_in_month(next_year, next_month))
+            }
+        }
+        ResampleFreq::Weekly | ResampleFreq::WeeklyOn(_) => {
+            // Add 7 days for next week
+            base_date + 7 + offset_days
+        }
+        ResampleFreq::Quarterly => {
+            // Get current quarter and move to next
+            let (year, month) = days_to_year_month(base_date);
+            let current_quarter = (month - 1) / 3;
+            let (next_year, next_quarter) = if current_quarter == 3 {
+                (year + 1, 0)
+            } else {
+                (year, current_quarter + 1)
+            };
+
+            // First month of next quarter
+            let quarter_start_month = next_quarter * 3 + 1;
+
+            if offset_days > 0 {
+                ymd_to_days(next_year, quarter_start_month, offset_days.min(28) as u32)
+            } else {
+                // Last day of quarter (last day of 3rd month in quarter)
+                let quarter_end_month = quarter_start_month + 2;
+                ymd_to_days(
+                    next_year,
+                    quarter_end_month,
+                    days_in_month(next_year, quarter_end_month),
+                )
+            }
+        }
+        ResampleFreq::Yearly => {
+            let (year, _) = days_to_year_month(base_date);
+            if offset_days > 0 {
+                ymd_to_days(year + 1, 1, offset_days.min(28) as u32)
+            } else {
+                ymd_to_days(year + 1, 12, 31)
+            }
+        }
+        _ => {
+            // Daily or PositionChange - just add 1 day
+            base_date + 1
+        }
+    }
+}
+
 /// Calculate stock operations (actions, weights, next_weights) at the end of backtest
 ///
 /// This function computes the trading actions by comparing:
@@ -1009,6 +1091,8 @@ fn calculate_stock_operations(
     input: &LongFormatArrowInput,
     trades: &[TradeRecord],
     dates: &[i32],
+    resample: ResampleFreq,
+    offset: Option<ResampleOffset>,
 ) -> StockOperations {
     use std::collections::HashSet;
 
@@ -1028,39 +1112,70 @@ fn calculate_stock_operations(
         .map(|t| t.symbol.clone())
         .collect();
 
-    // Find the latest signal date and weights from input
-    // Signal date is the date with non-zero weights that is <= last_price_date
-    // We scan from the end to find the latest signal date
+    // Find signal dates from input
+    // We need to find weights for action calculation and determine the next rebalance date
     let n = input.dates.len();
-    let mut latest_signal_date: Option<i32> = None;
+    let mut current_signal_date: Option<i32> = None;
+    let mut future_signal_date: Option<i32> = None;
     let mut signal_weights: HashMap<String, f64> = HashMap::new();
 
-    // Find the latest date with any signal (non-zero weight)
-    for i in (0..n).rev() {
+    // First pass: find the NEXT signal date (first date > last_price_date with signals)
+    for i in 0..n {
         let date = input.dates.value(i);
         let weight = input.weights.value(i);
 
-        // Skip if this date is after the last price date
-        // (we want signals that could have been executed)
         if date > last_price_date {
-            continue;
-        }
-
-        // Check if this is a new date
-        if latest_signal_date.is_none() || date == latest_signal_date.unwrap() {
             if !weight.is_nan() && weight.abs() > FLOAT_EPSILON {
-                latest_signal_date = Some(date);
-                let symbol = input.symbols.value(i).to_string();
-                signal_weights.insert(symbol, weight);
+                if future_signal_date.is_none() {
+                    future_signal_date = Some(date);
+                }
+                if future_signal_date == Some(date) {
+                    let symbol = input.symbols.value(i).to_string();
+                    signal_weights.insert(symbol, weight);
+                } else {
+                    // We've moved past the next signal date
+                    break;
+                }
             }
-        } else if latest_signal_date.is_some() && date < latest_signal_date.unwrap() {
-            // We've moved past the latest signal date
-            break;
         }
     }
 
-    // If no signal found, return empty operations
-    let Some(signal_date) = latest_signal_date else {
+    // If no future signal found, fall back to latest signal <= last_price_date
+    if future_signal_date.is_none() {
+        // Find the latest date with any signal (non-zero weight)
+        for i in (0..n).rev() {
+            let date = input.dates.value(i);
+            let weight = input.weights.value(i);
+
+            // Skip if this date is after the last price date
+            if date > last_price_date {
+                continue;
+            }
+
+            // Check if this is a new date
+            if current_signal_date.is_none() || date == current_signal_date.unwrap() {
+                if !weight.is_nan() && weight.abs() > FLOAT_EPSILON {
+                    current_signal_date = Some(date);
+                    let symbol = input.symbols.value(i).to_string();
+                    signal_weights.insert(symbol, weight);
+                }
+            } else if current_signal_date.is_some() && date < current_signal_date.unwrap() {
+                // We've moved past the latest signal date
+                break;
+            }
+        }
+    }
+
+    // Determine signal_date (for weights) and next_weight_date (next rebalance)
+    let (_signal_date, calculated_next_weight_date) = if let Some(future_date) = future_signal_date {
+        // Found future signal in input - use it for both
+        (future_date, future_date)
+    } else if let Some(current_date) = current_signal_date {
+        // Fallback to current signal - calculate next rebalance date from resample pattern
+        let next_date = calculate_next_signal_date(current_date, resample, offset);
+        (current_date, next_date)
+    } else {
+        // No signal found
         return ops;
     };
 
@@ -1122,7 +1237,7 @@ fn calculate_stock_operations(
     ops.weights = normalized_current;
     ops.next_weights = signal_weights;
     ops.weight_date = weight_date;
-    ops.next_weight_date = Some(signal_date);
+    ops.next_weight_date = Some(calculated_next_weight_date);
 
     ops
 }
