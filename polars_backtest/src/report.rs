@@ -334,25 +334,56 @@ impl PyBacktestReport {
         Ok(PyDataFrame(pivoted))
     }
 
-    /// Get current trades (active positions)
+    /// Get current trades (active positions and recent actions)
+    ///
+    /// Returns trades that are relevant to the current portfolio state:
+    /// 1. Open positions: entry_date is not null AND exit_date is null
+    /// 2. Recently exited: exit_sig_date == weight_date (exited on last rebalance)
+    /// 3. Pending entries: entry_date is null (will enter on next trading day)
     fn current_trades(&self) -> PyResult<PyDataFrame> {
         let trades = &self.trades_df;
         if trades.height() == 0 {
             return Ok(PyDataFrame(trades.clone()));
         }
 
-        // Get last date from creturn
-        let last_date = self.get_last_date_expr()?;
+        // Get weight_date from weights_df (the last rebalance signal date)
+        let weight_date = if let Some(weights) = &self.weights_df {
+            if weights.height() > 0 {
+                let date_col = weights.column("date")
+                    .map_err(to_py_err)?
+                    .date()
+                    .map_err(to_py_err)?;
+                date_col.phys.get(0)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
 
-        let current = trades
-            .clone()
-            .lazy()
-            .filter(
-                col("exit_date").is_null()
-                    .or(col("exit_date").eq(lit(last_date)))
-            )
-            .collect()
-            .map_err(to_py_err)?;
+        // Filter trades based on current portfolio relevance
+        let current = if let Some(w_date) = weight_date {
+            // Include:
+            // 1. exit_date is null (open positions + pending entries)
+            // 2. exit_sig_date == weight_date (recently exited on last rebalance)
+            trades
+                .clone()
+                .lazy()
+                .filter(
+                    col("exit_date").is_null()
+                        .or(col("exit_sig_date").eq(lit(w_date)))
+                )
+                .collect()
+                .map_err(to_py_err)?
+        } else {
+            // Fallback: just use exit_date is null
+            trades
+                .clone()
+                .lazy()
+                .filter(col("exit_date").is_null())
+                .collect()
+                .map_err(to_py_err)?
+        };
 
         Ok(PyDataFrame(current))
     }
