@@ -1034,8 +1034,9 @@ fn calculate_next_signal_date(
             }
         }
         ResampleFreq::Weekly | ResampleFreq::WeeklyOn(_) => {
-            // Add 7 days for next week
-            base_date + 7 + offset_days
+            // Weekly signal repeats every 7 days
+            // The offset is already reflected in the base_date (which is a signal date)
+            base_date + 7
         }
         ResampleFreq::Quarterly => {
             // Get current quarter and move to next
@@ -1166,19 +1167,6 @@ fn calculate_stock_operations(
         }
     }
 
-    // Determine signal_date (for weights) and next_weight_date (next rebalance)
-    let (_signal_date, calculated_next_weight_date) = if let Some(future_date) = future_signal_date {
-        // Found future signal in input - use it for both
-        (future_date, future_date)
-    } else if let Some(current_date) = current_signal_date {
-        // Fallback to current signal - calculate next rebalance date from resample pattern
-        let next_date = calculate_next_signal_date(current_date, resample, offset);
-        (current_date, next_date)
-    } else {
-        // No signal found
-        return ops;
-    };
-
     // Normalize signal weights
     let total_weight: f64 = signal_weights.values().map(|w| w.abs()).sum();
     if total_weight > 1.0 {
@@ -1227,17 +1215,32 @@ fn calculate_stock_operations(
     }
 
     // Set weight dates
-    // weight_date: the date of current weights (entry_sig_date of most recent entry)
+    // weight_date: the date of current weights (entry_sig_date of most recent entry in open positions)
     let weight_date = trades
         .iter()
         .filter(|t| t.entry_date.is_some() && t.exit_date.is_none())
         .map(|t| t.entry_sig_date)
         .max();
 
+    // Determine next_weight_date (next rebalance date)
+    // Priority: future_signal_date from input > calculated from weight_date > calculated from current_signal_date
+    let next_weight_date = if let Some(future_date) = future_signal_date {
+        // Found future signal in input - use it directly
+        Some(future_date)
+    } else if let Some(w_date) = weight_date {
+        // Calculate from weight_date (the actual last rebalance date from trades)
+        Some(calculate_next_signal_date(w_date, resample, offset))
+    } else if let Some(current_date) = current_signal_date {
+        // Fallback to current_signal_date from input
+        Some(calculate_next_signal_date(current_date, resample, offset))
+    } else {
+        None
+    };
+
     ops.weights = normalized_current;
     ops.next_weights = signal_weights;
     ops.weight_date = weight_date;
-    ops.next_weight_date = Some(calculated_next_weight_date);
+    ops.next_weight_date = next_weight_date;
 
     ops
 }
