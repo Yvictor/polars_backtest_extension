@@ -78,11 +78,21 @@ impl WideTradeRecord {
 
     /// Calculate trade return with fees
     ///
-    /// Finlab formula:
+    /// Long formula:
     /// trade_return = (1 - fee_ratio) * (exit_price / entry_price) * (1 - tax_ratio - fee_ratio) - 1
+    ///
+    /// Short formula (using `2 - exit/entry` to invert the ratio):
+    /// trade_return = (1 - fee_ratio) * (2 - exit_price / entry_price) * (1 - tax_ratio - fee_ratio) - 1
     pub fn calculate_return(&self, fee_ratio: f64, tax_ratio: f64) -> Option<f64> {
         self.exit_price.map(|exit_price| {
-            (1.0 - fee_ratio) * (exit_price / self.entry_price) * (1.0 - tax_ratio - fee_ratio) - 1.0
+            let is_long = self.position_weight >= 0.0;
+            let price_ratio = exit_price / self.entry_price;
+            let adjusted_ratio = if is_long {
+                price_ratio
+            } else {
+                2.0 - price_ratio // Short: (entry - exit) / entry + 1 = 2 - exit/entry
+            };
+            (1.0 - fee_ratio) * adjusted_ratio * (1.0 - tax_ratio - fee_ratio) - 1.0
         })
     }
 }
@@ -142,9 +152,22 @@ impl TradeRecord {
     }
 
     /// Calculate trade return with fees
+    ///
+    /// Long formula:
+    /// trade_return = (1 - fee_ratio) * (exit_price / entry_price) * (1 - tax_ratio - fee_ratio) - 1
+    ///
+    /// Short formula (using `2 - exit/entry` to invert the ratio):
+    /// trade_return = (1 - fee_ratio) * (2 - exit_price / entry_price) * (1 - tax_ratio - fee_ratio) - 1
     pub fn calculate_return(&self, fee_ratio: f64, tax_ratio: f64) -> Option<f64> {
         self.exit_price.map(|exit_price| {
-            (1.0 - fee_ratio) * (exit_price / self.entry_price) * (1.0 - tax_ratio - fee_ratio) - 1.0
+            let is_long = self.position_weight >= 0.0;
+            let price_ratio = exit_price / self.entry_price;
+            let adjusted_ratio = if is_long {
+                price_ratio
+            } else {
+                2.0 - price_ratio // Short: (entry - exit) / entry + 1 = 2 - exit/entry
+            };
+            (1.0 - fee_ratio) * adjusted_ratio * (1.0 - tax_ratio - fee_ratio) - 1.0
         })
     }
 }
@@ -1123,5 +1146,141 @@ mod tests {
             period: Some(10),
         };
         assert_eq!(trade.holding_days(), Some(10));
+    }
+
+    #[test]
+    fn test_long_trade_return_no_fees() {
+        // Long: entry at 100, exit at 110 -> profit 10%
+        let trade = TradeRecord {
+            symbol: "TEST".to_string(),
+            entry_date: Some(19000),
+            exit_date: Some(19010),
+            entry_sig_date: 18999,
+            exit_sig_date: Some(19009),
+            position_weight: 0.1, // positive = long
+            entry_price: 100.0,
+            exit_price: Some(110.0),
+            entry_raw_price: 100.0,
+            exit_raw_price: Some(110.0),
+            trade_return: None,
+            mae: None,
+            gmfe: None,
+            bmfe: None,
+            mdd: None,
+            pdays: None,
+            period: Some(10),
+        };
+        let ret = trade.calculate_return(0.0, 0.0).unwrap();
+        assert!((ret - 0.10).abs() < 1e-10, "Long profit should be 10%, got {}", ret);
+    }
+
+    #[test]
+    fn test_short_trade_return_profit_no_fees() {
+        // Short: entry at 100, exit at 90 -> profit 10%
+        // Formula: 2 - exit/entry - 1 = 2 - 0.9 - 1 = 0.1
+        let trade = TradeRecord {
+            symbol: "TEST".to_string(),
+            entry_date: Some(19000),
+            exit_date: Some(19010),
+            entry_sig_date: 18999,
+            exit_sig_date: Some(19009),
+            position_weight: -0.1, // negative = short
+            entry_price: 100.0,
+            exit_price: Some(90.0),
+            entry_raw_price: 100.0,
+            exit_raw_price: Some(90.0),
+            trade_return: None,
+            mae: None,
+            gmfe: None,
+            bmfe: None,
+            mdd: None,
+            pdays: None,
+            period: Some(10),
+        };
+        let ret = trade.calculate_return(0.0, 0.0).unwrap();
+        assert!((ret - 0.10).abs() < 1e-10, "Short profit should be 10%, got {}", ret);
+    }
+
+    #[test]
+    fn test_short_trade_return_loss_no_fees() {
+        // Short: entry at 100, exit at 110 -> loss 10%
+        // Formula: 2 - exit/entry - 1 = 2 - 1.1 - 1 = -0.1
+        let trade = TradeRecord {
+            symbol: "TEST".to_string(),
+            entry_date: Some(19000),
+            exit_date: Some(19010),
+            entry_sig_date: 18999,
+            exit_sig_date: Some(19009),
+            position_weight: -0.1, // negative = short
+            entry_price: 100.0,
+            exit_price: Some(110.0),
+            entry_raw_price: 100.0,
+            exit_raw_price: Some(110.0),
+            trade_return: None,
+            mae: None,
+            gmfe: None,
+            bmfe: None,
+            mdd: None,
+            pdays: None,
+            period: Some(10),
+        };
+        let ret = trade.calculate_return(0.0, 0.0).unwrap();
+        assert!((ret - (-0.10)).abs() < 1e-10, "Short loss should be -10%, got {}", ret);
+    }
+
+    #[test]
+    fn test_wide_short_trade_return_profit_no_fees() {
+        // Short: entry at 100, exit at 90 -> profit 10%
+        let trade = WideTradeRecord {
+            stock_id: 0,
+            entry_index: Some(0),
+            exit_index: Some(10),
+            entry_sig_index: 0,
+            exit_sig_index: Some(9),
+            position_weight: -1.0, // negative = short
+            entry_price: 100.0,
+            exit_price: Some(90.0),
+            trade_return: None,
+            mae: None,
+            gmfe: None,
+            bmfe: None,
+            mdd: None,
+            pdays: None,
+            period: Some(10),
+        };
+
+        let ret = trade.calculate_return(0.0, 0.0).unwrap();
+        assert!((ret - 0.10).abs() < 1e-10, "Wide short profit should be 10%, got {}", ret);
+    }
+
+    #[test]
+    fn test_short_trade_return_with_fees() {
+        // Short: entry at 100, exit at 90 -> profit 10% before fees
+        // With fees: (1 - fee) * (2 - exit/entry) * (1 - tax - fee) - 1
+        let fee_ratio = 0.001425;
+        let tax_ratio = 0.003;
+        let trade = TradeRecord {
+            symbol: "TEST".to_string(),
+            entry_date: Some(19000),
+            exit_date: Some(19010),
+            entry_sig_date: 18999,
+            exit_sig_date: Some(19009),
+            position_weight: -0.1, // negative = short
+            entry_price: 100.0,
+            exit_price: Some(90.0),
+            entry_raw_price: 100.0,
+            exit_raw_price: Some(90.0),
+            trade_return: None,
+            mae: None,
+            gmfe: None,
+            bmfe: None,
+            mdd: None,
+            pdays: None,
+            period: Some(10),
+        };
+        let ret = trade.calculate_return(fee_ratio, tax_ratio).unwrap();
+        // Short: adjusted_ratio = 2 - 0.9 = 1.1
+        let expected = (1.0 - fee_ratio) * 1.1 * (1.0 - tax_ratio - fee_ratio) - 1.0;
+        assert!((ret - expected).abs() < 1e-10, "Short return with fees mismatch: got {}, expected {}", ret, expected);
     }
 }
