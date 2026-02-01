@@ -97,23 +97,24 @@ impl WideTradeRecord {
     }
 }
 
-/// Trade record (string symbols, i32 dates) - default format
+/// Trade record (string symbols, i64 timestamps) - default format
 ///
-/// Uses string symbols and i32 dates (days since epoch) for direct use with Polars DataFrames.
+/// Uses string symbols and i64 timestamps (milliseconds since epoch) for direct use with Polars DataFrames.
+/// Supports both Date (daily) and Datetime (sub-daily) granularity.
 /// This is the default/recommended format.
 #[derive(Debug, Clone)]
 pub struct TradeRecord {
     /// Stock symbol (string key)
     pub symbol: String,
-    /// Actual entry date (days since epoch, T+1 after signal)
+    /// Actual entry timestamp (milliseconds since epoch, T+1 after signal)
     /// None for pending entries that have signal but not yet executed
-    pub entry_date: Option<i32>,
-    /// Actual exit date (days since epoch)
-    pub exit_date: Option<i32>,
-    /// Signal date for entry (days since epoch)
-    pub entry_sig_date: i32,
-    /// Signal date for exit (days since epoch)
-    pub exit_sig_date: Option<i32>,
+    pub entry_date: Option<i64>,
+    /// Actual exit timestamp (milliseconds since epoch)
+    pub exit_date: Option<i64>,
+    /// Signal timestamp for entry (milliseconds since epoch)
+    pub entry_sig_date: i64,
+    /// Signal timestamp for exit (milliseconds since epoch)
+    pub exit_sig_date: Option<i64>,
     /// Position weight at entry
     pub position_weight: f64,
     /// Entry price (adjusted price, for return calculation)
@@ -138,17 +139,22 @@ pub struct TradeRecord {
     pub mdd: Option<f64>,
     /// Number of profitable days
     pub pdays: Option<u32>,
-    /// Holding period in days
-    pub period: Option<i32>,
+    /// Holding period in days (or time units for sub-daily)
+    pub period: Option<i64>,
 }
 
 impl TradeRecord {
-    /// Calculate holding period in days
-    pub fn holding_days(&self) -> Option<i32> {
+    /// Calculate holding period in milliseconds
+    pub fn holding_ms(&self) -> Option<i64> {
         match (self.entry_date, self.exit_date) {
             (Some(entry), Some(exit)) => Some(exit - entry),
             _ => None,
         }
+    }
+
+    /// Calculate holding period in days (for backward compatibility)
+    pub fn holding_days(&self) -> Option<i64> {
+        self.holding_ms().map(|ms| ms / 86_400_000)
     }
 
     /// Calculate trade return with fees
@@ -189,10 +195,10 @@ pub struct StockOperations {
     pub weights: HashMap<String, f64>,
     /// Next signal weights (at next_weight_date)
     pub next_weights: HashMap<String, f64>,
-    /// Date of current weights (days since epoch)
-    pub weight_date: Option<i32>,
-    /// Date of next weights/signal (days since epoch)
-    pub next_weight_date: Option<i32>,
+    /// Timestamp of current weights (milliseconds since epoch)
+    pub weight_date: Option<i64>,
+    /// Timestamp of next weights/signal (milliseconds since epoch)
+    pub next_weight_date: Option<i64>,
 }
 
 impl StockOperations {
@@ -213,9 +219,9 @@ pub struct WideBacktestResult {
 /// Result of a backtest with trades - default format
 #[derive(Debug, Clone)]
 pub struct BacktestResult {
-    /// Unique dates (i32 days since epoch) - same length as creturn
-    pub dates: Vec<i32>,
-    /// Cumulative returns at each time step (one per unique date)
+    /// Unique timestamps (i64 milliseconds since epoch) - same length as creturn
+    pub dates: Vec<i64>,
+    /// Cumulative returns at each time step (one per unique timestamp)
     pub creturn: Vec<f64>,
     /// List of completed trades
     pub trades: Vec<TradeRecord>,
@@ -354,7 +360,7 @@ where
 
 // Type aliases for convenience
 pub type NoopIndexTracker = NoopTracker<usize, usize, WideTradeRecord>;
-pub type NoopSymbolTracker = NoopTracker<String, i32, TradeRecord>;
+pub type NoopSymbolTracker = NoopTracker<String, i64, TradeRecord>;
 
 // ============================================================================
 // Generic TradeTracker Implementation
@@ -640,14 +646,14 @@ impl RecordBuilder for WideTradeRecord {
 
 impl RecordBuilder for TradeRecord {
     type Key = String;
-    type Date = i32;
+    type Date = i64;
 
     fn build_completed(
         key: String,
-        entry_date: i32,
-        exit_date: i32,
-        signal_date: i32,
-        exit_sig_date: Option<i32>,
+        entry_date: i64,
+        exit_date: i64,
+        signal_date: i64,
+        exit_sig_date: Option<i64>,
         weight: f64,
         entry_price: f64,
         exit_price: f64,
@@ -656,6 +662,9 @@ impl RecordBuilder for TradeRecord {
         fee_ratio: f64,
         tax_ratio: f64,
     ) -> Self {
+        // Calculate period in days (ms / 86400000)
+        let period_ms = exit_date - entry_date;
+        let period_days = period_ms / 86_400_000;
         let trade = Self {
             symbol: key,
             entry_date: Some(entry_date),
@@ -673,7 +682,7 @@ impl RecordBuilder for TradeRecord {
             bmfe: None,
             mdd: None,
             pdays: None,
-            period: Some(exit_date - entry_date),
+            period: Some(period_days),
         };
         Self {
             trade_return: trade.calculate_return(fee_ratio, tax_ratio),
@@ -683,10 +692,10 @@ impl RecordBuilder for TradeRecord {
 
     fn build_completed_with_mae_mfe(
         key: String,
-        entry_date: i32,
-        exit_date: i32,
-        signal_date: i32,
-        exit_sig_date: Option<i32>,
+        entry_date: i64,
+        exit_date: i64,
+        signal_date: i64,
+        exit_sig_date: Option<i64>,
         weight: f64,
         entry_price: f64,
         exit_price: f64,
@@ -712,6 +721,9 @@ impl RecordBuilder for TradeRecord {
             tax_ratio,
         );
 
+        // Calculate period in days (ms / 86400000)
+        let period_ms = exit_date - entry_date;
+        let period_days = period_ms / 86_400_000;
         let trade = Self {
             symbol: key,
             entry_date: Some(entry_date),
@@ -729,7 +741,7 @@ impl RecordBuilder for TradeRecord {
             bmfe: Some(metrics.bmfe),
             mdd: Some(metrics.mdd),
             pdays: Some(metrics.pdays),
-            period: Some(exit_date - entry_date),
+            period: Some(period_days),
         };
         Self {
             trade_return: trade.calculate_return(fee_ratio, tax_ratio),
@@ -737,7 +749,7 @@ impl RecordBuilder for TradeRecord {
         }
     }
 
-    fn build_pending(key: String, signal_date: i32, weight: f64) -> Self {
+    fn build_pending(key: String, signal_date: i64, weight: f64) -> Self {
         Self {
             symbol: key,
             entry_date: None,
@@ -761,8 +773,8 @@ impl RecordBuilder for TradeRecord {
 
     fn build_open(
         key: String,
-        entry_date: i32,
-        signal_date: i32,
+        entry_date: i64,
+        signal_date: i64,
         weight: f64,
         entry_price: f64,
         entry_raw_price: f64,
@@ -790,8 +802,8 @@ impl RecordBuilder for TradeRecord {
 
     fn build_open_with_metrics(
         key: String,
-        entry_date: i32,
-        signal_date: i32,
+        entry_date: i64,
+        signal_date: i64,
         weight: f64,
         entry_price: f64,
         entry_raw_price: f64,
@@ -816,7 +828,7 @@ impl RecordBuilder for TradeRecord {
             0.0,    // No tax for unrealized return
         );
 
-        let period = close_prices.len().saturating_sub(1) as i32;
+        let period = close_prices.len().saturating_sub(1) as i64;
 
         Self {
             symbol: key,
@@ -1076,19 +1088,25 @@ mod tests {
     fn test_symbol_tracker_open_close() {
         let mut tracker = SymbolTracker::new();
 
+        // Use millisecond timestamps (days * 86400000)
+        let entry_ms = 19000i64 * 86_400_000;
+        let signal_ms = 18999i64 * 86_400_000;
+        let exit_ms = 19010i64 * 86_400_000;
+        let exit_sig_ms = 19009i64 * 86_400_000;
+
         // factor = 1.0 means raw price equals adj price
-        tracker.open_trade("2330".to_string(), 19000, 18999, 100.0, 0.5, 1.0);
+        tracker.open_trade("2330".to_string(), entry_ms, signal_ms, 100.0, 0.5, 1.0);
         assert!(tracker.has_open_trade(&"2330".to_string()));
         assert!(!tracker.has_open_trade(&"2317".to_string()));
 
-        tracker.close_trade(&"2330".to_string(), 19010, Some(19009), 110.0, 1.0, 0.001425, 0.003);
+        tracker.close_trade(&"2330".to_string(), exit_ms, Some(exit_sig_ms), 110.0, 1.0, 0.001425, 0.003);
         assert!(!tracker.has_open_trade(&"2330".to_string()));
 
         let trades = tracker.finalize(0.001425, 0.003);
         assert_eq!(trades.len(), 1);
         assert_eq!(trades[0].symbol, "2330");
-        assert_eq!(trades[0].entry_date, Some(19000));
-        assert_eq!(trades[0].exit_date, Some(19010));
+        assert_eq!(trades[0].entry_date, Some(entry_ms));
+        assert_eq!(trades[0].exit_date, Some(exit_ms));
         // With factor = 1.0, raw_price should equal adj price
         assert_eq!(trades[0].entry_raw_price, 100.0);
         assert_eq!(trades[0].exit_raw_price, Some(110.0));
@@ -1098,11 +1116,17 @@ mod tests {
     fn test_symbol_tracker_with_factor() {
         let mut tracker = SymbolTracker::new();
 
+        // Use millisecond timestamps (days * 86400000)
+        let entry_ms = 19000i64 * 86_400_000;
+        let signal_ms = 18999i64 * 86_400_000;
+        let exit_ms = 19010i64 * 86_400_000;
+        let exit_sig_ms = 19009i64 * 86_400_000;
+
         // adj_price = 100.0, factor = 2.0 => raw_price = 50.0
-        tracker.open_trade("2330".to_string(), 19000, 18999, 100.0, 0.5, 2.0);
+        tracker.open_trade("2330".to_string(), entry_ms, signal_ms, 100.0, 0.5, 2.0);
 
         // adj_price = 110.0, factor = 2.2 => raw_price = 50.0
-        tracker.close_trade(&"2330".to_string(), 19010, Some(19009), 110.0, 2.2, 0.001425, 0.003);
+        tracker.close_trade(&"2330".to_string(), exit_ms, Some(exit_sig_ms), 110.0, 2.2, 0.001425, 0.003);
 
         let trades = tracker.finalize(0.001425, 0.003);
         assert_eq!(trades.len(), 1);
@@ -1115,7 +1139,8 @@ mod tests {
     #[test]
     fn test_symbol_tracker_pending_entry() {
         let mut tracker = SymbolTracker::new();
-        tracker.add_pending_entry("2330".to_string(), 19009, 0.5);
+        let signal_ms = 19009i64 * 86_400_000;
+        tracker.add_pending_entry("2330".to_string(), signal_ms, 0.5);
 
         let trades = tracker.finalize(0.001425, 0.003);
         assert_eq!(trades.len(), 1);
@@ -1126,12 +1151,18 @@ mod tests {
 
     #[test]
     fn test_trade_record_holding_days() {
+        // Use millisecond timestamps (10 days = 10 * 86400000 ms)
+        let entry_ms = 19000i64 * 86_400_000;
+        let exit_ms = 19010i64 * 86_400_000;
+        let signal_ms = 18999i64 * 86_400_000;
+        let exit_sig_ms = 19009i64 * 86_400_000;
+
         let trade = TradeRecord {
             symbol: "2330".to_string(),
-            entry_date: Some(19000),
-            exit_date: Some(19010),
-            entry_sig_date: 18999,
-            exit_sig_date: Some(19009),
+            entry_date: Some(entry_ms),
+            exit_date: Some(exit_ms),
+            entry_sig_date: signal_ms,
+            exit_sig_date: Some(exit_sig_ms),
             position_weight: 0.5,
             entry_price: 100.0,
             exit_price: Some(110.0),
@@ -1151,12 +1182,17 @@ mod tests {
     #[test]
     fn test_long_trade_return_no_fees() {
         // Long: entry at 100, exit at 110 -> profit 10%
+        let entry_ms = 19000i64 * 86_400_000;
+        let exit_ms = 19010i64 * 86_400_000;
+        let signal_ms = 18999i64 * 86_400_000;
+        let exit_sig_ms = 19009i64 * 86_400_000;
+
         let trade = TradeRecord {
             symbol: "TEST".to_string(),
-            entry_date: Some(19000),
-            exit_date: Some(19010),
-            entry_sig_date: 18999,
-            exit_sig_date: Some(19009),
+            entry_date: Some(entry_ms),
+            exit_date: Some(exit_ms),
+            entry_sig_date: signal_ms,
+            exit_sig_date: Some(exit_sig_ms),
             position_weight: 0.1, // positive = long
             entry_price: 100.0,
             exit_price: Some(110.0),
@@ -1178,12 +1214,17 @@ mod tests {
     fn test_short_trade_return_profit_no_fees() {
         // Short: entry at 100, exit at 90 -> profit 10%
         // Formula: 2 - exit/entry - 1 = 2 - 0.9 - 1 = 0.1
+        let entry_ms = 19000i64 * 86_400_000;
+        let exit_ms = 19010i64 * 86_400_000;
+        let signal_ms = 18999i64 * 86_400_000;
+        let exit_sig_ms = 19009i64 * 86_400_000;
+
         let trade = TradeRecord {
             symbol: "TEST".to_string(),
-            entry_date: Some(19000),
-            exit_date: Some(19010),
-            entry_sig_date: 18999,
-            exit_sig_date: Some(19009),
+            entry_date: Some(entry_ms),
+            exit_date: Some(exit_ms),
+            entry_sig_date: signal_ms,
+            exit_sig_date: Some(exit_sig_ms),
             position_weight: -0.1, // negative = short
             entry_price: 100.0,
             exit_price: Some(90.0),
@@ -1205,12 +1246,17 @@ mod tests {
     fn test_short_trade_return_loss_no_fees() {
         // Short: entry at 100, exit at 110 -> loss 10%
         // Formula: 2 - exit/entry - 1 = 2 - 1.1 - 1 = -0.1
+        let entry_ms = 19000i64 * 86_400_000;
+        let exit_ms = 19010i64 * 86_400_000;
+        let signal_ms = 18999i64 * 86_400_000;
+        let exit_sig_ms = 19009i64 * 86_400_000;
+
         let trade = TradeRecord {
             symbol: "TEST".to_string(),
-            entry_date: Some(19000),
-            exit_date: Some(19010),
-            entry_sig_date: 18999,
-            exit_sig_date: Some(19009),
+            entry_date: Some(entry_ms),
+            exit_date: Some(exit_ms),
+            entry_sig_date: signal_ms,
+            exit_sig_date: Some(exit_sig_ms),
             position_weight: -0.1, // negative = short
             entry_price: 100.0,
             exit_price: Some(110.0),
@@ -1259,12 +1305,17 @@ mod tests {
         // With fees: (1 - fee) * (2 - exit/entry) * (1 - tax - fee) - 1
         let fee_ratio = 0.001425;
         let tax_ratio = 0.003;
+        let entry_ms = 19000i64 * 86_400_000;
+        let exit_ms = 19010i64 * 86_400_000;
+        let signal_ms = 18999i64 * 86_400_000;
+        let exit_sig_ms = 19009i64 * 86_400_000;
+
         let trade = TradeRecord {
             symbol: "TEST".to_string(),
-            entry_date: Some(19000),
-            exit_date: Some(19010),
-            entry_sig_date: 18999,
-            exit_sig_date: Some(19009),
+            entry_date: Some(entry_ms),
+            exit_date: Some(exit_ms),
+            entry_sig_date: signal_ms,
+            exit_sig_date: Some(exit_sig_ms),
             position_weight: -0.1, // negative = short
             entry_price: 100.0,
             exit_price: Some(90.0),
