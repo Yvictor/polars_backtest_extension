@@ -3,7 +3,7 @@
 //! This module provides zero-copy conversion from polars-arrow arrays to arrow-rs arrays
 //! using the Arrow C Data Interface.
 
-use arrow::array::{Array as ArrowArray, ArrayRef, Float64Array, Int32Array, StringViewArray};
+use arrow::array::{Array as ArrowArray, ArrayRef, Float64Array, Int32Array, Int64Array, StringViewArray};
 use arrow::ffi as ar_ffi;
 use polars_arrow::array::Array as PolarsArray;
 use polars_arrow::datatypes::Field;
@@ -52,6 +52,22 @@ pub fn polars_i32_to_arrow(
         .cloned()
         .ok_or_else(|| {
             arrow::error::ArrowError::CastError("Failed to downcast to Int32Array".to_string())
+        })
+}
+
+/// Convert polars-arrow PrimitiveArray<i64> to arrow-rs Int64Array
+pub fn polars_i64_to_arrow(
+    array: &polars_arrow::array::PrimitiveArray<i64>,
+) -> Result<Int64Array, arrow::error::ArrowError> {
+    let boxed = array.to_boxed();
+    let array_ref = polars_to_arrow_rs(boxed)?;
+
+    array_ref
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .cloned()
+        .ok_or_else(|| {
+            arrow::error::ArrowError::CastError("Failed to downcast to Int64Array".to_string())
         })
 }
 

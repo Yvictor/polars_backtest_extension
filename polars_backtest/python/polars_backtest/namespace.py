@@ -5,6 +5,7 @@ Provides df.bt.backtest() API for long format DataFrames.
 
 from __future__ import annotations
 
+import re
 from typing import TYPE_CHECKING, Union, cast
 
 import polars as pl
@@ -25,6 +26,38 @@ if TYPE_CHECKING:
 
 # Type alias for column specification (str or Expr)
 ColumnSpec = Union[str, pl.Expr]
+
+# Fixed supported resample values (calendar-based)
+_FIXED_RESAMPLE = frozenset({
+    None, "D",
+    "W", "W-MON", "W-TUE", "W-WED", "W-THU", "W-FRI", "W-SAT", "W-SUN",
+    "M", "ME", "MS",
+    "Q", "QE", "QS",
+    "Y", "YE", "A",
+    "H",  # Hourly
+})
+
+# Interval format pattern: "H", "5T", "30S", "2H", "5min" etc.
+# Note: number prefix is optional (e.g., "H" = "1H", "T" = "1T", "S" = "1S")
+_INTERVAL_PATTERN = re.compile(r"^(\d*)(H|h|T|t|S|s|min)$")
+
+
+def _validate_resample(resample: str | None) -> bool:
+    """Validate resample parameter.
+
+    Supports:
+    - Calendar-based: None, D, W, W-MON..W-SUN, M, ME, MS, Q, QE, QS, Y, YE, A
+    - Hourly: H
+    - Interval: nH (n hours), nT/nmin (n minutes), nS (n seconds)
+
+    Returns:
+        True if resample is valid, False otherwise.
+    """
+    if resample in _FIXED_RESAMPLE:
+        return True
+    if resample and _INTERVAL_PATTERN.match(resample):
+        return True
+    return False
 
 
 def _resolve_column(
@@ -182,18 +215,14 @@ class BacktestNamespace:
             df = df.with_columns(pl.col(position_col).fill_null(0.0))
 
         # Validate resample parameter
-        # Supported: D, W, W-MON..W-SUN, M, MS, Q, QS, Y, None
-        supported_resample = (
-            None, "D",
-            "W", "W-MON", "W-TUE", "W-WED", "W-THU", "W-FRI", "W-SAT", "W-SUN",
-            "M", "ME", "MS",
-            "Q", "QE", "QS",
-            "Y", "YE", "A",
-        )
-        if resample not in supported_resample:
+        # Supported:
+        # - Calendar: D, W, W-MON..W-SUN, M, MS, Q, QS, Y, None
+        # - Interval: H, nH (n hours), nT/nmin (n minutes), nS (n seconds)
+        if not _validate_resample(resample):
             raise ValueError(
                 f"Unsupported resample '{resample}'. "
-                f"Supported values: {', '.join(str(s) for s in supported_resample)}"
+                f"Supported values: None, D, W, W-MON..W-SUN, M, ME, MS, Q, QE, QS, Y, YE, A, "
+                f"H, nH (hours), nT/nmin (minutes), nS (seconds)"
             )
 
         # Create config

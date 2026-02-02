@@ -52,6 +52,52 @@ use btcore::{
 };
 
 // =============================================================================
+// DateMode enum for tracking input time type
+// =============================================================================
+
+/// DateMode tracks the original input time type so we can convert back correctly
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum DateMode {
+    /// Polars Date type (days since epoch)
+    Date,
+    /// Polars Datetime type (microseconds)
+    DatetimeMicroseconds,
+    /// Polars Datetime type (milliseconds)
+    DatetimeMilliseconds,
+    /// Polars Datetime type (nanoseconds)
+    DatetimeNanoseconds,
+}
+
+impl DateMode {
+    /// Get the Polars DataType for this mode
+    fn to_dtype(&self) -> DataType {
+        match self {
+            DateMode::Date => DataType::Date,
+            DateMode::DatetimeMicroseconds => DataType::Datetime(TimeUnit::Microseconds, None),
+            DateMode::DatetimeMilliseconds => DataType::Datetime(TimeUnit::Milliseconds, None),
+            DateMode::DatetimeNanoseconds => DataType::Datetime(TimeUnit::Nanoseconds, None),
+        }
+    }
+
+    /// Convert milliseconds timestamp to appropriate output value for this mode
+    ///
+    /// Uses saturating arithmetic for nanoseconds to prevent overflow on extreme timestamps.
+    fn from_ms(&self, ms: i64) -> i64 {
+        match self {
+            DateMode::Date => ms / 86_400_000,  // ms to days
+            DateMode::DatetimeMicroseconds => ms.saturating_mul(1_000),  // ms to us
+            DateMode::DatetimeMilliseconds => ms,  // already ms
+            DateMode::DatetimeNanoseconds => ms.saturating_mul(1_000_000),  // ms to ns
+        }
+    }
+
+    /// Convert optional milliseconds timestamp
+    fn from_ms_opt(&self, ms: Option<i64>) -> Option<i64> {
+        ms.map(|v| self.from_ms(v))
+    }
+}
+
+// =============================================================================
 // Python Wrapper Types
 // =============================================================================
 
@@ -268,20 +314,24 @@ impl From<WideBacktestResult> for PyWideBacktestResult {
     }
 }
 
-/// Python wrapper for TradeRecord (default format - string symbols, i32 dates)
+/// Python wrapper for TradeRecord (default format - string symbols, i64 timestamps)
 #[pyclass(name = "TradeRecord")]
 #[derive(Clone)]
 pub struct PyTradeRecord {
     #[pyo3(get)]
     pub symbol: String,
+    /// Entry timestamp (milliseconds since epoch)
     #[pyo3(get)]
-    pub entry_date: Option<i32>,
+    pub entry_date: Option<i64>,
+    /// Exit timestamp (milliseconds since epoch)
     #[pyo3(get)]
-    pub exit_date: Option<i32>,
+    pub exit_date: Option<i64>,
+    /// Entry signal timestamp (milliseconds since epoch)
     #[pyo3(get)]
-    pub entry_sig_date: i32,
+    pub entry_sig_date: i64,
+    /// Exit signal timestamp (milliseconds since epoch)
     #[pyo3(get)]
-    pub exit_sig_date: Option<i32>,
+    pub exit_sig_date: Option<i64>,
     #[pyo3(get)]
     pub position_weight: f64,
     #[pyo3(get)]
@@ -302,14 +352,14 @@ pub struct PyTradeRecord {
     #[pyo3(get)]
     pub pdays: Option<u32>,
     #[pyo3(get)]
-    pub period: Option<i32>,
+    pub period: Option<i64>,
 }
 
 #[pymethods]
 impl PyTradeRecord {
-    fn holding_days(&self) -> Option<i32> {
+    fn holding_days(&self) -> Option<i64> {
         match (self.entry_date, self.exit_date) {
-            (Some(entry), Some(exit)) => Some(exit - entry),
+            (Some(entry), Some(exit)) => Some((exit - entry) / 86_400_000),
             _ => None,
         }
     }
@@ -349,12 +399,12 @@ impl From<TradeRecord> for PyTradeRecord {
 ///
 /// Columns:
 /// - stock_id: String (symbol)
-/// - entry_date: Date (days since epoch -> Date)
-/// - exit_date: Date (optional)
-/// - entry_sig_date: Date
-/// - exit_sig_date: Date (optional)
+/// - entry_date: Date or Datetime (depends on date_mode)
+/// - exit_date: Date or Datetime (optional)
+/// - entry_sig_date: Date or Datetime
+/// - exit_sig_date: Date or Datetime (optional)
 /// - position: Float64 (position weight)
-/// - period: Int32 (holding period in days, optional)
+/// - period: Int64 (holding period in days, optional)
 /// - return: Float64 (trade return, optional)
 /// - entry_price: Float64
 /// - exit_price: Float64 (optional)
@@ -363,15 +413,24 @@ impl From<TradeRecord> for PyTradeRecord {
 /// - bmfe: Float64 (Before-MAE MFE, optional)
 /// - mdd: Float64 (Maximum Drawdown, optional)
 /// - pdays: UInt32 (Profitable days, optional)
-fn trades_to_dataframe(trades: &[TradeRecord]) -> PolarsResult<DataFrame> {
+fn trades_to_dataframe(trades: &[TradeRecord], date_mode: DateMode) -> PolarsResult<DataFrame> {
     // Build columns
     let stock_id: Vec<&str> = trades.iter().map(|t| t.symbol.as_str()).collect();
-    let entry_date: Vec<Option<i32>> = trades.iter().map(|t| t.entry_date).collect();
-    let exit_date: Vec<Option<i32>> = trades.iter().map(|t| t.exit_date).collect();
-    let entry_sig_date: Vec<i32> = trades.iter().map(|t| t.entry_sig_date).collect();
-    let exit_sig_date: Vec<Option<i32>> = trades.iter().map(|t| t.exit_sig_date).collect();
+    // Convert milliseconds timestamps to appropriate format based on date_mode
+    let entry_date: Vec<Option<i64>> = trades.iter()
+        .map(|t| date_mode.from_ms_opt(t.entry_date))
+        .collect();
+    let exit_date: Vec<Option<i64>> = trades.iter()
+        .map(|t| date_mode.from_ms_opt(t.exit_date))
+        .collect();
+    let entry_sig_date: Vec<i64> = trades.iter()
+        .map(|t| date_mode.from_ms(t.entry_sig_date))
+        .collect();
+    let exit_sig_date: Vec<Option<i64>> = trades.iter()
+        .map(|t| date_mode.from_ms_opt(t.exit_sig_date))
+        .collect();
     let position: Vec<f64> = trades.iter().map(|t| t.position_weight).collect();
-    let period: Vec<Option<i32>> = trades.iter().map(|t| t.period).collect();
+    let period: Vec<Option<i64>> = trades.iter().map(|t| t.period).collect();
     let trade_return: Vec<Option<f64>> = trades.iter().map(|t| t.trade_return).collect();
     let entry_price: Vec<f64> = trades.iter().map(|t| t.entry_price).collect();
     let exit_price: Vec<Option<f64>> = trades.iter().map(|t| t.exit_price).collect();
@@ -385,16 +444,19 @@ fn trades_to_dataframe(trades: &[TradeRecord]) -> PolarsResult<DataFrame> {
     let mdd: Vec<Option<f64>> = trades.iter().map(|t| t.mdd).collect();
     let pdays: Vec<Option<u32>> = trades.iter().map(|t| t.pdays).collect();
 
-    // Create Series
+    // Get the target date dtype
+    let date_dtype = date_mode.to_dtype();
+
+    // Create Series - cast dates to appropriate type based on date_mode
     let stock_id_series = Series::new("stock_id".into(), stock_id);
     let entry_date_series = Series::new("entry_date".into(), entry_date)
-        .cast(&DataType::Date)?;
+        .cast(&date_dtype)?;
     let exit_date_series = Series::new("exit_date".into(), exit_date)
-        .cast(&DataType::Date)?;
+        .cast(&date_dtype)?;
     let entry_sig_date_series = Series::new("entry_sig_date".into(), entry_sig_date)
-        .cast(&DataType::Date)?;
+        .cast(&date_dtype)?;
     let exit_sig_date_series = Series::new("exit_sig_date".into(), exit_sig_date)
-        .cast(&DataType::Date)?;
+        .cast(&date_dtype)?;
     let position_series = Series::new("position".into(), position);
     let period_series = Series::new("period".into(), period);
     let return_series = Series::new("return".into(), trade_return);
@@ -435,10 +497,13 @@ fn trades_to_dataframe(trades: &[TradeRecord]) -> PolarsResult<DataFrame> {
 /// Returns (weights_df, next_weights_df) where each DataFrame has columns:
 /// - symbol: String
 /// - weight: Float64
-/// - date: Date (weight_date for weights, next_weight_date for next_weights)
+/// - date: Date or Datetime (depends on date_mode)
 fn stock_operations_to_dataframes(
     ops: &StockOperations,
+    date_mode: DateMode,
 ) -> PolarsResult<(Option<DataFrame>, Option<DataFrame>)> {
+    let date_dtype = date_mode.to_dtype();
+
     // Create weights DataFrame with date column
     let weights_df = if ops.weights.is_empty() {
         None
@@ -446,12 +511,12 @@ fn stock_operations_to_dataframes(
         let n = ops.weights.len();
         let symbols: Vec<&str> = ops.weights.keys().map(|s| s.as_str()).collect();
         let weights: Vec<f64> = ops.weights.values().copied().collect();
-        // Add date column (same date for all rows)
-        let dates: Vec<Option<i32>> = vec![ops.weight_date; n];
+        // Add date column (same date for all rows) - convert from ms to appropriate format
+        let dates: Vec<Option<i64>> = vec![ops.weight_date.map(|ms| date_mode.from_ms(ms)); n];
         Some(DataFrame::new(vec![
             Series::new("symbol".into(), symbols).into_column(),
             Series::new("weight".into(), weights).into_column(),
-            Series::new("date".into(), dates).cast(&DataType::Date)?.into_column(),
+            Series::new("date".into(), dates).cast(&date_dtype)?.into_column(),
         ])?)
     };
 
@@ -462,12 +527,12 @@ fn stock_operations_to_dataframes(
         let n = ops.next_weights.len();
         let symbols: Vec<&str> = ops.next_weights.keys().map(|s| s.as_str()).collect();
         let weights: Vec<f64> = ops.next_weights.values().copied().collect();
-        // Add date column (same date for all rows)
-        let dates: Vec<Option<i32>> = vec![ops.next_weight_date; n];
+        // Add date column (same date for all rows) - convert from ms to appropriate format
+        let dates: Vec<Option<i64>> = vec![ops.next_weight_date.map(|ms| date_mode.from_ms(ms)); n];
         Some(DataFrame::new(vec![
             Series::new("symbol".into(), symbols).into_column(),
             Series::new("weight".into(), weights).into_column(),
-            Series::new("date".into(), dates).cast(&DataType::Date)?.into_column(),
+            Series::new("date".into(), dates).cast(&date_dtype)?.into_column(),
         ])?)
     };
 
@@ -585,26 +650,85 @@ fn backtest(
     };
     step_start = Instant::now();
 
-    // Get ChunkedArrays - only cast/rechunk when necessary
+    // Get date/datetime column and detect DateMode
     let date_col_ref = df.column(date)
         .map_err(|e| PyValueError::new_err(format!("Failed to get date column: {}", e)))?;
-    let date_series = if date_col_ref.dtype() == &DataType::Date {
-        date_col_ref.clone()
-    } else {
-        date_col_ref.cast(&DataType::Date)
-            .map_err(|e| PyValueError::new_err(format!("Failed to cast date: {}", e)))?
+    let date_dtype = date_col_ref.dtype().clone();
+
+    // Helper to extract timestamps from Date column
+    fn extract_date_timestamps(date_series: &Column) -> PyResult<Vec<i64>> {
+        let date_phys = date_series.date()
+            .map_err(|e| PyValueError::new_err(format!("Date column must be Date: {}", e)))?
+            .physical();
+        let date_nc = date_phys.chunks().len();
+        let date_ca_rechunked;
+        let date_ca: &ChunkedArray<Int32Type> = if date_nc > 1 {
+            date_ca_rechunked = date_phys.rechunk();
+            &date_ca_rechunked
+        } else {
+            date_phys
+        };
+        // Convert days to milliseconds
+        Ok(date_ca.into_iter()
+            .map(|opt| opt.map(|d| d as i64 * 86_400_000).unwrap_or(0))
+            .collect())
+    }
+
+    // Detect DateMode and extract timestamps as i64 milliseconds
+    let (timestamps_ms, date_mode): (Vec<i64>, DateMode) = match &date_dtype {
+        DataType::Date => {
+            let ms = extract_date_timestamps(date_col_ref)?;
+            (ms, DateMode::Date)
+        }
+        DataType::Datetime(time_unit, _tz) => {
+            let datetime_phys = date_col_ref.datetime()
+                .map_err(|e| PyValueError::new_err(format!("Datetime column error: {}", e)))?
+                .physical();
+            let dt_nc = datetime_phys.chunks().len();
+            let dt_ca_rechunked;
+            let dt_ca: &ChunkedArray<Int64Type> = if dt_nc > 1 {
+                dt_ca_rechunked = datetime_phys.rechunk();
+                &dt_ca_rechunked
+            } else {
+                datetime_phys
+            };
+            // Convert to milliseconds based on time unit
+            let (ms, mode) = match time_unit {
+                TimeUnit::Nanoseconds => {
+                    let ms: Vec<i64> = dt_ca.into_iter()
+                        .map(|opt| opt.map(|v| v / 1_000_000).unwrap_or(0))
+                        .collect();
+                    (ms, DateMode::DatetimeNanoseconds)
+                }
+                TimeUnit::Microseconds => {
+                    let ms: Vec<i64> = dt_ca.into_iter()
+                        .map(|opt| opt.map(|v| v / 1_000).unwrap_or(0))
+                        .collect();
+                    (ms, DateMode::DatetimeMicroseconds)
+                }
+                TimeUnit::Milliseconds => {
+                    let ms: Vec<i64> = dt_ca.into_iter()
+                        .map(|opt| opt.unwrap_or(0))
+                        .collect();
+                    (ms, DateMode::DatetimeMilliseconds)
+                }
+            };
+            (ms, mode)
+        }
+        DataType::String => {
+            // Try to cast String to Date
+            let date_series = date_col_ref.cast(&DataType::Date)
+                .map_err(|e| PyValueError::new_err(format!("Failed to parse date string: {}", e)))?;
+            let ms = extract_date_timestamps(&date_series)?;
+            (ms, DateMode::Date)
+        }
+        _ => {
+            return Err(PyValueError::new_err(
+                format!("Date column must be Date, Datetime or String type, got: {:?}", date_dtype)
+            ));
+        }
     };
-    let date_phys = date_series.date()
-        .map_err(|e| PyValueError::new_err(format!("Date column must be Date: {}", e)))?
-        .physical();
-    let date_nc = date_phys.chunks().len();
-    let date_ca_rechunked;
-    let date_ca: &ChunkedArray<Int32Type> = if date_nc > 1 {
-        date_ca_rechunked = date_phys.rechunk();
-        &date_ca_rechunked
-    } else {
-        date_phys
-    };
+    let date_nc = 1; // For profiling - always 1 chunk after processing
 
     let symbol_ref = df.column(symbol)
         .map_err(|e| PyValueError::new_err(format!("Failed to get symbol column: {}", e)))?
@@ -662,17 +786,11 @@ fn backtest(
     step_start = Instant::now();
 
     // Get underlying polars-arrow arrays (single chunk guaranteed by rechunk)
-    let date_chunks = date_ca.chunks();
     let symbol_chunks = symbol_ca.chunks();
     let price_chunks = price_ca.chunks();
     let position_chunks = position_ca.chunks();
 
     // Downcast to concrete polars-arrow types
-    let dates_arrow = date_chunks[0]
-        .as_any()
-        .downcast_ref::<PrimitiveArray<i32>>()
-        .ok_or_else(|| PyValueError::new_err("Failed to downcast date array"))?;
-
     let symbols_arrow = symbol_chunks[0]
         .as_any()
         .downcast_ref::<Utf8ViewArray>()
@@ -691,9 +809,8 @@ fn backtest(
     profile!("[PROFILE] Get polars-arrow arrays: {:?}", step_start.elapsed());
     step_start = Instant::now();
 
-    // Convert polars-arrow arrays to arrow-rs arrays using FFI (zero-copy)
-    let dates_rs = ffi_convert::polars_i32_to_arrow(dates_arrow)
-        .map_err(|e| PyValueError::new_err(format!("FFI date conversion failed: {}", e)))?;
+    // Create Int64Array from timestamps_ms for btcore
+    let timestamps_rs = arrow::array::Int64Array::from(timestamps_ms.clone());
     let symbols_rs = ffi_convert::polars_utf8view_to_arrow(symbols_arrow)
         .map_err(|e| PyValueError::new_err(format!("FFI symbol conversion failed: {}", e)))?;
     let prices_rs = ffi_convert::polars_f64_to_arrow(prices_arrow)
@@ -791,7 +908,7 @@ fn backtest(
 
     // Build arrow input for btcore
     let input = LongFormatArrowInput {
-        dates: &dates_rs,
+        timestamps: &timestamps_rs,
         symbols: &symbols_rs,
         prices: &prices_rs,
         weights: &positions_rs,
@@ -807,11 +924,12 @@ fn backtest(
     profile!("[PROFILE] Backtest (btcore): {:?}", step_start.elapsed());
     step_start = Instant::now();
 
+    // Get target date dtype for output
+    let date_dtype = date_mode.to_dtype();
+
     // Handle empty result case (e.g., no valid signals)
     if result.dates.is_empty() {
-        let empty_dates = Series::new(date.into(), Vec::<i32>::new())
-            .cast(&DataType::Date)
-            .map_err(|e| PyValueError::new_err(format!("Failed to cast to Date: {}", e)))?;
+        let empty_dates = Series::new_empty(date.into(), &date_dtype);
         let empty_creturn = Series::new("creturn".into(), Vec::<f64>::new());
         let creturn_df = DataFrame::new(vec![
             empty_dates.into_column(),
@@ -820,10 +938,13 @@ fn backtest(
         return Ok(PyBacktestResult { creturn_df });
     }
 
-    // Create unique_dates Series directly from btcore result (zero overhead)
-    let unique_dates = Series::new(date.into(), &result.dates)
-        .cast(&DataType::Date)
-        .map_err(|e| PyValueError::new_err(format!("Failed to cast to Date: {}", e)))?;
+    // Create unique_dates Series - convert from ms timestamps to appropriate type
+    let dates_converted: Vec<i64> = result.dates.iter()
+        .map(|&ms| date_mode.from_ms(ms))
+        .collect();
+    let unique_dates = Series::new(date.into(), &dates_converted)
+        .cast(&date_dtype)
+        .map_err(|e| PyValueError::new_err(format!("Failed to cast to date type: {}", e)))?;
 
     // Create creturn Series and find first index where != 1.0 using Polars boolean mask
     let creturn_series = Series::new("creturn".into(), &result.creturn);
@@ -973,25 +1094,83 @@ fn backtest_with_report(
             .map_err(|e| PyValueError::new_err(format!("Failed to sort: {}", e)))?
     };
 
-    // Get ChunkedArrays - only cast/rechunk when necessary
+    // Get date/datetime column and detect DateMode
     let date_col_ref = df.column(date)
         .map_err(|e| PyValueError::new_err(format!("Failed to get date column: {}", e)))?;
-    let date_series = if date_col_ref.dtype() == &DataType::Date {
-        date_col_ref.clone()
-    } else {
-        date_col_ref.cast(&DataType::Date)
-            .map_err(|e| PyValueError::new_err(format!("Failed to cast date: {}", e)))?
-    };
-    let date_phys = date_series.date()
-        .map_err(|e| PyValueError::new_err(format!("Date column must be Date: {}", e)))?
-        .physical();
-    let date_nc = date_phys.chunks().len();
-    let date_ca_rechunked;
-    let date_ca: &ChunkedArray<Int32Type> = if date_nc > 1 {
-        date_ca_rechunked = date_phys.rechunk();
-        &date_ca_rechunked
-    } else {
-        date_phys
+    let date_dtype = date_col_ref.dtype().clone();
+
+    // Helper to extract timestamps from Date column
+    fn extract_date_timestamps_report(date_series: &Column) -> PyResult<Vec<i64>> {
+        let date_phys = date_series.date()
+            .map_err(|e| PyValueError::new_err(format!("Date column must be Date: {}", e)))?
+            .physical();
+        let date_nc = date_phys.chunks().len();
+        let date_ca_rechunked;
+        let date_ca: &ChunkedArray<Int32Type> = if date_nc > 1 {
+            date_ca_rechunked = date_phys.rechunk();
+            &date_ca_rechunked
+        } else {
+            date_phys
+        };
+        // Convert days to milliseconds
+        Ok(date_ca.into_iter()
+            .map(|opt| opt.map(|d| d as i64 * 86_400_000).unwrap_or(0))
+            .collect())
+    }
+
+    // Detect DateMode and extract timestamps as i64 milliseconds
+    let (timestamps_ms, date_mode): (Vec<i64>, DateMode) = match &date_dtype {
+        DataType::Date => {
+            let ms = extract_date_timestamps_report(date_col_ref)?;
+            (ms, DateMode::Date)
+        }
+        DataType::Datetime(time_unit, _tz) => {
+            let datetime_phys = date_col_ref.datetime()
+                .map_err(|e| PyValueError::new_err(format!("Datetime column error: {}", e)))?
+                .physical();
+            let dt_nc = datetime_phys.chunks().len();
+            let dt_ca_rechunked;
+            let dt_ca: &ChunkedArray<Int64Type> = if dt_nc > 1 {
+                dt_ca_rechunked = datetime_phys.rechunk();
+                &dt_ca_rechunked
+            } else {
+                datetime_phys
+            };
+            // Convert to milliseconds based on time unit
+            let (ms, mode) = match time_unit {
+                TimeUnit::Nanoseconds => {
+                    let ms: Vec<i64> = dt_ca.into_iter()
+                        .map(|opt| opt.map(|v| v / 1_000_000).unwrap_or(0))
+                        .collect();
+                    (ms, DateMode::DatetimeNanoseconds)
+                }
+                TimeUnit::Microseconds => {
+                    let ms: Vec<i64> = dt_ca.into_iter()
+                        .map(|opt| opt.map(|v| v / 1_000).unwrap_or(0))
+                        .collect();
+                    (ms, DateMode::DatetimeMicroseconds)
+                }
+                TimeUnit::Milliseconds => {
+                    let ms: Vec<i64> = dt_ca.into_iter()
+                        .map(|opt| opt.unwrap_or(0))
+                        .collect();
+                    (ms, DateMode::DatetimeMilliseconds)
+                }
+            };
+            (ms, mode)
+        }
+        DataType::String => {
+            // Try to cast String to Date
+            let date_series = date_col_ref.cast(&DataType::Date)
+                .map_err(|e| PyValueError::new_err(format!("Failed to parse date string: {}", e)))?;
+            let ms = extract_date_timestamps_report(&date_series)?;
+            (ms, DateMode::Date)
+        }
+        _ => {
+            return Err(PyValueError::new_err(
+                format!("Date column must be Date, Datetime or String type, got: {:?}", date_dtype)
+            ));
+        }
     };
 
     let symbol_ref = df.column(symbol)
@@ -1046,17 +1225,11 @@ fn backtest_with_report(
     };
 
     // Get underlying polars-arrow arrays (single chunk guaranteed by rechunk)
-    let date_chunks = date_ca.chunks();
     let symbol_chunks = symbol_ca.chunks();
     let price_chunks = price_ca.chunks();
     let position_chunks = position_ca.chunks();
 
     // Downcast to concrete polars-arrow types
-    let dates_arrow = date_chunks[0]
-        .as_any()
-        .downcast_ref::<PrimitiveArray<i32>>()
-        .ok_or_else(|| PyValueError::new_err("Failed to downcast date array"))?;
-
     let symbols_arrow = symbol_chunks[0]
         .as_any()
         .downcast_ref::<Utf8ViewArray>()
@@ -1072,9 +1245,8 @@ fn backtest_with_report(
         .downcast_ref::<PrimitiveArray<f64>>()
         .ok_or_else(|| PyValueError::new_err("Failed to downcast position array"))?;
 
-    // Convert polars-arrow arrays to arrow-rs arrays using FFI (zero-copy)
-    let dates_rs = ffi_convert::polars_i32_to_arrow(dates_arrow)
-        .map_err(|e| PyValueError::new_err(format!("FFI date conversion failed: {}", e)))?;
+    // Create Int64Array from timestamps_ms for btcore
+    let timestamps_rs = arrow::array::Int64Array::from(timestamps_ms.clone());
     let symbols_rs = ffi_convert::polars_utf8view_to_arrow(symbols_arrow)
         .map_err(|e| PyValueError::new_err(format!("FFI symbol conversion failed: {}", e)))?;
     let prices_rs = ffi_convert::polars_f64_to_arrow(prices_arrow)
@@ -1163,7 +1335,7 @@ fn backtest_with_report(
 
     // Build arrow input for btcore
     let input = LongFormatArrowInput {
-        dates: &dates_rs,
+        timestamps: &timestamps_rs,
         symbols: &symbols_rs,
         prices: &prices_rs,
         weights: &positions_rs,
@@ -1247,16 +1419,19 @@ fn backtest_with_report(
         None
     };
 
+    // Get target date dtype for output
+    let date_dtype = date_mode.to_dtype();
+
     // Handle empty result (no signals/trades)
     if result.dates.is_empty() {
-        let empty_dates = Series::new_empty(date.into(), &DataType::Date);
+        let empty_dates = Series::new_empty(date.into(), &date_dtype);
         let empty_creturn = Series::new_empty("creturn".into(), &DataType::Float64);
         let creturn_df = DataFrame::new(vec![
             empty_dates.into_column(),
             empty_creturn.into_column(),
         ]).map_err(|e| PyValueError::new_err(format!("Failed to create empty creturn DataFrame: {}", e)))?;
 
-        let trades_df = trades_to_dataframe(&result.trades)
+        let trades_df = trades_to_dataframe(&result.trades, date_mode)
             .map_err(|e| PyValueError::new_err(format!("Failed to create trades DataFrame: {}", e)))?;
 
         return Ok(PyBacktestReport::new(
@@ -1273,13 +1448,16 @@ fn backtest_with_report(
     }
 
     // Convert trades to DataFrame
-    let trades_df = trades_to_dataframe(&result.trades)
+    let trades_df = trades_to_dataframe(&result.trades, date_mode)
         .map_err(|e| PyValueError::new_err(format!("Failed to create trades DataFrame: {}", e)))?;
 
-    // Create unique_dates Series directly from btcore result (zero overhead)
-    let unique_dates = Series::new(date.into(), &result.dates)
-        .cast(&DataType::Date)
-        .map_err(|e| PyValueError::new_err(format!("Failed to cast to Date: {}", e)))?;
+    // Create unique_dates Series - convert from ms timestamps to appropriate type
+    let dates_converted: Vec<i64> = result.dates.iter()
+        .map(|&ms| date_mode.from_ms(ms))
+        .collect();
+    let unique_dates = Series::new(date.into(), &dates_converted)
+        .cast(&date_dtype)
+        .map_err(|e| PyValueError::new_err(format!("Failed to cast to date type: {}", e)))?;
 
     // Find first index where creturn != 1.0 using Polars boolean mask
     let creturn_series = Series::new("creturn".into(), &result.creturn);
@@ -1323,7 +1501,7 @@ fn backtest_with_report(
 
     // Extract weights and next_weights from stock_operations
     let (weights_df, next_weights_df) = if let Some(ref ops) = result.stock_operations {
-        stock_operations_to_dataframes(ops)
+        stock_operations_to_dataframes(ops, date_mode)
             .map_err(|e| PyValueError::new_err(format!("Failed to create weights DataFrames: {}", e)))?
     } else {
         (None, None)
