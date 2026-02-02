@@ -8,7 +8,7 @@
 //!
 //! - `NoopTracker` - Zero overhead, for backtest without trade records
 //! - `IndexTracker` - Wide format (usize keys, usize dates)
-//! - `SymbolTracker` - Long format (String keys, i32 dates)
+//! - `SymbolTracker` - Long format (String keys, i64 timestamps in milliseconds)
 
 use std::collections::HashMap;
 use std::hash::Hash;
@@ -237,7 +237,7 @@ pub struct BacktestResult {
 ///
 /// Uses associated types to support both:
 /// - Wide format: `Key=usize`, `Date=usize`, `Record=WideTradeRecord`
-/// - Long format: `Key=String`, `Date=i32`, `Record=TradeRecord`
+/// - Long format: `Key=String`, `Date=i64` (milliseconds since epoch), `Record=TradeRecord`
 ///
 /// This allows zero-cost abstraction when trade tracking is not needed.
 pub trait TradeTracker {

@@ -37,8 +37,9 @@ _FIXED_RESAMPLE = frozenset({
     "H",  # Hourly
 })
 
-# Interval format pattern: "5T", "30S", "2H", "5min" etc.
-_INTERVAL_PATTERN = re.compile(r"^(\d+)(H|h|T|t|S|s|min)$")
+# Interval format pattern: "H", "5T", "30S", "2H", "5min" etc.
+# Note: number prefix is optional (e.g., "H" = "1H", "T" = "1T", "S" = "1S")
+_INTERVAL_PATTERN = re.compile(r"^(\d*)(H|h|T|t|S|s|min)$")
 
 
 def _validate_resample(resample: str | None) -> bool:
