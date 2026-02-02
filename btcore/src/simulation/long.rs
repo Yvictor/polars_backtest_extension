@@ -1230,7 +1230,9 @@ fn calculate_stock_operations(
     }
 
     // Find the last creturn timestamp (last price timestamp)
-    let last_price_timestamp = *timestamps.last().unwrap();
+    // Safety: timestamps.is_empty() check above guarantees this won't panic
+    let last_price_timestamp = *timestamps.last()
+        .expect("invariant: timestamps is non-empty after is_empty() check");
 
     // Find current positions: trades with entry_date but no exit_date
     let current_positions: HashSet<String> = trades
@@ -1441,9 +1443,15 @@ fn weekday_of_i32(days: i32) -> u8 {
 /// # Arguments
 /// * `prev_ms` - Previous timestamp in milliseconds
 /// * `curr_ms` - Current timestamp in milliseconds
-/// * `interval_secs` - Interval duration in seconds
+/// * `interval_secs` - Interval duration in seconds (must be > 0)
+///
+/// # Safety
+/// Returns false if interval_secs is 0 to avoid division by zero panic.
 #[inline]
 fn crossed_interval_boundary(prev_ms: i64, curr_ms: i64, interval_secs: u32) -> bool {
+    if interval_secs == 0 {
+        return false;
+    }
     let interval_ms = interval_secs as i64 * 1000;
     prev_ms / interval_ms != curr_ms / interval_ms
 }

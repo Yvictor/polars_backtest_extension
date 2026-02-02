@@ -80,12 +80,14 @@ impl DateMode {
     }
 
     /// Convert milliseconds timestamp to appropriate output value for this mode
+    ///
+    /// Uses saturating arithmetic for nanoseconds to prevent overflow on extreme timestamps.
     fn from_ms(&self, ms: i64) -> i64 {
         match self {
             DateMode::Date => ms / 86_400_000,  // ms to days
-            DateMode::DatetimeMicroseconds => ms * 1_000,  // ms to us
+            DateMode::DatetimeMicroseconds => ms.saturating_mul(1_000),  // ms to us
             DateMode::DatetimeMilliseconds => ms,  // already ms
-            DateMode::DatetimeNanoseconds => ms * 1_000_000,  // ms to ns
+            DateMode::DatetimeNanoseconds => ms.saturating_mul(1_000_000),  // ms to ns
         }
     }
 
