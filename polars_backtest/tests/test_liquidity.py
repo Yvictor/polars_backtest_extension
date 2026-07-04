@@ -128,3 +128,27 @@ def test_viz_payload_kinds_and_scenarios(report, limit_fixture):
     import json
 
     json.dumps(data, allow_nan=False)
+
+
+def test_one_sided_limit_up_only(report, limit_fixture):
+    """limit_up-only input must not crash; short/exit sides stay unknown."""
+    one_sided = limit_fixture.drop("limit_down")
+    flagged = liquidity.classify_limit_trades(report.trades, one_sided)
+    entered = flagged.filter(pl.col("entry_date").is_not_null())
+    kinds = {r["stock_id"]: r["entry_kind"] for r in entered.to_dicts()}
+
+    assert kinds["LOCK"] == "locked" and kinds["TOUCH"] == "touched"
+    # long exits need limit_down — unknown, not False/"not at limit"
+    exits = flagged.filter(pl.col("exit_date").is_not_null())
+    assert exits.get_column("exit_kind").null_count() == exits.height
+
+
+def test_one_sided_does_not_fabricate_sell_low(report, limit_fixture):
+    from polars_backtest import viz
+
+    data = viz.report_data(report, input_df=limit_fixture.drop("limit_down"))
+
+    # sell-side flags are unknown for long trades without limit_down —
+    # a passing 0% sellLow must NOT appear
+    assert "sell_low_ratio" not in data["trade_summary"]
+    assert "buy_high_ratio" in data["trade_summary"]

@@ -143,26 +143,23 @@ def _with_limit_flags(trades: pl.DataFrame, input_df: pl.DataFrame | None) -> pl
     is_long = pl.col("position") >= 0
     at_up = lambda px, lim: pl.col(px) >= pl.col(lim) * (1 - _LIMIT_EPS)  # noqa: E731
     at_dn = lambda px, lim: pl.col(px) <= pl.col(lim) * (1 + _LIMIT_EPS)  # noqa: E731
-    exprs = []
+    unknown = pl.lit(None, dtype=pl.Boolean)
     if lu_e or ld_e:
+        # A side whose limit column is absent is UNKNOWN (null), never False —
+        # otherwise one-sided data would fabricate passing 0% ratios.
         # adverse entry: long buys at limit-up, short sells at limit-down
-        entry = None
-        if lu_e:
-            entry = is_long & at_up("entry_raw_price", lu_e)
-        if ld_e:
-            short_e = ~is_long & at_dn("entry_raw_price", ld_e)
-            entry = short_e if entry is None else (entry | short_e)
-        exprs.append(entry.alias("lim_entry"))
+        entry = pl.when(is_long).then(
+            at_up("entry_raw_price", lu_e) if lu_e else unknown
+        ).otherwise(
+            at_dn("entry_raw_price", ld_e) if ld_e else unknown
+        )
         # adverse exit: long sells at limit-down, short covers at limit-up
-        exit_ = None
-        if ld_x:
-            exit_ = is_long & at_dn("exit_raw_price", ld_x)
-        if lu_x:
-            short_x = ~is_long & at_up("exit_raw_price", lu_x)
-            exit_ = short_x if exit_ is None else (exit_ | short_x)
-        exprs.append(exit_.alias("lim_exit"))
-    if exprs:
-        trades = trades.with_columns(exprs)
+        exit_ = pl.when(is_long).then(
+            at_dn("exit_raw_price", ld_x) if ld_x else unknown
+        ).otherwise(
+            at_up("exit_raw_price", lu_x) if lu_x else unknown
+        )
+        trades = trades.with_columns(entry.alias("lim_entry"), exit_.alias("lim_exit"))
     drop = [c for c in trades.columns if c.endswith("_x") or c in ("limit_up", "limit_down")]
     return trades.drop([c for c in drop if c not in ("lim_entry", "lim_exit")])
 
@@ -256,16 +253,20 @@ def _trades_payload(
         trades = _with_limit_kinds(trades, input_df)
         entered = trades.filter(pl.col("entry_date").is_not_null())
         exited = trades.filter(pl.col("exit_date").is_not_null())
-        lim_e = entered.get_column("lim_entry") if entered.height else None
-        lim_x = exited.get_column("lim_exit") if exited.height else None
-        if lim_e is not None and lim_e.null_count() < entered.height:
+        # Denominators count only trades whose flag is KNOWN (non-null) — same
+        # population the engine uses (trades with a joinable limit price), and
+        # one-sided limit data cannot fabricate a passing 0% ratio.
+        lim_e = entered.get_column("lim_entry").drop_nulls() if entered.height else None
+        lim_x = exited.get_column("lim_exit").drop_nulls() if exited.height else None
+        if lim_e is not None and lim_e.len():
             summary["buy_high_n"] = int(lim_e.sum() or 0)
-            summary["buy_high_ratio"] = (lim_e.sum() or 0) / entered.height
-        if lim_x is not None and exited.height and lim_x.null_count() < exited.height:
+            summary["buy_high_ratio"] = (lim_e.sum() or 0) / lim_e.len()
+        if lim_x is not None and lim_x.len():
             summary["sell_low_n"] = int(lim_x.sum() or 0)
-            summary["sell_low_ratio"] = (lim_x.sum() or 0) / exited.height
+            summary["sell_low_ratio"] = (lim_x.sum() or 0) / lim_x.len()
         # How much of the strategy's P&L rides on limit-up entries — the honest
         # answer to "would this survive not getting filled at limit-up?"
+        tot = None
         closed_flagged = trades.filter(
             pl.col("exit_date").is_not_null() & pl.col("return").is_not_null()
         )
@@ -291,7 +292,7 @@ def _trades_payload(
                 summary["entry_locked_n"] = locked.height
                 summary["entry_touched_n"] = touched.height
                 closed_locked = locked.filter(pl.col("return").is_not_null())
-                if closed_locked.height and abs(tot) > 0:
+                if closed_locked.height and tot is not None and abs(tot) > 0:
                     locked_c = closed_locked.select(
                         (pl.col("return") * pl.col("position").abs()).sum()
                     ).item() or 0.0
@@ -359,14 +360,13 @@ def _drawdown_episodes(
 ) -> list[dict[str, Any]]:
     """Extract drawdown episodes (peak -> trough -> recovery), deepest first."""
     episodes: list[dict[str, Any]] = []
-    if not creturn:
+    pairs = [(d, v) for d, v in zip(dates, creturn) if v is not None and v > 0]
+    if not pairs:
         return episodes
-    peak = creturn[0]
-    peak_date = dates[0]
+    peak = pairs[0][1]
+    peak_date = pairs[0][0]
     cur: dict[str, Any] | None = None
-    for d, v in zip(dates, creturn):
-        if v is None:
-            continue
+    for d, v in pairs:
         if v >= peak:
             if cur is not None:
                 cur["end"] = d
@@ -383,7 +383,7 @@ def _drawdown_episodes(
                 cur["trough"] = d
     if cur is not None:
         episodes.append(cur)  # ongoing, end stays None
-    last = dates[-1]
+    last = pairs[-1][0]
     for ep in episodes:
         end = ep["end"] or last
         ep["days"] = (end - ep["start"]).days
@@ -395,7 +395,12 @@ def _drawdown_episodes(
 def _metrics_row(report: Any) -> dict[str, Any]:
     if not hasattr(report, "get_metrics"):
         return {}
-    metrics = report.get_metrics()
+    try:
+        metrics = report.get_metrics()
+    except ValueError:
+        # engine raises "Insufficient data for metrics" on <2-point curves;
+        # the report can still render from stats/creturn
+        return {}
     if not isinstance(metrics, pl.DataFrame) or not metrics.height:
         return {}
     row = metrics.to_dicts()[0]
@@ -658,11 +663,17 @@ def report_html(
         symbol_names=symbol_names,
         fill_scenarios=fill_scenarios,
     )
-    return (
-        TEMPLATE.replace("__TITLE__", _escape(title))
-        .replace("__VERSION__", str(__version__))
-        .replace("__PAYLOAD__", json.dumps(payload, separators=(",", ":")))
-    )
+    # "<" must not appear raw inside the <script> block: "</script>" in any
+    # payload string (title, symbol names, ...) would terminate the element at
+    # HTML-parse time. \u003c is the JSON-native escape; ensure_ascii already
+    # covers U+2028/U+2029.
+    payload_json = json.dumps(payload, separators=(",", ":")).replace("<", "\\u003c")
+    # Each placeholder occurs once in the template and, in template order,
+    # before any user-controlled substitution — replace with count=1 so user
+    # strings containing a placeholder name are never re-substituted.
+    html = TEMPLATE.replace("__TITLE__", _escape(title), 1)
+    html = html.replace("__VERSION__", str(__version__), 1)
+    return html.replace("__PAYLOAD__", payload_json, 1)
 
 
 def save_html(

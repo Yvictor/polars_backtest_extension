@@ -327,3 +327,56 @@ class TestBuyHighSellLow:
         metrics = const_tv_report.get_metrics(sections=["liquidity"]).to_dicts()[0]
         assert metrics["buyHigh"] is None
         assert metrics["sellLow"] is None
+
+
+class TestNanInputs:
+    """NaN in liquidity inputs must be excluded, never propagated (review M1)."""
+
+    def test_nan_trading_value_excluded(self):
+        import datetime
+        import math
+
+        import polars as pl
+        import polars_backtest as pl_bt
+
+        rows = []
+        start = datetime.date(2024, 1, 1)
+        for i in range(90):
+            date = start + datetime.timedelta(days=i)
+            if date.weekday() >= 5:
+                continue
+            held = date < datetime.date(2024, 2, 15)
+            for symbol in ("AAA", "BBB"):
+                # AAA has NaN trading value on every day -> its trade excluded
+                tv = float("nan") if symbol == "AAA" else 1_000_000.0
+                rows.append({
+                    "date": date, "symbol": symbol,
+                    "close": 100.0 * (1 + 0.001 * i),
+                    "trading_value": tv,
+                    "weight": 0.5 if held else 0.0,
+                })
+        report = pl_bt.backtest_with_report(pl.DataFrame(rows), resample="M")
+        capacity = report.capacity(method="finlab")
+
+        assert capacity is not None and math.isfinite(capacity)
+        # only BBB's trade is eligible: 1M * 0.05 / 0.5 = 100k on both legs
+        assert capacity == pytest.approx(100_000.0)
+
+    def test_capacity_param_validation(self):
+        import datetime
+
+        import polars as pl
+        import polars_backtest as pl_bt
+
+        rows = [
+            {"date": datetime.date(2024, 1, 2) + datetime.timedelta(days=i),
+             "symbol": "AAA", "close": 100.0 + i, "weight": 1.0}
+            for i in range(10)
+        ]
+        report = pl_bt.backtest_with_report(pl.DataFrame(rows), resample="M")
+        with pytest.raises(ValueError, match="percentage_of_volume"):
+            report.capacity(percentage_of_volume=-0.05)
+        with pytest.raises(ValueError, match="quantile"):
+            report.capacity(quantile=1.5)
+        with pytest.raises(ValueError, match="percentage_of_volume"):
+            report.capacity_by_date(percentage_of_volume=0.0)

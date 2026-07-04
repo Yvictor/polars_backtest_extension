@@ -219,6 +219,42 @@ def test_template_v3_log_scale_default(report):
     assert 'scale: "log"' in html
 
 
+def test_report_html_escapes_hostile_symbol():
+    """Hostile symbol / display names must never reach the HTML unescaped."""
+    from polars_backtest._viz_template import TEMPLATE
+
+    evil = "</script><img src=x onerror=alert(1)>"
+    rows = []
+    start = datetime.date(2024, 1, 1)
+    for i in range(90):
+        date = start + datetime.timedelta(days=i)
+        if date.weekday() >= 5:
+            continue
+        price = 100.0 * (1 + 0.002 * i)
+        rows.append({
+            "date": str(date),
+            "symbol": evil,
+            "open": price * 0.99,
+            "high": price * 1.02,
+            "low": price * 0.98,
+            "close": price,
+            "weight": (i % 5) != 0,
+        })
+    df = pl.DataFrame(rows).with_columns(pl.col("date").str.to_date())
+    hostile_report = pl_bt.backtest_with_report(df, resample="M")
+    data = viz.report_data(hostile_report)
+    assert data["trades"] and evil in data["trades"]["stock"], "fixture must trade the symbol"
+
+    html = viz.report_html(hostile_report, symbol_names={evil: "<b>bad</b>"})
+
+    # no script breakout: the </script> count stays at the template's baseline
+    assert html.count("</script>") == TEMPLATE.count("</script>")
+    # the raw injection payloads never appear unescaped anywhere in the document
+    assert "</script><img" not in html
+    assert "<img" not in html
+    assert "<b>bad</b>" not in html
+
+
 def test_template_v2_script_syntax(report, tmp_path):
     """The embedded JS must be syntactically valid (checked with node when present)."""
     import re

@@ -85,43 +85,64 @@ def classify_limit_trades(trades: pl.DataFrame, input_df: pl.DataFrame) -> pl.Da
             .otherwise(pl.lit(None, dtype=pl.String))
         )
 
-    exprs = []
-    if "limit_up_entry_date" in out.columns and "open_entry_date" in out.columns:
-        long_at = at_up("entry_raw_price", "limit_up_entry_date")
-        long_locked = at_up("open_entry_date", "limit_up_entry_date") & at_up(
-            "low_entry_date", "limit_up_entry_date"
+    # A side whose limit column is absent stays UNKNOWN (null) — one-sided
+    # input (e.g. limit_up only) must neither crash nor fabricate "not at
+    # limit" answers for the other side.
+    unknown = pl.lit(None, dtype=pl.String)
+    have_ohlc = "open_entry_date" in out.columns
+    lu_e = "limit_up_entry_date" in out.columns
+    ld_e = "limit_down_entry_date" in out.columns
+    lu_x = "limit_up_exit_date" in out.columns
+    ld_x = "limit_down_exit_date" in out.columns
+
+    if have_ohlc and (lu_e or ld_e):
+        long_entry = (
+            kind(
+                at_up("entry_raw_price", "limit_up_entry_date"),
+                at_up("open_entry_date", "limit_up_entry_date")
+                & at_up("low_entry_date", "limit_up_entry_date"),
+            )
+            if lu_e
+            else unknown
         )
-        short_at = at_dn("entry_raw_price", "limit_down_entry_date")
-        short_locked = at_dn("open_entry_date", "limit_down_entry_date") & at_dn(
-            "high_entry_date", "limit_down_entry_date"
+        short_entry = (
+            kind(
+                at_dn("entry_raw_price", "limit_down_entry_date"),
+                at_dn("open_entry_date", "limit_down_entry_date")
+                & at_dn("high_entry_date", "limit_down_entry_date"),
+            )
+            if ld_e
+            else unknown
         )
-        exprs.append(
-            pl.when(is_long)
-            .then(kind(long_at, long_locked))
-            .otherwise(kind(short_at, short_locked))
-            .alias("entry_kind")
+        long_exit = (
+            kind(
+                at_dn("exit_raw_price", "limit_down_exit_date"),
+                at_dn("open_exit_date", "limit_down_exit_date")
+                & at_dn("high_exit_date", "limit_down_exit_date"),
+            )
+            if ld_x
+            else unknown
         )
-        long_exit_at = at_dn("exit_raw_price", "limit_down_exit_date")
-        long_exit_locked = at_dn("open_exit_date", "limit_down_exit_date") & at_dn(
-            "high_exit_date", "limit_down_exit_date"
+        short_exit = (
+            kind(
+                at_up("exit_raw_price", "limit_up_exit_date"),
+                at_up("open_exit_date", "limit_up_exit_date")
+                & at_up("low_exit_date", "limit_up_exit_date"),
+            )
+            if lu_x
+            else unknown
         )
-        short_exit_at = at_up("exit_raw_price", "limit_up_exit_date")
-        short_exit_locked = at_up("open_exit_date", "limit_up_exit_date") & at_up(
-            "low_exit_date", "limit_up_exit_date"
-        )
-        exprs.append(
-            pl.when(pl.col("exit_date").is_null())
-            .then(pl.lit(None, dtype=pl.String))
-            .when(is_long)
-            .then(kind(long_exit_at, long_exit_locked))
-            .otherwise(kind(short_exit_at, short_exit_locked))
-            .alias("exit_kind")
-        )
-    else:
         exprs = [
-            pl.lit(None, dtype=pl.String).alias("entry_kind"),
-            pl.lit(None, dtype=pl.String).alias("exit_kind"),
+            pl.when(is_long).then(long_entry).otherwise(short_entry).alias("entry_kind"),
+            pl.when(pl.col("exit_date").is_null())
+            .then(unknown)
+            .when(is_long)
+            .then(long_exit)
+            .otherwise(short_exit)
+            .alias("exit_kind"),
         ]
+    else:
+        exprs = [unknown.alias("entry_kind"), unknown.alias("exit_kind")]
 
     out = out.with_columns(exprs)
     keep = list(trades.columns) + ["entry_kind", "exit_kind"]
@@ -155,13 +176,19 @@ def limit_stress(
         "at_limit" — remove every entry filled at the limit price
                      (conservative: assume none of them fill).
 
-    Blocking works by zeroing the ``position`` column at the blocked trade's
-    (entry_sig_date, stock_id); with float weights the undeployed money stays
-    in cash (finlab normalization does not scale the rest up). Boolean signal
-    columns would redistribute the slot — pass float weights for exact
-    semantics. One-pass approximation: blocking is decided from the baseline
-    run's trades. Exits are NOT deferred (an unfillable exit day is reported
-    by ``classify_limit_trades`` but the scenario still exits at that price).
+    Blocking model — "deferred entry", one pass:
+    - The ``position`` value is zeroed only at the blocked trade's
+      (entry_sig_date, stock_id). If the signal persists at the NEXT
+      rebalance, the stock enters then at that period's price — the fill is
+      deferred, not banned forever.
+    - With float weights whose per-date sum is <= 1, the undeployed money
+      stays in cash. Boolean signals — and float weights with sum > 1 —
+      are re-normalized by the engine, so the blocked slot is partially
+      redistributed to the remaining names; pass sum<=1 float weights for
+      exact cash semantics.
+    - Blocking is decided from the baseline run's trades (one pass).
+    - Exits are NOT deferred: an unfillable exit day is reported by
+      ``classify_limit_trades`` but the scenario still exits at that price.
 
     ``backtest_kwargs`` must be the same arguments used for the baseline
     ``backtest_with_report`` call (resample, benchmark, fees, ...).

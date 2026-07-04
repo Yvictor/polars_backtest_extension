@@ -922,6 +922,14 @@ impl PyBacktestReport {
         window: usize,
         method: &str,
     ) -> PyResult<Option<f64>> {
+        if !(percentage_of_volume.is_finite() && percentage_of_volume > 0.0) {
+            return Err(PyValueError::new_err(
+                "percentage_of_volume must be a finite positive number",
+            ));
+        }
+        if !(0.0..=1.0).contains(&quantile) {
+            return Err(PyValueError::new_err("quantile must be within [0, 1]"));
+        }
         match method {
             "finlab" => self
                 .calc_capacity_tv(percentage_of_volume, quantile, false)
@@ -965,6 +973,11 @@ impl PyBacktestReport {
         window: usize,
         method: &str,
     ) -> PyResult<Option<PyDataFrame>> {
+        if !(percentage_of_volume.is_finite() && percentage_of_volume > 0.0) {
+            return Err(PyValueError::new_err(
+                "percentage_of_volume must be a finite positive number",
+            ));
+        }
         let use_adv = match method {
             "adv" => true,
             "finlab" | "min_leg" => false,
@@ -1696,7 +1709,7 @@ impl PyBacktestReport {
                 [col("date"), col("symbol")],
                 JoinArgs::new(JoinType::Left),
             )
-            .filter(col("limit_price").is_not_null())
+            .filter(col("limit_price").is_not_null().and(col("limit_price").is_not_nan()))
             .select([
                 at_limit.clone().sum().alias("count_at_limit"),
                 at_limit.count().alias("total"),
@@ -1792,7 +1805,9 @@ impl PyBacktestReport {
             .lazy()
             .filter(
                 col("trading_value_entry").is_not_null()
+                    .and(col("trading_value_entry").is_not_nan())
                     .and(col("trading_value_exit").is_not_null())
+                    .and(col("trading_value_exit").is_not_nan())
                     .and(col("position").abs().gt(lit(0.0)))
             )
             .with_column(amf_expr.alias("accepted_money_flow"))
@@ -1853,7 +1868,9 @@ impl PyBacktestReport {
             )
             .filter(
                 col("adv_entry").is_not_null()
+                    .and(col("adv_entry").is_not_nan())
                     .and(col("adv_exit").is_not_null())
+                    .and(col("adv_exit").is_not_nan())
                     .and(col("position").abs().gt(lit(0.0)))
             )
             .with_column(
@@ -1910,7 +1927,7 @@ impl PyBacktestReport {
                 JoinArgs::new(JoinType::Left),
             )
             .filter(
-                col("liquidity").is_not_null()
+                col("liquidity").is_not_null().and(col("liquidity").is_not_nan())
                     .and(col("position").abs().gt(lit(0.0)))
             )
             .with_column(
