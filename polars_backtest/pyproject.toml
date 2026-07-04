@@ -27,6 +27,10 @@ classifiers = [
 keywords = ["polars", "backtest", "trading", "finance", "quantitative"]
 dependencies = [
     "polars>=1.0.0",
+    # pyo3-polars converts DataFrames via Series.to_arrow(), which requires
+    # pyarrow at runtime — this is a real dependency even though nothing
+    # imports it directly.
+    "pyarrow>=15.0.0",
 ]
 
 [project.optional-dependencies]
