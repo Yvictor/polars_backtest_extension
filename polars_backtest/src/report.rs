@@ -1287,7 +1287,10 @@ impl PyBacktestReport {
             .and_then(|c| c.get(0))
             .unwrap_or(0.0);
 
-        if neg_sum == 0.0 || neg_sum.is_nan() {
+        if neg_sum.is_nan() {
+            // Undeterminable is NaN, not "infinitely profitable"
+            Ok(f64::NAN)
+        } else if neg_sum == 0.0 {
             Ok(f64::INFINITY)
         } else {
             Ok((pos_sum / neg_sum).abs())
@@ -1303,7 +1306,10 @@ impl PyBacktestReport {
         let p05 = return_col.quantile(0.05, QuantileMethod::Linear)?
             .unwrap_or(f64::NAN);
 
-        if p05 == 0.0 || p05.is_nan() || p95.is_nan() {
+        if p05.is_nan() || p95.is_nan() {
+            // Undeterminable is NaN, not "infinitely good tail"
+            Ok(f64::NAN)
+        } else if p05 == 0.0 {
             Ok(f64::INFINITY)
         } else {
             Ok((p95 / p05).abs())

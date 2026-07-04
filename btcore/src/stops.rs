@@ -118,7 +118,9 @@ pub fn detect_stops_finlab(
             // Even when close == price (both adj_close), the multiply-divide operation
             // affects floating point precision, which matters at exact threshold boundaries.
             // Example: cr = 0.9499999999999998 < 0.95, but cr * p / p = 0.95 exactly!
-            let cr_at_close = cr * current_price / current_price;
+            // black_box stops the optimizer from contracting the multiply-divide
+            // (e.g. via FMA), which would change results at exact thresholds.
+            let cr_at_close = std::hint::black_box(cr * current_price) / current_price;
 
             // Use cumulative maxcr from Position (Finlab: maxcr[sid] = max(maxcr[sid], cr[sid]))
             // Note: maxcr is updated by update_max_prices() before this function is called

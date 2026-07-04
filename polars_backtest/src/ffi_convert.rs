@@ -102,8 +102,7 @@ pub fn check_ffi_struct_sizes() -> (usize, usize, usize, usize) {
     )
 }
 
-/// Verify FFI compatibility at runtime
-#[allow(dead_code)]
+/// Verify FFI compatibility at runtime (called once at module init)
 pub fn verify_ffi_compatibility() -> Result<(), String> {
     let (pa_array, pa_schema, ar_array, ar_schema) = check_ffi_struct_sizes();
 

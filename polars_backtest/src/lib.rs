@@ -1568,6 +1568,10 @@ fn df_to_f64_2d(df: &DataFrame) -> Result<Vec<Vec<f64>>, String> {
 
 #[pymodule]
 fn _polars_backtest(m: &Bound<'_, PyModule>) -> PyResult<()> {
+    // The zero-copy FFI path transmutes between polars-arrow and arrow-rs C-ABI
+    // structs; verify layout compatibility once instead of assuming it forever.
+    ffi_convert::verify_ffi_compatibility()
+        .map_err(|e| PyValueError::new_err(format!("Arrow FFI incompatibility: {}", e)))?;
     m.add("__version__", env!("CARGO_PKG_VERSION"))?;
     // Config
     m.add_class::<PyBacktestConfig>()?;

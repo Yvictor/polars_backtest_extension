@@ -41,7 +41,17 @@
 >   relationship asserted).
 > - Wide-format findings **M1, M2, M3 WON'T FIX** — the wide path is frozen;
 >   the framework core is the long format (owner decision 2026-07-04).
-> - Open: L1–L8 (low).
+> - **L5 FIXED** — tail_ratio/profit_factor return NaN (not +inf) when inputs
+>   are NaN. **L6 FIXED** — `verify_ffi_compatibility()` now runs at module
+>   init. **L7 FIXED** — the stops.rs FP-precision trick is guarded with
+>   `std::hint::black_box`; golden-fixture parity still at machine precision,
+>   confirming bit-compatibility is preserved.
+> - **L4 WON'T FIX (finlab-compatible by design)** — the first-value rebase of
+>   creturn matches finlab's behavior: the golden fixtures pass at machine
+>   precision *with* the rebase, so "fixing" it would break parity.
+> - Open: L1 (window>holding fee indexing — unreachable via defaults),
+>   L2 (dead code + stale comments), L3 (W-MON + offset anchor),
+>   L8 (period units documented in the skill; wide frozen).
 
 Adversarial review of `btcore` + `polars_backtest` (Rust engine, pyo3 bindings,
 Python layer, tests, packaging). `cargo test -p btcore` passes (101+19 tests).
