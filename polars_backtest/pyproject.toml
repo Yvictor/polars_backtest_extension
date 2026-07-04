@@ -27,7 +27,6 @@ classifiers = [
 keywords = ["polars", "backtest", "trading", "finance", "quantitative"]
 dependencies = [
     "polars>=1.0.0",
-    "pyarrow>=21.0.0",
 ]
 
 [project.optional-dependencies]
@@ -68,5 +67,4 @@ dev = [
     "patchelf>=0.17.2.4; sys_platform == 'linux'",
     "pytest>=8.4.2",
     "ruff>=0.14.10",
-    "yfinance>=1.0",
 ]
