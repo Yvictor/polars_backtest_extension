@@ -35,8 +35,9 @@ if TYPE_CHECKING:
 else:
     DataFrame = pl.DataFrame
 
+# Liquidity analysis: limit-lock classification and fill-stress scenarios
 # Visualization: self-contained interactive HTML report (no extra dependencies)
-from polars_backtest import viz
+from polars_backtest import liquidity, viz
 
 # Wide format API (optional, for Finlab compatibility)
 from polars_backtest.wide import (
@@ -59,8 +60,9 @@ __all__ = [
     "backtest_wide",
     "backtest_with_report_wide",
     "Report",
-    # Visualization
+    # Visualization / analysis
     "viz",
+    "liquidity",
     # Statistics expressions
     "daily_returns",
     "cumulative_returns",

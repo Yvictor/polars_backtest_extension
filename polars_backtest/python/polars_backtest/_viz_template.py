@@ -93,7 +93,7 @@ h2 { font-size: 14px; margin: 0 0 8px; font-weight: 600; color: var(--ink-2); }
 .tile .k { color: var(--muted); font-size: 12px; }
 .tile .v { font-size: 22px; font-weight: 650; margin-top: 2px; }
 .tile .v.xl { font-size: 30px; }
-.tile .v.up { color: var(--up); } .tile .v.dn { color: var(--dn); }
+.tile .v.up { color: var(--up); } .tile .v.dn { color: var(--dn); } .tile .v.wa { color: var(--warn); }
 .tile .c { color: var(--muted); font-size: 11px; margin-top: 2px; }
 .tiles { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 10px; }
 /* tradability flag pills */
@@ -192,6 +192,7 @@ table.tt td { padding: 6px 8px; border-bottom: 1px solid var(--grid); vertical-a
 .badge.dn { color: var(--dn); background: color-mix(in srgb, var(--dn) 12%, transparent); }
 .flag { display: inline-block; font-size: 11px; border: 1px solid color-mix(in srgb, var(--dn) 45%, transparent);
         color: var(--dn); border-radius: 5px; padding: 0 5px; margin-right: 4px; white-space: nowrap; }
+.flag.wa { border-color: color-mix(in srgb, var(--warn) 55%, transparent); color: var(--warn); }
 .pager { display: flex; gap: 8px; align-items: center; justify-content: flex-end;
          color: var(--muted); font-size: 12px; margin-top: 8px; }
 .pager button { border: 1px solid var(--border); background: transparent; color: var(--ink-2);
@@ -318,7 +319,8 @@ svg text { font-family: inherit; }
     <div class="card">
       <h2>漲停依賴 <span class="info" data-tip="進場當日即漲停的交易可能實際買不到；報酬貢獻占比衡量策略有多少損益建立在這些交易上">&#9432;</span></h2>
       <div class="tiles" id="lim-tiles" style="margin-bottom:8px"></div>
-      <div class="sub" style="margin-bottom:8px">若漲停日實際買不到，「漲停報酬貢獻」這部分報酬將消失；下表依 |貢獻| 由大到小列出漲跌停成交。</div>
+      <div class="sub" id="lim-note" style="margin-bottom:8px"></div>
+      <div id="fill-scn"></div>
       <div id="liq-list"></div>
     </div>
     <div class="row2">
@@ -749,12 +751,18 @@ function flagList() {
     val: cap == null ? "無資料" : fmtMetric(cap, "wan"),
     tip: "規則：胃納量 ≥5000萬 綠 / ≥1000萬 黃 / 更低 紅（FinLab capacity 估計，需 trading_value）",
   });
+  const lkc = ts.entry_locked_contrib_ratio;
   const bhc = ts.buy_high_contrib_ratio;
   const bh = m.buyHigh != null ? m.buyHigh : ts.buy_high_ratio;
-  if (bhc != null) flags.push({
+  if (lkc != null) flags.push({
+    label: "漲停依賴", cls: lkc <= 0.05 ? "g" : lkc <= 0.15 ? "a" : "r",
+    val: "一字鎖死貢獻 " + fmtPct(lkc, 1),
+    tip: "規則：一字鎖死進場（開盤即漲停且全日未打開，完全買不到）的報酬貢獻占比 ≤5% 綠 / ≤15% 黃 / >15% 紅",
+  });
+  else if (bhc != null) flags.push({
     label: "漲停依賴", cls: bhc <= 0.10 ? "g" : bhc <= 0.25 ? "a" : "r",
     val: "貢獻 " + fmtPct(bhc, 1),
-    tip: "規則：漲停進場交易的報酬貢獻占比 ≤10% 綠 / ≤25% 黃 / >25% 紅",
+    tip: "規則（後備，無一字鎖死分類）：漲停進場交易的報酬貢獻占比 ≤10% 綠 / ≤25% 黃 / >25% 紅",
   });
   else flags.push({
     label: "漲停依賴", cls: bh == null ? "na" : bh <= 0.05 ? "g" : bh <= 0.10 ? "a" : "r",
@@ -1350,17 +1358,33 @@ function renderLiveSection() {
   const bh = m.buyHigh != null ? m.buyHigh : ts.buy_high_ratio;
   const sl = m.sellLow != null ? m.sellLow : ts.sell_low_ratio;
   const bhc = ts.buy_high_contrib_ratio;
-  $("lim-tiles").innerHTML =
+  const hasKinds = ts.entry_locked_n != null || ts.entry_touched_n != null;
+  let limHtml =
     tile("買在漲停比率", bh == null ? "–" : fmtPct(bh, 1),
       bh == null ? "需 limit_up / limit_down 資料" : (ts.buy_high_n != null ? ts.buy_high_n + " 筆" : "") + " · 需 < 5%",
       bh != null && bh >= 0.05 ? "dn" : "", DESC.buyHigh)
     + tile("漲停報酬貢獻占比", bhc == null ? "–" : fmtPct(bhc, 1),
       bhc == null ? "無貢獻資料" : "若漲停買不到，這部分報酬將消失",
       bhc != null && bhc > 0.25 ? "dn" : "",
-      "漲停進場交易的損益（報酬 × |持倉|）占策略總損益的比例")
-    + tile("賣在跌停", sl == null ? "–" : fmtPct(sl, 1),
-      sl == null ? "需 limit_up / limit_down 資料" : (ts.sell_low_n != null ? ts.sell_low_n + " 筆" : "") + " · 需 < 5%",
-      sl != null && sl >= 0.05 ? "dn" : "", DESC.sellLow);
+      "漲停進場交易的損益（報酬 × |持倉|）占策略總損益的比例");
+  if (hasKinds) {
+    const lkN = ts.entry_locked_n || 0, tcN = ts.entry_touched_n || 0;
+    const lkc = ts.entry_locked_contrib_ratio;
+    limHtml += tile("一字鎖死進場", lkN + " 筆",
+      (lkc != null ? "貢獻 " + fmtPct(lkc, 1) + " · " : "") + "完全買不到",
+      lkN > 0 ? "dn" : "",
+      "開盤即漲停且全日未打開（open==low==limit）的進場，掛單完全無法成交")
+      + tile("盤中觸及進場", tcN + " 筆", "有監控可買到", tcN > 0 ? "wa" : "",
+        "當日曾於漲停價以下成交的漲停進場，監控下仍有機會買進");
+  }
+  limHtml += tile("賣在跌停", sl == null ? "–" : fmtPct(sl, 1),
+    (sl == null ? "需 limit_up / limit_down 資料" : (ts.sell_low_n != null ? ts.sell_low_n + " 筆" : "") + " · 需 < 5%")
+    + (ts.exit_locked_n != null ? " · 一字 " + ts.exit_locked_n + " / 觸及 " + (ts.exit_touched_n || 0) : ""),
+    sl != null && sl >= 0.05 ? "dn" : "", DESC.sellLow);
+  $("lim-tiles").innerHTML = limHtml;
+  $("lim-note").textContent = "若漲停日實際買不到，「漲停報酬貢獻」這部分報酬將消失；下表依 |貢獻| 由大到小列出漲跌停成交。"
+    + (hasKinds ? " 一字鎖死＝開盤即漲停且全日未打開，掛單完全無法成交；盤中觸及＝當日曾於漲停價下成交，監控下仍有機會買進。" : "");
+  renderFillScenarios();
   renderLimitEvidence();
   const cap = m.capacity, capMin = m.capacityMinLeg, capAdv = m.capacityAdv;
   let capHtml = tile("胃納量（FinLab 法）", cap == null ? "–" : fmtMetric(cap, "wan"),
@@ -1396,9 +1420,65 @@ function renderLiveSection() {
     + (cd != null ? "，成本拖累約 " + fmtPct(cd, 1) + "/年" : ""));
   if (bhc != null) parts.push("漲停進場貢獻 " + fmtPct(bhc, 1) + " 的報酬");
   else if (bh != null) parts.push("買在漲停占 " + fmtPct(bh, 1) + " 筆");
+  const scn = P.fill_scenarios || [];
+  const scnBase = scn.find(s => s.name === "baseline");
+  const scnLocked = scn.find(s => s.name === "locked");
+  if (scnBase && scnLocked && scnBase.cagr != null && scnLocked.cagr != null)
+    parts.push("若一字鎖死均買不到，年化 " + fmtSignPct(scnBase.cagr, 1) + " → " + fmtSignPct(scnLocked.cagr, 1));
   if (cap != null) parts.push("胃納量約 " + fmtMetric(cap, "wan"));
   $("tk-live").textContent = parts.length ? parts.join("；") + "。"
     : "缺少成本與漲跌停資料，無法完整評估實盤可行性。";
+}
+function renderFillScenarios() {
+  const S = P.fill_scenarios;
+  const box = $("fill-scn");
+  if (!S || !S.length) { box.innerHTML = ""; return; }
+  const base = S.find(s => s.name === "baseline") || S[0];
+  const NAME = {
+    baseline: "baseline（全部成交）",
+    locked: "排除一字鎖死（有監控）",
+    at_limit: "排除所有漲停進場（保守）",
+  };
+  const cagrCell = (s) => {
+    if (s.cagr == null) return "–";
+    if (s.name === "baseline" || base.cagr == null || base.cagr <= 0)
+      return "<b>" + fmtSignPct(s.cagr, 1) + "</b>";
+    const drop = (base.cagr - s.cagr) / Math.abs(base.cagr);
+    const col = drop < 0.10 ? "var(--good)" : drop < 0.30 ? "var(--warn)" : "var(--bad)";
+    return '<b style="color:' + col + '">' + fmtSignPct(s.cagr, 1) + "</b>"
+      + ' <span class="tsub">(' + fmtSignPct(s.cagr - base.cagr, 1) + ")</span>";
+  };
+  let rows = "";
+  for (const s of S) {
+    rows += "<tr><td>" + (NAME[s.name] || s.name) + "</td>"
+      + "<td>" + cagrCell(s) + "</td>"
+      + "<td>" + fmtSignPct(s.total_return, 1) + "</td>"
+      + "<td>" + fmtPct(s.max_drawdown, 1) + "</td>"
+      + "<td>" + fmtNum(s.daily_sharpe, 2) + "</td>"
+      + "<td>" + fmtNum(s.calmar, 2) + "</td>"
+      + "<td>" + (s.blocked_n != null ? s.blocked_n : "–") + "</td></tr>";
+  }
+  box.innerHTML = '<h2 style="margin-top:8px">買不到情境模擬 <span class="info" data-tip="將買不到的進場訊號歸零後重新回測，觀察策略在真實成交限制下還剩多少">&#9432;</span></h2>'
+    + '<table class="stats"><thead><tr><th>情境</th><th>年化報酬</th><th>總報酬</th><th>最大回檔</th>'
+    + "<th>Sharpe</th><th>Calmar</th><th>排除筆數</th></tr></thead><tbody>" + rows + "</tbody></table>"
+    + '<div class="sub" style="margin:6px 0 10px">重新回測：被排除的進場訊號歸零、資金留在現金（非事後扣減）。</div>';
+}
+/* kind-aware limit badges: 一字 (locked, red) / 盤中 (touched, amber) with generic fallback */
+function flagBadges(T, i) {
+  let out = "";
+  if (T.lim_entry && T.lim_entry[i]) {
+    const k = T.entry_kind ? T.entry_kind[i] : null;
+    if (k === "locked") out += '<span class="flag">一字漲停進</span>';
+    else if (k === "touched") out += '<span class="flag wa">盤中漲停進</span>';
+    else out += '<span class="flag">漲停進</span>';
+  }
+  if (T.lim_exit && T.lim_exit[i]) {
+    const k = T.exit_kind ? T.exit_kind[i] : null;
+    if (k === "locked") out += '<span class="flag">一字跌停出</span>';
+    else if (k === "touched") out += '<span class="flag wa">盤中跌停出</span>';
+    else out += '<span class="flag">跌停出</span>';
+  }
+  return out;
 }
 function renderLimitEvidence() {
   const T = P.trades;
@@ -1421,9 +1501,7 @@ function renderLimitEvidence() {
         + '<table class="tt"><thead><tr><th>代號 / 名稱</th><th>進場</th><th>出場</th><th>報酬</th><th>貢獻 (NAV)</th><th>旗標</th></tr></thead><tbody>';
       for (const i of shown) {
         const name = T.name && T.name[i] ? ' <span class="tsub">' + T.name[i] + "</span>" : "";
-        let flags = "";
-        if (T.lim_entry && T.lim_entry[i]) flags += '<span class="flag">漲停進</span>';
-        if (T.lim_exit && T.lim_exit[i]) flags += '<span class="flag">跌停出</span>';
+        const flags = flagBadges(T, i);
         const cb = contribOf(i);
         html += "<tr><td>" + T.stock[i] + name + "</td><td>" + (T.entry[i] || "–") + "</td>"
           + "<td>" + (T.exit[i] || '<span class="tsub">持有中</span>') + "</td>"
@@ -1556,9 +1634,7 @@ function renderTradesPanel() {
       : '<span class="badge ' + (T.ret[i] >= 0 ? "up" : "dn") + '">' + (T.ret[i] >= 0 ? "▲ " : "▼ ") + fmtSignPct(T.ret[i], 1) + "</span>";
     const px = (v) => v == null ? "" : '<div class="tsub">$' + v + "</div>";
     const exitCell = T.exit[i] ? T.exit[i] + px(T.exit_px[i]) : '<span class="tsub">持有中</span>';
-    let flags = "";
-    if (T.lim_entry && T.lim_entry[i]) flags += '<span class="flag">漲停進</span>';
-    if (T.lim_exit && T.lim_exit[i]) flags += '<span class="flag">跌停出</span>';
+    const flags = flagBadges(T, i);
     html += "<tr><td>" + T.stock[i] + name + "</td><td>" + ret + "</td>"
       + "<td>" + (T.entry[i] || "–") + px(T.entry_px[i]) + "</td><td>" + exitCell + "</td>"
       + "<td>" + fmtPct(T.pos[i], 1) + "</td>"

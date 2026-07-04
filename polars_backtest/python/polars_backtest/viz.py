@@ -167,6 +167,22 @@ def _with_limit_flags(trades: pl.DataFrame, input_df: pl.DataFrame | None) -> pl
     return trades.drop([c for c in drop if c not in ("lim_entry", "lim_exit")])
 
 
+def _with_limit_kinds(trades: pl.DataFrame, input_df: pl.DataFrame | None) -> pl.DataFrame:
+    """Add entry_kind/exit_kind ("locked" 一字 / "touched" 盤中 / null) when OHLC exists."""
+    if (
+        input_df is None
+        or not {"open", "high", "low", "date", "symbol"} <= set(input_df.columns)
+        or not ({"limit_up", "limit_down"} & set(input_df.columns))
+    ):
+        return trades.with_columns(
+            pl.lit(None, dtype=pl.String).alias("entry_kind"),
+            pl.lit(None, dtype=pl.String).alias("exit_kind"),
+        )
+    from polars_backtest.liquidity import classify_limit_trades
+
+    return classify_limit_trades(trades, input_df)
+
+
 def _trades_payload(
     report: Any,
     input_df: pl.DataFrame | None = None,
@@ -237,6 +253,7 @@ def _trades_payload(
 
     if "entry_raw_price" in trades.columns:
         trades = _with_limit_flags(trades, input_df)
+        trades = _with_limit_kinds(trades, input_df)
         entered = trades.filter(pl.col("entry_date").is_not_null())
         exited = trades.filter(pl.col("exit_date").is_not_null())
         lim_e = entered.get_column("lim_entry") if entered.height else None
@@ -266,6 +283,23 @@ def _trades_payload(
             if abs(tot) > 0:
                 summary["buy_high_contrib"] = bh
                 summary["buy_high_contrib_ratio"] = bh / tot
+        if "entry_kind" in trades.columns:
+            kinds = trades.filter(pl.col("entry_date").is_not_null())
+            if kinds.height and kinds.get_column("entry_kind").null_count() < kinds.height:
+                locked = kinds.filter(pl.col("entry_kind") == "locked")
+                touched = kinds.filter(pl.col("entry_kind") == "touched")
+                summary["entry_locked_n"] = locked.height
+                summary["entry_touched_n"] = touched.height
+                closed_locked = locked.filter(pl.col("return").is_not_null())
+                if closed_locked.height and abs(tot) > 0:
+                    locked_c = closed_locked.select(
+                        (pl.col("return") * pl.col("position").abs()).sum()
+                    ).item() or 0.0
+                    summary["entry_locked_contrib_ratio"] = locked_c / tot
+            exits = trades.filter(pl.col("exit_date").is_not_null())
+            if exits.height and exits.get_column("exit_kind").null_count() < exits.height:
+                summary["exit_locked_n"] = exits.filter(pl.col("exit_kind") == "locked").height
+                summary["exit_touched_n"] = exits.filter(pl.col("exit_kind") == "touched").height
 
     sampled = trades
     if total > MAX_EMBEDDED_TRADES:
@@ -292,6 +326,8 @@ def _trades_payload(
         _opt("mdd"),
         _opt("lim_entry"),
         _opt("lim_exit"),
+        _opt("entry_kind"),
+        _opt("exit_kind"),
     )
     payload = {
         "stock": cols.get_column("stock_id").to_list(),
@@ -308,6 +344,8 @@ def _trades_payload(
         "mdd": cols.get_column("mdd").to_list(),
         "lim_entry": cols.get_column("lim_entry").to_list(),
         "lim_exit": cols.get_column("lim_exit").to_list(),
+        "entry_kind": cols.get_column("entry_kind").to_list(),
+        "exit_kind": cols.get_column("exit_kind").to_list(),
         "sampled": total > MAX_EMBEDDED_TRADES,
         "total": total,
     }
@@ -529,6 +567,7 @@ def report_data(
     title: str = "Backtest Report",
     input_df: pl.DataFrame | None = None,
     symbol_names: dict[str, str] | None = None,
+    fill_scenarios: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     """Extract a JSON-serializable payload from a report object.
 
@@ -595,6 +634,7 @@ def report_data(
         "dd_episodes": _drawdown_episodes(dates, creturn),
         "benchmark_dd_episodes": bench_episodes,
         "trades": trades,
+        "fill_scenarios": fill_scenarios,
         "stat_groups": _stat_groups(stats, monthly, trade_summary),
     }
     return _clean(payload)
@@ -606,11 +646,18 @@ def report_html(
     title: str = "Backtest Report",
     input_df: pl.DataFrame | None = None,
     symbol_names: dict[str, str] | None = None,
+    fill_scenarios: list[dict[str, Any]] | None = None,
 ) -> str:
     """Render a report to a self-contained HTML string."""
     from polars_backtest._polars_backtest import __version__
 
-    payload = report_data(report, title=title, input_df=input_df, symbol_names=symbol_names)
+    payload = report_data(
+        report,
+        title=title,
+        input_df=input_df,
+        symbol_names=symbol_names,
+        fill_scenarios=fill_scenarios,
+    )
     return (
         TEMPLATE.replace("__TITLE__", _escape(title))
         .replace("__VERSION__", str(__version__))
@@ -625,11 +672,18 @@ def save_html(
     title: str = "Backtest Report",
     input_df: pl.DataFrame | None = None,
     symbol_names: dict[str, str] | None = None,
+    fill_scenarios: list[dict[str, Any]] | None = None,
 ) -> Path:
     """Render a report and write it to ``path``. Returns the written path."""
     out = Path(path)
     out.write_text(
-        report_html(report, title=title, input_df=input_df, symbol_names=symbol_names),
+        report_html(
+            report,
+            title=title,
+            input_df=input_df,
+            symbol_names=symbol_names,
+            fill_scenarios=fill_scenarios,
+        ),
         encoding="utf-8",
     )
     return out

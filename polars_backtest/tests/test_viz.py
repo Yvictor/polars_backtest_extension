@@ -167,6 +167,7 @@ def test_template_v3_one_page_sections(report):
         'id="rolling-card"', 'id="roll-ret"', 'id="roll-sharpe"',
         'id="ls-card"', 'id="contrib-hist"', 'id="uw-tiles"',
         'id="lim-tiles"', 'id="cap-tiles"', 'id="cost-tiles"',
+        'id="fill-scn"', 'id="lim-note"',
     ):
         assert marker in html
     # trade microscope is a collapsed <details>
@@ -190,6 +191,10 @@ def test_template_v3_zh_labels(report):
         "年換手率", "賣在跌停",
         # three-method capacity tiles (rendered when payload carries the keys)
         "保守估計（min-leg 法）", "ADV 法",
+        # limit-lock classification + fill-stress scenario table
+        "一字鎖死進場", "盤中觸及進場", "買不到情境模擬",
+        "一字漲停進", "盤中漲停進", "一字跌停出", "盤中跌停出",
+        "排除一字鎖死（有監控）", "排除所有漲停進場（保守）",
     ):
         assert label in html, f"missing zh-TW label: {label}"
 
