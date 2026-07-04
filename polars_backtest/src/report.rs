@@ -643,7 +643,7 @@ impl PyBacktestReport {
     ///
     /// Args:
     ///     sections: List of sections to include. Options: "backtest", "profitability",
-    ///              "risk", "ratio", "winrate". Defaults to all sections.
+    ///              "risk", "ratio", "winrate", "liquidity". Defaults to all sections.
     ///     riskfree_rate: Annual risk-free rate for Sharpe/Sortino calculations.
     ///
     /// Returns:
@@ -886,6 +886,102 @@ impl PyBacktestReport {
             .map_err(to_py_err)?;
 
         Ok(PyDataFrame(result))
+    }
+
+    /// Estimate strategy capacity from per-trade accepted money flow.
+    ///
+    /// Args:
+    ///     percentage_of_volume: Fraction of daily trading value assumed capturable
+    ///                          without market impact (default 0.05).
+    ///     quantile: Quantile of per-trade accepted money flow reported as the
+    ///              scalar capacity (default 0.1, linear interpolation).
+    ///     window: Rolling window length in trading days for method="adv"
+    ///            (default 20). Ignored by the other methods.
+    ///     method: One of:
+    ///         - "finlab" (default): average of entry/exit legs,
+    ///           amf = (TV@entry_date + TV@exit_date) * pov / |position| / 2.
+    ///           With the default pov/quantile this matches the capacity value
+    ///           in get_metrics(sections=["liquidity"]).
+    ///         - "min_leg": binding leg only,
+    ///           amf = pov * min(TV@entry_date, TV@exit_date) / |position|.
+    ///         - "adv": like "min_leg" but uses the rolling MEDIAN of trading
+    ///           value over `window` trading days ending at the SIGNAL dates
+    ///           (entry_sig_date / exit_sig_date), which is robust to the
+    ///           strategy's own volume and limit-locked near-zero-volume days.
+    ///
+    /// Only closed trades with liquidity data on both legs are included.
+    ///
+    /// Returns:
+    ///     Capacity in the unit of the trading_value column (e.g. TWD), or
+    ///     None when no trading value data was provided or no trade is eligible.
+    #[pyo3(signature = (percentage_of_volume=0.05, quantile=0.1, window=20, method="finlab"))]
+    fn capacity(
+        &self,
+        percentage_of_volume: f64,
+        quantile: f64,
+        window: usize,
+        method: &str,
+    ) -> PyResult<Option<f64>> {
+        match method {
+            "finlab" => self
+                .calc_capacity_tv(percentage_of_volume, quantile, false)
+                .map_err(to_py_err),
+            "min_leg" => self
+                .calc_capacity_tv(percentage_of_volume, quantile, true)
+                .map_err(to_py_err),
+            "adv" => {
+                if window == 0 {
+                    return Err(PyValueError::new_err("window must be >= 1"));
+                }
+                self.calc_capacity_adv(percentage_of_volume, quantile, window)
+                    .map_err(to_py_err)
+            }
+            other => Err(PyValueError::new_err(format!(
+                "Unknown capacity method: '{}'. Valid: \"finlab\", \"min_leg\", \"adv\"",
+                other
+            ))),
+        }
+    }
+
+    /// Per-rebalance capacity diagnostic.
+    ///
+    /// For each entry SIGNAL date d, all trades entering on d bind jointly:
+    /// NAV_max(d) = min over those trades of
+    /// (percentage_of_volume * liquidity@entry / |position|), where
+    /// liquidity@entry is the rolling-median ADV at the entry signal date for
+    /// method="adv" (window trading days, min_periods=1), or the raw trading
+    /// value at the entry execution date for method="finlab" / "min_leg"
+    /// (both reduce to the same entry-only leg here).
+    ///
+    /// Returns:
+    ///     DataFrame with columns date (Date), capacity (Float64) and
+    ///     n_entries (UInt32, eligible trades entering on that date), sorted by
+    ///     date, in the unit of the trading_value column. None when no trading
+    ///     value data was provided.
+    #[pyo3(signature = (percentage_of_volume=0.05, window=20, method="adv"))]
+    fn capacity_by_date(
+        &self,
+        percentage_of_volume: f64,
+        window: usize,
+        method: &str,
+    ) -> PyResult<Option<PyDataFrame>> {
+        let use_adv = match method {
+            "adv" => true,
+            "finlab" | "min_leg" => false,
+            other => {
+                return Err(PyValueError::new_err(format!(
+                    "Unknown capacity method: '{}'. Valid: \"finlab\", \"min_leg\", \"adv\"",
+                    other
+                )))
+            }
+        };
+        if use_adv && window == 0 {
+            return Err(PyValueError::new_err("window must be >= 1"));
+        }
+        Ok(self
+            .calc_capacity_by_date(percentage_of_volume, window, use_adv)
+            .map_err(to_py_err)?
+            .map(PyDataFrame))
     }
 }
 
@@ -1467,10 +1563,22 @@ impl PyBacktestReport {
         }
     }
 
-    /// Calculate liquidity metrics (buyHigh, sellLow) using join with limit_prices_df
+    /// Calculate liquidity metrics (buyHigh, sellLow), direction-aware
     ///
-    /// buyHigh: ratio of trades where entry_raw_price >= limit_up
-    /// sellLow: ratio of trades where exit_raw_price <= limit_down
+    /// Adverse-fill checks are epsilon-tolerant (1e-6 relative) so fills at
+    /// exactly the limit price survive the adj-price/factor round-trip:
+    /// - adverse_up(px, lim) = px >= lim * (1 - 1e-6)  (buying into limit-up)
+    /// - adverse_dn(px, lim) = px <= lim * (1 + 1e-6)  (selling into limit-down)
+    ///
+    /// buyHigh = max( ratio of long entries at limit-up,
+    ///                ratio of short exits (covers) at limit-up )
+    /// sellLow = max( ratio of short entries at limit-down,
+    ///                ratio of long exits at limit-down )
+    ///
+    /// Each leg's denominator counts only trades whose (date, symbol) join with
+    /// the limit prices produced a non-null limit (entry legs include open
+    /// trades; exit legs use closed trades only). A leg with no eligible trades
+    /// is absent; if both legs are absent the metric is null.
     fn calc_liquidity_metrics(&self) -> PolarsResult<(Option<f64>, Option<f64>)> {
         let Some(limit_df) = &self.limit_prices_df else {
             return Ok((None, None));
@@ -1481,89 +1589,46 @@ impl PyBacktestReport {
             return Ok((None, None));
         }
 
-        // Check if entry_raw_price column exists
+        // Check if raw price / limit columns exist
         let has_entry_raw_price = trades.column("entry_raw_price").is_ok();
         let has_exit_raw_price = trades.column("exit_raw_price").is_ok();
         let has_limit_up = limit_df.column("limit_up").is_ok();
         let has_limit_down = limit_df.column("limit_down").is_ok();
 
-        // Calculate buyHigh: join trades with limit_df on (entry_date, stock_id)
-        let buy_high = if has_entry_raw_price && has_limit_up {
-            let with_entry_limit = trades
-                .clone()
-                .lazy()
-                .join(
-                    limit_df.clone().lazy().select([
-                        col("date"),
-                        col("symbol"),
-                        col("limit_up"),
-                    ]),
-                    [col("entry_date"), col("stock_id")],
-                    [col("date"), col("symbol")],
-                    JoinArgs::new(JoinType::Left),
-                )
-                .filter(col("limit_up").is_not_null())
-                .select([
-                    col("entry_raw_price").gt_eq(col("limit_up")).alias("at_limit"),
-                ])
-                .collect()?;
-
-            if with_entry_limit.height() == 0 {
-                None
+        // buyHigh: long entries and short exits (covers) filled at limit-up
+        let buy_high = if has_limit_up {
+            let long_entries = if has_entry_raw_price {
+                // long_leg=true, is_exit=false, adverse_up=true
+                self.calc_limit_leg_ratio(limit_df, "limit_up", true, false, true)?
             } else {
-                let stats = with_entry_limit
-                    .lazy()
-                    .select([
-                        col("at_limit").sum().alias("count_at_limit"),
-                        col("at_limit").count().alias("total"),
-                    ])
-                    .collect()?;
-
-                let count = stats.column("count_at_limit")?.u32()?.get(0).unwrap_or(0) as f64;
-                let total = stats.column("total")?.u32()?.get(0).unwrap_or(1) as f64;
-                if total > 0.0 { Some(count / total) } else { None }
-            }
+                None
+            };
+            let short_exits = if has_exit_raw_price {
+                // long_leg=false, is_exit=true, adverse_up=true
+                self.calc_limit_leg_ratio(limit_df, "limit_up", false, true, true)?
+            } else {
+                None
+            };
+            max_option(long_entries, short_exits)
         } else {
             None
         };
 
-        // Calculate sellLow: join trades with limit_df on (exit_date, stock_id)
-        let sell_low = if has_exit_raw_price && has_limit_down {
-            let with_exit_limit = trades
-                .clone()
-                .lazy()
-                .filter(col("exit_date").is_not_null())
-                .join(
-                    limit_df.clone().lazy().select([
-                        col("date"),
-                        col("symbol"),
-                        col("limit_down"),
-                    ]),
-                    [col("exit_date"), col("stock_id")],
-                    [col("date"), col("symbol")],
-                    JoinArgs::new(JoinType::Left),
-                )
-                .filter(col("limit_down").is_not_null())
-                .select([
-                    col("exit_raw_price").lt_eq(col("limit_down")).alias("at_limit"),
-                ])
-                .collect()?;
-
-            if with_exit_limit.height() == 0 {
-                None
+        // sellLow: short entries and long exits filled at limit-down
+        let sell_low = if has_limit_down {
+            let short_entries = if has_entry_raw_price {
+                // long_leg=false, is_exit=false, adverse_up=false
+                self.calc_limit_leg_ratio(limit_df, "limit_down", false, false, false)?
             } else {
-                let stats = with_exit_limit
-                    .lazy()
-                    .select([
-                        col("at_limit").sum().alias("count_at_limit"),
-                        col("at_limit").count().alias("total"),
-                    ])
-                    .collect()?;
-
-                let count = stats.column("count_at_limit")?.u32()?.get(0).unwrap_or(0) as f64;
-                let total = stats.column("total")?.u32()?.get(0).unwrap_or(1) as f64;
-                if total > 0.0 { Some(count / total) } else { None }
-            }
+                None
+            };
+            let long_exits = if has_exit_raw_price {
+                // long_leg=true, is_exit=true, adverse_up=false
+                self.calc_limit_leg_ratio(limit_df, "limit_down", true, true, false)?
+            } else {
+                None
+            };
+            max_option(short_entries, long_exits)
         } else {
             None
         };
@@ -1571,13 +1636,97 @@ impl PyBacktestReport {
         Ok((buy_high, sell_low))
     }
 
-    /// Calculate capacity metric using join with trading_value_df
+    /// Ratio of trades in one direction leg filled at the limit price
     ///
-    /// Formula (matching finlab):
-    /// accepted_money_flow = (trading_value@entry * 0.05 / |position| +
-    ///                        trading_value@exit * 0.05 / |position|) / 2
-    /// capacity = accepted_money_flow.quantile(0.1)
+    /// Args:
+    /// - `limit_col`: "limit_up" or "limit_down"
+    /// - `long_leg`: true selects position > 0 trades, false position < 0
+    /// - `is_exit`: false joins limit@entry_date vs entry_raw_price (includes
+    ///   open trades), true joins limit@exit_date vs exit_raw_price (closed only)
+    /// - `adverse_up`: true checks px >= lim*(1-eps), false px <= lim*(1+eps)
+    ///
+    /// Returns None when no trade in the leg has a joinable limit price.
+    fn calc_limit_leg_ratio(
+        &self,
+        limit_df: &DataFrame,
+        limit_col: &str,
+        long_leg: bool,
+        is_exit: bool,
+        adverse_up: bool,
+    ) -> PolarsResult<Option<f64>> {
+        const LIMIT_EPS: f64 = 1e-6;
+
+        let (date_col, price_col) = if is_exit {
+            ("exit_date", "exit_raw_price")
+        } else {
+            ("entry_date", "entry_raw_price")
+        };
+
+        let position_filter = if long_leg {
+            col("position").gt(lit(0.0))
+        } else {
+            col("position").lt(lit(0.0))
+        };
+
+        let mut lf = self.trades_df.clone().lazy().filter(position_filter);
+        if is_exit {
+            lf = lf.filter(col("exit_date").is_not_null());
+        }
+
+        let at_limit = if adverse_up {
+            col(price_col).gt_eq(col("limit_price") * lit(1.0 - LIMIT_EPS))
+        } else {
+            col(price_col).lt_eq(col("limit_price") * lit(1.0 + LIMIT_EPS))
+        };
+
+        let stats = lf
+            .join(
+                limit_df.clone().lazy().select([
+                    col("date"),
+                    col("symbol"),
+                    col(limit_col).alias("limit_price"),
+                ]),
+                [col(date_col), col("stock_id")],
+                [col("date"), col("symbol")],
+                JoinArgs::new(JoinType::Left),
+            )
+            .filter(col("limit_price").is_not_null())
+            .select([
+                at_limit.clone().sum().alias("count_at_limit"),
+                at_limit.count().alias("total"),
+            ])
+            .collect()?;
+
+        let count = stats.column("count_at_limit")?.u32()?.get(0).unwrap_or(0) as f64;
+        let total = stats.column("total")?.u32()?.get(0).unwrap_or(0) as f64;
+        if total > 0.0 { Ok(Some(count / total)) } else { Ok(None) }
+    }
+
+    /// Calculate the default capacity metric for get_metrics()
+    ///
+    /// Delegates to the finlab formula with pov=0.05, quantile=0.1 — must stay
+    /// byte-identical to the historical finlab-faithful behavior.
     fn calc_capacity(&self) -> PolarsResult<Option<f64>> {
+        self.calc_capacity_tv(0.05, 0.1, false)
+    }
+
+    /// Capacity from raw trading value at entry/exit execution dates
+    ///
+    /// Formula (matching finlab, `min_leg=false`):
+    /// accepted_money_flow = (trading_value@entry * pov / |position| +
+    ///                        trading_value@exit * pov / |position|) / 2
+    ///
+    /// With `min_leg=true` the binding leg is used instead:
+    /// accepted_money_flow = pov * min(trading_value@entry, trading_value@exit)
+    ///                       / |position|
+    ///
+    /// capacity = accepted_money_flow.quantile(quantile) over closed trades.
+    fn calc_capacity_tv(
+        &self,
+        percentage_of_volume: f64,
+        quantile: f64,
+        min_leg: bool,
+    ) -> PolarsResult<Option<f64>> {
         let Some(trading_value_df) = &self.trading_value_df else {
             return Ok(None);
         };
@@ -1586,8 +1735,6 @@ impl PyBacktestReport {
         if trades.height() == 0 {
             return Ok(None);
         }
-
-        let percentage_of_volume = 0.05;
 
         // Step 1: Join trades with trading_value on (entry_date, stock_id) to get trading_value@entry
         let with_entry_value = trades
@@ -1622,7 +1769,19 @@ impl PyBacktestReport {
             .collect()?;
 
         // Step 3: Calculate accepted_money_flow for each trade
-        // Formula: ((trading_value_entry * 0.05 / |position|) + (trading_value_exit * 0.05 / |position|)) / 2
+        let amf_expr = if min_leg {
+            (lit(percentage_of_volume)
+                * when(col("trading_value_entry").lt(col("trading_value_exit")))
+                    .then(col("trading_value_entry"))
+                    .otherwise(col("trading_value_exit")))
+                / col("position").abs()
+        } else {
+            // Finlab formula: ((tv_entry * pov / |pos|) + (tv_exit * pov / |pos|)) / 2
+            ((col("trading_value_entry") * lit(percentage_of_volume) / col("position").abs())
+                + (col("trading_value_exit") * lit(percentage_of_volume) / col("position").abs()))
+                / lit(2.0)
+        };
+
         let with_capacity = with_both_value
             .lazy()
             .filter(
@@ -1630,22 +1789,189 @@ impl PyBacktestReport {
                     .and(col("trading_value_exit").is_not_null())
                     .and(col("position").abs().gt(lit(0.0)))
             )
-            .with_column(
-                (((col("trading_value_entry") * lit(percentage_of_volume) / col("position").abs())
-                    + (col("trading_value_exit") * lit(percentage_of_volume) / col("position").abs()))
-                    / lit(2.0))
-                .alias("accepted_money_flow")
-            )
+            .with_column(amf_expr.alias("accepted_money_flow"))
             .collect()?;
 
-        if with_capacity.height() == 0 {
+        // Step 4: Calculate the requested quantile
+        Self::amf_quantile(&with_capacity, quantile)
+    }
+
+    /// Capacity from rolling-median ADV at the entry/exit SIGNAL dates
+    ///
+    /// ADV = rolling median of trading_value over `window` trading days
+    /// (rows present in trading_value_df) ending at the signal date, per symbol.
+    /// accepted_money_flow = pov * min(ADV@entry_sig, ADV@exit_sig) / |position|
+    /// capacity = accepted_money_flow.quantile(quantile) over closed trades.
+    /// Trades whose ADV window has no data (signal date absent from
+    /// trading_value_df) are excluded.
+    fn calc_capacity_adv(
+        &self,
+        percentage_of_volume: f64,
+        quantile: f64,
+        window: usize,
+    ) -> PolarsResult<Option<f64>> {
+        let Some(trading_value_df) = &self.trading_value_df else {
+            return Ok(None);
+        };
+
+        let trades = &self.trades_df;
+        if trades.height() == 0 {
             return Ok(None);
         }
 
-        // Step 4: Calculate 10th percentile (quantile 0.1)
-        let capacity_col = with_capacity.column("accepted_money_flow")?.f64()?;
-        let capacity = capacity_col.quantile(0.1, QuantileMethod::Linear)?;
+        let adv_df = Self::compute_adv_frame(trading_value_df, window)?;
 
-        Ok(capacity)
+        let with_capacity = trades
+            .clone()
+            .lazy()
+            .filter(col("exit_date").is_not_null())
+            .join(
+                adv_df.clone().lazy().select([
+                    col("date"),
+                    col("symbol"),
+                    col("liquidity").alias("adv_entry"),
+                ]),
+                [col("entry_sig_date"), col("stock_id")],
+                [col("date"), col("symbol")],
+                JoinArgs::new(JoinType::Left),
+            )
+            .join(
+                adv_df.lazy().select([
+                    col("date"),
+                    col("symbol"),
+                    col("liquidity").alias("adv_exit"),
+                ]),
+                [col("exit_sig_date"), col("stock_id")],
+                [col("date"), col("symbol")],
+                JoinArgs::new(JoinType::Left),
+            )
+            .filter(
+                col("adv_entry").is_not_null()
+                    .and(col("adv_exit").is_not_null())
+                    .and(col("position").abs().gt(lit(0.0)))
+            )
+            .with_column(
+                ((lit(percentage_of_volume)
+                    * when(col("adv_entry").lt(col("adv_exit")))
+                        .then(col("adv_entry"))
+                        .otherwise(col("adv_exit")))
+                    / col("position").abs())
+                .alias("accepted_money_flow"),
+            )
+            .collect()?;
+
+        Self::amf_quantile(&with_capacity, quantile)
+    }
+
+    /// Per-entry-signal-date capacity: min over entering trades of
+    /// pov * liquidity@entry / |position|
+    ///
+    /// `use_adv=true` joins rolling-median ADV at entry_sig_date; otherwise
+    /// raw trading value at entry_date is used.
+    fn calc_capacity_by_date(
+        &self,
+        percentage_of_volume: f64,
+        window: usize,
+        use_adv: bool,
+    ) -> PolarsResult<Option<DataFrame>> {
+        let Some(trading_value_df) = &self.trading_value_df else {
+            return Ok(None);
+        };
+
+        let (liquidity_df, join_date_col) = if use_adv {
+            (Self::compute_adv_frame(trading_value_df, window)?, "entry_sig_date")
+        } else {
+            let tv = trading_value_df
+                .clone()
+                .lazy()
+                .select([
+                    col("date"),
+                    col("symbol"),
+                    col("trading_value").alias("liquidity"),
+                ])
+                .collect()?;
+            (tv, "entry_date")
+        };
+
+        let result = self
+            .trades_df
+            .clone()
+            .lazy()
+            .join(
+                liquidity_df.lazy(),
+                [col(join_date_col), col("stock_id")],
+                [col("date"), col("symbol")],
+                JoinArgs::new(JoinType::Left),
+            )
+            .filter(
+                col("liquidity").is_not_null()
+                    .and(col("position").abs().gt(lit(0.0)))
+            )
+            .with_column(
+                (lit(percentage_of_volume) * col("liquidity") / col("position").abs())
+                    .alias("trade_capacity"),
+            )
+            .group_by([col("entry_sig_date")])
+            .agg([
+                col("trade_capacity").min().alias("capacity"),
+                col("trade_capacity").count().alias("n_entries"),
+            ])
+            .with_column(col("n_entries").cast(DataType::UInt32))
+            .sort(["entry_sig_date"], Default::default())
+            .select([
+                col("entry_sig_date").alias("date"),
+                col("capacity"),
+                col("n_entries"),
+            ])
+            .collect()?;
+
+        Ok(Some(result))
+    }
+
+    /// Rolling-median ADV per symbol over `window` trading days
+    ///
+    /// Only dates present in trading_value_df (trading days) are used;
+    /// min_periods=1 so early dates with fewer than `window` observations use
+    /// the data available instead of being dropped.
+    /// Returns columns: date, symbol, liquidity.
+    fn compute_adv_frame(trading_value_df: &DataFrame, window: usize) -> PolarsResult<DataFrame> {
+        trading_value_df
+            .clone()
+            .lazy()
+            .sort(["symbol", "date"], Default::default())
+            .with_column(
+                col("trading_value")
+                    .rolling_median(RollingOptionsFixedWindow {
+                        window_size: window,
+                        min_periods: 1,
+                        weights: None,
+                        center: false,
+                        fn_params: None,
+                    })
+                    .over([col("symbol")])
+                    .alias("liquidity"),
+            )
+            .select([col("date"), col("symbol"), col("liquidity")])
+            .collect()
+    }
+
+    /// Quantile (linear) of the accepted_money_flow column; None when empty
+    fn amf_quantile(with_capacity: &DataFrame, quantile: f64) -> PolarsResult<Option<f64>> {
+        if with_capacity.height() == 0 {
+            return Ok(None);
+        }
+        with_capacity
+            .column("accepted_money_flow")?
+            .f64()?
+            .quantile(quantile, QuantileMethod::Linear)
+    }
+}
+
+/// Max of two optional values; None only when both are absent
+fn max_option(a: Option<f64>, b: Option<f64>) -> Option<f64> {
+    match (a, b) {
+        (Some(x), Some(y)) => Some(x.max(y)),
+        (Some(x), None) => Some(x),
+        (None, b) => b,
     }
 }

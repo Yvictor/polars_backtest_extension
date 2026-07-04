@@ -27,7 +27,8 @@ polars = { version = "0.52", default-features = false, features = [
     "dtype-struct",
     "rows",
     "new_streaming",
-    "abs"
+    "abs",
+    "rolling_window"
 ] }
 # polars-lazy with python feature to fix PythonScan compile error
 polars-lazy = { version = "0.52", default-features = false, features = ["python"] }

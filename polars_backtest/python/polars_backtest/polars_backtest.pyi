@@ -9,6 +9,7 @@ import polars as pl
 from polars_backtest.namespace import BacktestNamespace
 
 MetricsSection = Literal["backtest", "profitability", "risk", "ratio", "winrate", "liquidity"]
+CapacityMethod = Literal["finlab", "min_leg", "adv"]
 
 
 class DataFrame(pl.DataFrame):
@@ -203,10 +204,72 @@ class BacktestReport:
             - ratio: sharpeRatio, sortinoRatio, calmarRatio, volatility,
                     profitFactor, tailRatio
             - winrate: winRate, expectancy, mae, mfe
-            - liquidity: buyHigh, sellLow, capacity (requires limit_up/limit_down/trading_value columns in input DataFrame)
+            - liquidity: buyHigh, sellLow, capacity (requires limit_up/limit_down/
+              trading_value columns in the input DataFrame)
 
             If benchmark is set (via setter or backtest_with_report), additional columns:
             - alpha, beta, m12WinRate (12-month rolling win rate vs benchmark)
+        """
+        ...
+
+    def capacity(
+        self,
+        percentage_of_volume: float = 0.05,
+        quantile: float = 0.1,
+        window: int = 20,
+        method: CapacityMethod = "finlab",
+    ) -> float | None:
+        """Estimate strategy capacity from per-trade accepted money flow.
+
+        Args:
+            percentage_of_volume: Fraction of daily trading value assumed
+                capturable without market impact (default 0.05).
+            quantile: Quantile of per-trade accepted money flow reported as the
+                scalar capacity (default 0.1, linear interpolation).
+            window: Rolling window length in trading days for method='adv'
+                (default 20). Ignored by the other methods.
+            method:
+                - 'finlab' (default): amf = (TV@entry + TV@exit) * pov / |position| / 2.
+                  With default pov/quantile this matches the capacity value in
+                  get_metrics(sections=['liquidity']).
+                - 'min_leg': amf = pov * min(TV@entry, TV@exit) / |position|.
+                - 'adv': like 'min_leg' but uses the rolling MEDIAN of trading
+                  value over `window` trading days ending at the entry/exit
+                  SIGNAL dates (min_periods=1).
+
+        Only closed trades with liquidity data on both legs are included.
+
+        Returns:
+            Capacity in the unit of the trading_value column (e.g. TWD), or
+            None when no trading value data was provided or no trade is eligible.
+
+        Raises:
+            ValueError: On unknown method or window < 1.
+        """
+        ...
+
+    def capacity_by_date(
+        self,
+        percentage_of_volume: float = 0.05,
+        window: int = 20,
+        method: CapacityMethod = "adv",
+    ) -> pl.DataFrame | None:
+        """Per-rebalance capacity diagnostic.
+
+        For each entry SIGNAL date d, all trades entering on d bind jointly:
+        NAV_max(d) = min over those trades of
+        (percentage_of_volume * liquidity@entry / |position|), where
+        liquidity@entry is the rolling-median ADV at the entry signal date for
+        method='adv' (window trading days, min_periods=1), or the raw trading
+        value at the entry execution date for method='finlab' / 'min_leg'.
+
+        Returns:
+            DataFrame with columns date (Date), capacity (Float64) and
+            n_entries (UInt32), sorted by date, in the unit of the
+            trading_value column. None when no trading value data was provided.
+
+        Raises:
+            ValueError: On unknown method or window < 1.
         """
         ...
 
