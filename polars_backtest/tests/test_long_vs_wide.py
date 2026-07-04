@@ -198,7 +198,6 @@ def run_comparison(
         position_limit=kwargs.get("position_limit", 1.0),
         retain_cost_when_rebalance=kwargs.get("retain_cost_when_rebalance", False),
         stop_trading_next_period=kwargs.get("stop_trading_next_period", True),
-        finlab_mode=True,
     )
 
     # Compare
@@ -1073,7 +1072,6 @@ def run_backtest_touched_exit_comparison(
         take_profit=kwargs.get("take_profit", float("inf")),
         trail_stop=kwargs.get("trail_stop", float("inf")),
         position_limit=kwargs.get("position_limit", 1.0),
-        finlab_mode=True,
         touched_exit=True,
     )
 
@@ -1311,7 +1309,6 @@ def test_polars_rolling_null(long_format_df):
         trade_at_price="adj_close",
         position="weight",
         resample="M",
-        finlab_mode=True,
     )
 
     assert len(result) > 0

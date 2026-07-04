@@ -36,7 +36,6 @@ class BacktestNamespace:
         position_limit: float = 1.0,
         retain_cost_when_rebalance: bool = False,
         stop_trading_next_period: bool = True,
-        finlab_mode: bool = False,
         touched_exit: bool = False,
     ) -> pl.DataFrame:
         """Run backtest on long format DataFrame.
@@ -67,7 +66,6 @@ class BacktestNamespace:
         position_limit: float = 1.0,
         retain_cost_when_rebalance: bool = False,
         stop_trading_next_period: bool = True,
-        finlab_mode: bool = True,
         touched_exit: bool = False,
         limit_up: str = "limit_up",
         limit_down: str = "limit_down",
@@ -101,7 +99,6 @@ def backtest(
     position_limit: float = 1.0,
     retain_cost_when_rebalance: bool = False,
     stop_trading_next_period: bool = True,
-    finlab_mode: bool = False,
     touched_exit: bool = False,
 ) -> pl.DataFrame:
     """Standalone function for backtest."""
@@ -129,7 +126,6 @@ def backtest_with_report(
     position_limit: float = 1.0,
     retain_cost_when_rebalance: bool = False,
     stop_trading_next_period: bool = True,
-    finlab_mode: bool = True,
     touched_exit: bool = False,
     limit_up: str = "limit_up",
     limit_down: str = "limit_down",

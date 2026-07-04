@@ -5,7 +5,8 @@ Provides df.bt.backtest() API for long format DataFrames.
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Union, cast
+import re
+from typing import TYPE_CHECKING, Iterable, Union, cast
 
 import polars as pl
 
@@ -46,6 +47,68 @@ def _resolve_column(
         df = df.with_columns(col_spec.alias(temp_name))
         return df, temp_name
     return df, col_spec
+
+
+# Offsets the long-format Rust engine actually parses: non-negative "<N>D" / "<N>W".
+# Anything else (e.g. finlab-style "-1D") used to be *silently ignored* — reject instead.
+_OFFSET_PATTERN = re.compile(r"^\d+[dDwW]$")
+
+# NOTE: "MS"/"QS" are intentionally absent — the engine treated them as aliases of
+# "M"/"Q" (month/quarter END), which silently diverged from pandas/finlab semantics.
+_SUPPORTED_RESAMPLE = (
+    None, "D",
+    "W", "W-MON", "W-TUE", "W-WED", "W-THU", "W-FRI", "W-SAT", "W-SUN",
+    "M", "ME",
+    "Q", "QE",
+    "Y", "YE", "A",
+)
+
+
+def _validate_resample(resample: str | None, resample_offset: str | None) -> None:
+    """Reject resample values the engine would silently misinterpret."""
+    if resample not in _SUPPORTED_RESAMPLE:
+        hint = ""
+        if resample in ("MS", "QS"):
+            hint = (
+                " Start-of-period frequencies are not supported by the long-format"
+                " engine (they used to be silently treated as month/quarter end)."
+            )
+        raise ValueError(
+            f"Unsupported resample '{resample}'. "
+            f"Supported values: {', '.join(str(s) for s in _SUPPORTED_RESAMPLE)}.{hint}"
+        )
+    if resample_offset is not None and not _OFFSET_PATTERN.match(resample_offset.strip()):
+        raise ValueError(
+            f"Unsupported resample_offset '{resample_offset}'. The long-format engine"
+            " supports only non-negative day/week offsets such as '5D' or '1W'."
+            " Negative offsets like '-1D' are not supported (they used to be silently"
+            " ignored); use the wide-format API if you need them."
+        )
+
+
+def _validate_no_nulls(df: pl.DataFrame, columns: Iterable[str]) -> None:
+    """date/symbol nulls would reach the Rust engine as undefined buffer bytes."""
+    for col in columns:
+        null_count = df.get_column(col).null_count()
+        if null_count:
+            raise ValueError(
+                f"Column '{col}' contains {null_count} null value(s);"
+                " drop or fill them before backtesting"
+            )
+
+
+def _floats_with_nan_nulls(df: pl.DataFrame, columns: Iterable[str | None]) -> pl.DataFrame:
+    """Ensure Float64 dtype and represent nulls as NaN (the engine's missing marker).
+
+    The FFI layer reads raw value buffers without checking Arrow validity bitmaps,
+    so a null slot would otherwise surface as arbitrary bytes.
+    """
+    exprs = []
+    for col in dict.fromkeys(c for c in columns if c is not None):
+        series = df.get_column(col)
+        if series.dtype != pl.Float64 or series.null_count():
+            exprs.append(pl.col(col).cast(pl.Float64).fill_null(float("nan")))
+    return df.with_columns(exprs) if exprs else df
 
 
 @pl.api.register_dataframe_namespace("bt")
@@ -103,7 +166,6 @@ class BacktestNamespace:
         position_limit: float = 1.0,
         retain_cost_when_rebalance: bool = False,
         stop_trading_next_period: bool = True,
-        finlab_mode: bool = False,
         touched_exit: bool = False,
     ) -> pl.DataFrame:
         """Run backtest on long format DataFrame.
@@ -128,7 +190,6 @@ class BacktestNamespace:
             position_limit: Maximum weight per stock
             retain_cost_when_rebalance: Retain costs when rebalancing
             stop_trading_next_period: Stop trading after stop triggered
-            finlab_mode: Use Finlab-compatible calculation
             touched_exit: Use OHLC for intraday stop detection (requires open/high/low)
 
         Returns:
@@ -181,22 +242,21 @@ class BacktestNamespace:
         else:
             df = df.with_columns(pl.col(position_col).fill_null(0.0))
 
-        # Validate resample parameter
-        # Supported: D, W, W-MON..W-SUN, M, MS, Q, QS, Y, None
-        supported_resample = (
-            None, "D",
-            "W", "W-MON", "W-TUE", "W-WED", "W-THU", "W-FRI", "W-SAT", "W-SUN",
-            "M", "ME", "MS",
-            "Q", "QE", "QS",
-            "Y", "YE", "A",
-        )
-        if resample not in supported_resample:
-            raise ValueError(
-                f"Unsupported resample '{resample}'. "
-                f"Supported values: {', '.join(str(s) for s in supported_resample)}"
-            )
+        _validate_resample(resample, resample_offset)
+
+        # factor column: pass column name if exists, else None (defaults to 1.0 in Rust)
+        factor_col = factor if factor in df.columns else None
+
+        # Nulls must not reach the FFI boundary (validity bitmaps are not checked there)
+        _validate_no_nulls(df, (date_col, symbol_col))
+        float_cols: list[str | None] = [price_col, position_col, factor_col]
+        if touched_exit:
+            float_cols += [open_col, high_col, low_col]
+        df = _floats_with_nan_nulls(df, float_cols)
 
         # Create config
+        # Note: the long-format engine always uses finlab-style accounting; the former
+        # `finlab_mode` parameter had no effect on this path and was removed.
         config = BacktestConfig(
             fee_ratio=fee_ratio,
             tax_ratio=tax_ratio,
@@ -206,15 +266,12 @@ class BacktestNamespace:
             position_limit=position_limit,
             retain_cost_when_rebalance=retain_cost_when_rebalance,
             stop_trading_next_period=stop_trading_next_period,
-            finlab_mode=finlab_mode,
+            finlab_mode=True,
             touched_exit=touched_exit,
         )
 
         # Check if already sorted by date
         skip_sort = df.get_column(date_col).is_sorted()
-
-        # factor column: pass column name if exists, else None (defaults to 1.0 in Rust)
-        factor_col = factor if factor in df.columns else None
 
         result = _rust_backtest(
             df,
@@ -255,10 +312,10 @@ class BacktestNamespace:
         position_limit: float = 1.0,
         retain_cost_when_rebalance: bool = False,
         stop_trading_next_period: bool = True,
-        finlab_mode: bool = True,
         touched_exit: bool = False,
         limit_up: str = "limit_up",
         limit_down: str = "limit_down",
+        trading_value: str = "trading_value",
     ) -> BacktestReport:
         """Run backtest with trade tracking, returning a BacktestReport object.
 
@@ -289,8 +346,10 @@ class BacktestNamespace:
             position_limit: Maximum weight per stock
             retain_cost_when_rebalance: Retain costs when rebalancing
             stop_trading_next_period: Stop trading after stop triggered
-            finlab_mode: Use Finlab-compatible calculation (default True for report)
             touched_exit: Use OHLC for intraday stop detection (requires open/high/low)
+            limit_up: Limit-up price column name, used by get_metrics() liquidity section
+            limit_down: Limit-down price column name, used by get_metrics() liquidity section
+            trading_value: Trading value column name, used by get_metrics() capacity metric
 
         Returns:
             BacktestReport object with creturn (list) and trades (DataFrame)
@@ -338,7 +397,21 @@ class BacktestNamespace:
         else:
             df = df.with_columns(pl.col(position_col).fill_null(0.0))
 
+        _validate_resample(resample, resample_offset)
+
+        # factor column: pass column name, Rust checks if it exists (defaults to 1.0 if not)
+        factor_col = factor if factor in df.columns else None
+
+        # Nulls must not reach the FFI boundary (validity bitmaps are not checked there)
+        _validate_no_nulls(df, (date_col, symbol_col))
+        float_cols: list[str | None] = [price_col, position_col, factor_col]
+        if touched_exit:
+            float_cols += [open_col, high_col, low_col]
+        df = _floats_with_nan_nulls(df, float_cols)
+
         # Build config
+        # Note: the long-format engine always uses finlab-style accounting; the former
+        # `finlab_mode` parameter had no effect on this path and was removed.
         config = BacktestConfig(
             fee_ratio=fee_ratio,
             tax_ratio=tax_ratio,
@@ -348,7 +421,7 @@ class BacktestNamespace:
             position_limit=position_limit,
             retain_cost_when_rebalance=retain_cost_when_rebalance,
             stop_trading_next_period=stop_trading_next_period,
-            finlab_mode=finlab_mode,
+            finlab_mode=True,
             touched_exit=touched_exit,
         )
 
@@ -388,8 +461,6 @@ class BacktestNamespace:
 
         # Use Rust backtest_with_report directly (returns BacktestReport with trades DataFrame)
         # OHLC columns are only used when touched_exit=True
-        # factor column: pass column name, Rust checks if it exists (defaults to 1.0 if not)
-        factor_col = factor if factor in df.columns else None
         return _rust_backtest_with_report(
             df,
             date_col,
@@ -407,6 +478,7 @@ class BacktestNamespace:
             benchmark_arg,
             limit_up,
             limit_down,
+            trading_value,
         )
 
 # =============================================================================
@@ -434,7 +506,6 @@ def backtest(
     position_limit: float = 1.0,
     retain_cost_when_rebalance: bool = False,
     stop_trading_next_period: bool = True,
-    finlab_mode: bool = False,
     touched_exit: bool = False,
 ) -> pl.DataFrame:
     """Run backtest on long format DataFrame.
@@ -460,7 +531,6 @@ def backtest(
         position_limit: Maximum weight per stock
         retain_cost_when_rebalance: Retain costs when rebalancing
         stop_trading_next_period: Stop trading after stop triggered
-        finlab_mode: Use Finlab-compatible calculation
         touched_exit: Use OHLC for intraday stop detection (requires open/high/low)
 
     Returns:
@@ -489,7 +559,6 @@ def backtest(
         position_limit=position_limit,
         retain_cost_when_rebalance=retain_cost_when_rebalance,
         stop_trading_next_period=stop_trading_next_period,
-        finlab_mode=finlab_mode,
         touched_exit=touched_exit,
     )
 
@@ -515,10 +584,10 @@ def backtest_with_report(
     position_limit: float = 1.0,
     retain_cost_when_rebalance: bool = False,
     stop_trading_next_period: bool = True,
-    finlab_mode: bool = True,
     touched_exit: bool = False,
     limit_up: str = "limit_up",
     limit_down: str = "limit_down",
+    trading_value: str = "trading_value",
 ) -> BacktestReport:
     """Run backtest with trade tracking on long format DataFrame.
 
@@ -549,7 +618,6 @@ def backtest_with_report(
         position_limit: Maximum weight per stock
         retain_cost_when_rebalance: Retain costs when rebalancing
         stop_trading_next_period: Stop trading after stop triggered
-        finlab_mode: Use Finlab-compatible calculation (default True for report)
         touched_exit: Use OHLC for intraday stop detection (requires open/high/low)
 
     Returns:
@@ -581,8 +649,8 @@ def backtest_with_report(
         position_limit=position_limit,
         retain_cost_when_rebalance=retain_cost_when_rebalance,
         stop_trading_next_period=stop_trading_next_period,
-        finlab_mode=finlab_mode,
         touched_exit=touched_exit,
         limit_up=limit_up,
         limit_down=limit_down,
+        trading_value=trading_value,
     )
