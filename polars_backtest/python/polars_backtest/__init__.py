@@ -35,6 +35,9 @@ if TYPE_CHECKING:
 else:
     DataFrame = pl.DataFrame
 
+# Visualization: self-contained interactive HTML report (no extra dependencies)
+from polars_backtest import viz
+
 # Wide format API (optional, for Finlab compatibility)
 from polars_backtest.wide import (
     Report,
@@ -56,6 +59,8 @@ __all__ = [
     "backtest_wide",
     "backtest_with_report_wide",
     "Report",
+    # Visualization
+    "viz",
     # Statistics expressions
     "daily_returns",
     "cumulative_returns",
