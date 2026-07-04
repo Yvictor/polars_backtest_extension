@@ -3,10 +3,9 @@
 import datetime
 import json
 
-import pytest
 import polars as pl
-
 import polars_backtest as pl_bt
+import pytest
 from polars_backtest import viz
 
 
@@ -146,30 +145,73 @@ def test_limit_flags_from_input_df(report):
 
 
 # ---------------------------------------------------------------------------
-# V2 template (FinLab-parity layout, specs/VIZ_V2_FINLAB_PARITY_SPEC.md)
+# V3 template (quant-narrative one-page scroll, no tabs)
 # ---------------------------------------------------------------------------
 
 
-def test_template_v2_sections(report):
+def test_template_v3_one_page_sections(report):
     html = viz.report_html(report)
 
-    # hero / score chips / metric row / tab bar containers
-    for marker in ('id="hero"', 'id="qchips"', 'id="mrow"', 'id="tabbar"'):
+    # six narrative sections in reading order, no tab bar
+    for marker in (
+        'id="sec-verdict"', 'id="sec-perf"', 'id="sec-structure"',
+        'id="sec-dd"', 'id="sec-live"', 'id="sec-micro"',
+    ):
         assert marker in html
-    # one panel per tab, switchable by dimension
-    for panel in ("perf", "monthly", "yearly", "trades", "dd", "dist", "liq"):
-        assert f'id="panel-{panel}"' in html
+    assert 'id="tabbar"' not in html and 'class="panel"' not in html
+    # verdict strip: hero numbers, tradability flags, collapsible quality check
+    for marker in ('id="hero"', 'id="flags"', 'id="qcheck"'):
+        assert marker in html
+    # new panels: rolling 1Y, long/short split, concentration, underwater tiles
+    for marker in (
+        'id="rolling-card"', 'id="roll-ret"', 'id="roll-sharpe"',
+        'id="ls-card"', 'id="contrib-hist"', 'id="uw-tiles"',
+        'id="lim-tiles"', 'id="cap-tiles"', 'id="cost-tiles"',
+    ):
+        assert marker in html
+    # trade microscope is a collapsed <details>
+    assert '<details class="card" id="micro">' in html
+    # params chips live in the footer now
+    assert html.index('id="chips"') > html.index('id="rpt-footer"')
 
 
-def test_template_v2_zh_labels(report):
+def test_template_v3_zh_labels(report):
     html = viz.report_html(report)
 
     for label in (
+        # section titles
+        "判決", "績效軌跡", "報酬結構", "回檔與痛苦", "實盤可行性", "交易顯微鏡",
+        # kept card titles
         "歷史績效", "月報酬", "年度比較", "交易明細", "虧損歷史", "跌幅排名",
-        "報酬分布", "模擬停損", "流動性", "漲跌停成交明細", "年度回報",
-        "最大回檔", "夏普值", "逐筆交易勝率",
+        "模擬停損", "漲跌停成交明細", "最大回檔", "夏普值",
+        # new panels
+        "滾動 1 年表現", "多空拆解", "報酬集中度", "水下時間比例",
+        "最長水下天數", "平均修復天數", "漲停依賴", "胃納量", "成本結構",
+        "年換手率", "賣在跌停",
+        # three-method capacity tiles (rendered when payload carries the keys)
+        "保守估計（min-leg 法）", "ADV 法",
     ):
         assert label in html, f"missing zh-TW label: {label}"
+
+
+def test_template_v3_flags_and_takeaways(report):
+    html = viz.report_html(report)
+
+    # tradability flag labels (多空平衡 is conditional, injected by JS)
+    for label in ("資金容量", "漲停依賴", "成本敏感", "Alpha衰減", "多空平衡"):
+        assert label in html, f"missing flag label: {label}"
+    # one takeaway anchor per narrative section
+    for marker in (
+        'id="tk-verdict"', 'id="tk-perf"', 'id="tk-structure"',
+        'id="tk-dd"', 'id="tk-live"',
+    ):
+        assert marker in html
+
+
+def test_template_v3_log_scale_default(report):
+    html = viz.report_html(report)
+
+    assert 'scale: "log"' in html
 
 
 def test_template_v2_script_syntax(report, tmp_path):

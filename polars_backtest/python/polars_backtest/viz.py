@@ -191,6 +191,50 @@ def _trades_payload(
             avg_mae=closed.get_column("mae").mean() if "mae" in closed.columns else None,
         )
 
+    if closed.height:
+        # Long/short decomposition and return-concentration statistics.
+        # Contribution proxy = return x |position| (portfolio-weighted trade P&L).
+        contrib = closed.select(
+            (pl.col("return") * pl.col("position").abs()).alias("c"),
+            (pl.col("position") >= 0).alias("is_long"),
+            pl.col("return").alias("r"),
+        )
+        total_c = contrib.get_column("c").sum() or 0.0
+        sides = {}
+        for side, flag in (("long", True), ("short", False)):
+            grp = contrib.filter(pl.col("is_long") == flag)
+            if grp.height:
+                rets_g = grp.get_column("r")
+                sides[side] = {
+                    "n": grp.height,
+                    "win_rate": (rets_g > 0).sum() / grp.height,
+                    "avg_ret": rets_g.mean(),
+                    "contrib": grp.get_column("c").sum(),
+                }
+        summary["sides"] = sides
+        if abs(total_c) > 0:
+            top = contrib.sort("c", descending=True).get_column("c")
+            summary["top10_contrib_ratio"] = top.head(10).sum() / total_c
+            summary["total_contrib"] = total_c
+
+    # Annual turnover estimate and cost drag: each entry deploys |position| of
+    # NAV; a round trip pays fee twice plus tax once (TW long convention).
+    if closed.height and "pdays" in closed.columns:
+        entered_pos = trades.filter(pl.col("entry_date").is_not_null())
+        if entered_pos.height:
+            dmin = entered_pos.get_column("entry_date").min()
+            dmax = (
+                trades.get_column("exit_date").max()
+                or entered_pos.get_column("entry_date").max()
+            )
+            years = max(((dmax - dmin).days or 1) / 365.25, 1 / 365.25)
+            turnover = (entered_pos.get_column("position").abs().sum() or 0.0) / years
+            summary["annual_turnover"] = turnover
+            fee = getattr(report, "fee_ratio", None)
+            tax = getattr(report, "tax_ratio", None)
+            if fee is not None and tax is not None:
+                summary["cost_drag_annual"] = turnover * (2 * fee + tax)
+
     if "entry_raw_price" in trades.columns:
         trades = _with_limit_flags(trades, input_df)
         entered = trades.filter(pl.col("entry_date").is_not_null())
@@ -203,6 +247,25 @@ def _trades_payload(
         if lim_x is not None and exited.height and lim_x.null_count() < exited.height:
             summary["sell_low_n"] = int(lim_x.sum() or 0)
             summary["sell_low_ratio"] = (lim_x.sum() or 0) / exited.height
+        # How much of the strategy's P&L rides on limit-up entries — the honest
+        # answer to "would this survive not getting filled at limit-up?"
+        closed_flagged = trades.filter(
+            pl.col("exit_date").is_not_null() & pl.col("return").is_not_null()
+        )
+        flags_known = (
+            closed_flagged.height
+            and closed_flagged.get_column("lim_entry").null_count() < closed_flagged.height
+        )
+        if flags_known:
+            call = closed_flagged.select(
+                (pl.col("return") * pl.col("position").abs()).alias("c"),
+                pl.col("lim_entry").fill_null(False).alias("f"),
+            )
+            tot = call.get_column("c").sum() or 0.0
+            bh = call.filter(pl.col("f")).get_column("c").sum() or 0.0
+            if abs(tot) > 0:
+                summary["buy_high_contrib"] = bh
+                summary["buy_high_contrib_ratio"] = bh / tot
 
     sampled = trades
     if total > MAX_EMBEDDED_TRADES:
@@ -295,9 +358,17 @@ def _metrics_row(report: Any) -> dict[str, Any]:
     if not hasattr(report, "get_metrics"):
         return {}
     metrics = report.get_metrics()
-    if isinstance(metrics, pl.DataFrame) and metrics.height:
-        return metrics.to_dicts()[0]
-    return {}
+    if not isinstance(metrics, pl.DataFrame) or not metrics.height:
+        return {}
+    row = metrics.to_dicts()[0]
+    # Stricter capacity estimates (min-leg / ADV-based), when the engine has them
+    if row.get("capacity") is not None and hasattr(report, "capacity"):
+        for method, key in (("min_leg", "capacityMinLeg"), ("adv", "capacityAdv")):
+            try:
+                row[key] = report.capacity(method=method)
+            except TypeError:  # older builds without the method= signature
+                row[key] = None
+    return row
 
 
 # FinLab-exact quality checks (specs/VIZ_V2_FINLAB_PARITY_SPEC.md §2-3).
