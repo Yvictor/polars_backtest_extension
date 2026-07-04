@@ -97,7 +97,81 @@ def _return_table(report: Any) -> list[dict[str, Any]]:
     return rows
 
 
-def _trades_payload(report: Any) -> tuple[dict[str, Any] | None, dict[str, Any]]:
+_LIMIT_EPS = 1e-6
+
+
+def _round4(values: list) -> list:
+    return [None if v is None else round(v, 4) for v in values]
+
+
+def _with_limit_flags(trades: pl.DataFrame, input_df: pl.DataFrame | None) -> pl.DataFrame:
+    """Flag trades that entered at limit-up / exited at limit-down (direction-aware).
+
+    Uses raw prices with the same 1e-6 relative tolerance as the engine's
+    liquidity metrics. Requires `limit_up`/`limit_down` columns in input_df;
+    missing data leaves the flags null.
+    """
+    trades = trades.with_columns(
+        pl.lit(None, dtype=pl.Boolean).alias("lim_entry"),
+        pl.lit(None, dtype=pl.Boolean).alias("lim_exit"),
+    )
+    if input_df is None:
+        return trades
+    have = {c for c in ("limit_up", "limit_down") if c in input_df.columns}
+    if not have or "date" not in input_df.columns or "symbol" not in input_df.columns:
+        return trades
+    limits = input_df.select(
+        pl.col("date").cast(pl.Date),
+        pl.col("symbol"),
+        *[pl.col(c).cast(pl.Float64) for c in sorted(have)],
+    ).unique(subset=["date", "symbol"], keep="first")
+
+    def _leg(df: pl.DataFrame, date_col: str, suffix: str) -> pl.DataFrame:
+        return df.join(
+            limits.rename({"date": date_col, "symbol": "stock_id"}),
+            on=[date_col, "stock_id"],
+            how="left",
+            suffix=suffix,
+        )
+
+    trades = _leg(trades, "entry_date", "_e")
+    trades = _leg(trades, "exit_date", "_x")
+    lu_e = "limit_up" if "limit_up" in trades.columns else None
+    ld_e = "limit_down" if "limit_down" in trades.columns else None
+    lu_x = f"{lu_e}_x" if lu_e and f"{lu_e}_x" in trades.columns else lu_e
+    ld_x = f"{ld_e}_x" if ld_e and f"{ld_e}_x" in trades.columns else ld_e
+    is_long = pl.col("position") >= 0
+    at_up = lambda px, lim: pl.col(px) >= pl.col(lim) * (1 - _LIMIT_EPS)  # noqa: E731
+    at_dn = lambda px, lim: pl.col(px) <= pl.col(lim) * (1 + _LIMIT_EPS)  # noqa: E731
+    exprs = []
+    if lu_e or ld_e:
+        # adverse entry: long buys at limit-up, short sells at limit-down
+        entry = None
+        if lu_e:
+            entry = is_long & at_up("entry_raw_price", lu_e)
+        if ld_e:
+            short_e = ~is_long & at_dn("entry_raw_price", ld_e)
+            entry = short_e if entry is None else (entry | short_e)
+        exprs.append(entry.alias("lim_entry"))
+        # adverse exit: long sells at limit-down, short covers at limit-up
+        exit_ = None
+        if ld_x:
+            exit_ = is_long & at_dn("exit_raw_price", ld_x)
+        if lu_x:
+            short_x = ~is_long & at_up("exit_raw_price", lu_x)
+            exit_ = short_x if exit_ is None else (exit_ | short_x)
+        exprs.append(exit_.alias("lim_exit"))
+    if exprs:
+        trades = trades.with_columns(exprs)
+    drop = [c for c in trades.columns if c.endswith("_x") or c in ("limit_up", "limit_down")]
+    return trades.drop([c for c in drop if c not in ("lim_entry", "lim_exit")])
+
+
+def _trades_payload(
+    report: Any,
+    input_df: pl.DataFrame | None = None,
+    symbol_names: dict[str, str] | None = None,
+) -> tuple[dict[str, Any] | None, dict[str, Any]]:
     trades = getattr(report, "trades", None)
     if not isinstance(trades, pl.DataFrame) or trades.is_empty():
         return None, {}
@@ -117,17 +191,44 @@ def _trades_payload(report: Any) -> tuple[dict[str, Any] | None, dict[str, Any]]
             avg_mae=closed.get_column("mae").mean() if "mae" in closed.columns else None,
         )
 
+    if "entry_raw_price" in trades.columns:
+        trades = _with_limit_flags(trades, input_df)
+        entered = trades.filter(pl.col("entry_date").is_not_null())
+        exited = trades.filter(pl.col("exit_date").is_not_null())
+        lim_e = entered.get_column("lim_entry") if entered.height else None
+        lim_x = exited.get_column("lim_exit") if exited.height else None
+        if lim_e is not None and lim_e.null_count() < entered.height:
+            summary["buy_high_n"] = int(lim_e.sum() or 0)
+            summary["buy_high_ratio"] = (lim_e.sum() or 0) / entered.height
+        if lim_x is not None and exited.height and lim_x.null_count() < exited.height:
+            summary["sell_low_n"] = int(lim_x.sum() or 0)
+            summary["sell_low_ratio"] = (lim_x.sum() or 0) / exited.height
+
     sampled = trades
     if total > MAX_EMBEDDED_TRADES:
         step = total / MAX_EMBEDDED_TRADES
         sampled = trades[[int(i * step) for i in range(MAX_EMBEDDED_TRADES)]]
+    def _opt(name: str, alias: str | None = None) -> pl.Expr:
+        alias = alias or name
+        if name in sampled.columns:
+            return pl.col(name).alias(alias)
+        return pl.lit(None).alias(alias)
+
     cols = sampled.select(
         pl.col("stock_id"),
         pl.col("entry_date"),
         pl.col("exit_date"),
         pl.col("return").alias("ret"),
-        pl.col("mae") if "mae" in sampled.columns else pl.lit(None).alias("mae"),
-        pl.col("pdays") if "pdays" in sampled.columns else pl.lit(None).alias("pdays"),
+        _opt("mae"),
+        _opt("pdays"),
+        _opt("position", "pos"),
+        _opt("entry_raw_price", "entry_px"),
+        _opt("exit_raw_price", "exit_px"),
+        _opt("gmfe"),
+        _opt("bmfe"),
+        _opt("mdd"),
+        _opt("lim_entry"),
+        _opt("lim_exit"),
     )
     payload = {
         "stock": cols.get_column("stock_id").to_list(),
@@ -136,10 +237,153 @@ def _trades_payload(report: Any) -> tuple[dict[str, Any] | None, dict[str, Any]]
         "ret": cols.get_column("ret").to_list(),
         "mae": cols.get_column("mae").to_list(),
         "pdays": cols.get_column("pdays").to_list(),
+        "pos": cols.get_column("pos").to_list(),
+        "entry_px": _round4(cols.get_column("entry_px").to_list()),
+        "exit_px": _round4(cols.get_column("exit_px").to_list()),
+        "gmfe": cols.get_column("gmfe").to_list(),
+        "bmfe": cols.get_column("bmfe").to_list(),
+        "mdd": cols.get_column("mdd").to_list(),
+        "lim_entry": cols.get_column("lim_entry").to_list(),
+        "lim_exit": cols.get_column("lim_exit").to_list(),
         "sampled": total > MAX_EMBEDDED_TRADES,
         "total": total,
     }
+    if symbol_names:
+        payload["name"] = [symbol_names.get(sym) for sym in payload["stock"]]
     return payload, summary
+
+
+def _drawdown_episodes(
+    dates: list, creturn: list[float], top_n: int = 10
+) -> list[dict[str, Any]]:
+    """Extract drawdown episodes (peak -> trough -> recovery), deepest first."""
+    episodes: list[dict[str, Any]] = []
+    if not creturn:
+        return episodes
+    peak = creturn[0]
+    peak_date = dates[0]
+    cur: dict[str, Any] | None = None
+    for d, v in zip(dates, creturn):
+        if v is None:
+            continue
+        if v >= peak:
+            if cur is not None:
+                cur["end"] = d
+                episodes.append(cur)
+                cur = None
+            peak = v
+            peak_date = d
+        else:
+            dd = v / peak - 1
+            if cur is None:
+                cur = {"start": peak_date, "trough": d, "depth": dd, "end": None}
+            elif dd < cur["depth"]:
+                cur["depth"] = dd
+                cur["trough"] = d
+    if cur is not None:
+        episodes.append(cur)  # ongoing, end stays None
+    last = dates[-1]
+    for ep in episodes:
+        end = ep["end"] or last
+        ep["days"] = (end - ep["start"]).days
+        ep["recovery_days"] = (ep["end"] - ep["trough"]).days if ep["end"] else None
+    episodes.sort(key=lambda e: e["depth"])
+    return episodes[:top_n]
+
+
+def _metrics_row(report: Any) -> dict[str, Any]:
+    if not hasattr(report, "get_metrics"):
+        return {}
+    metrics = report.get_metrics()
+    if isinstance(metrics, pl.DataFrame) and metrics.height:
+        return metrics.to_dicts()[0]
+    return {}
+
+
+# FinLab-exact quality checks (specs/VIZ_V2_FINLAB_PARITY_SPEC.md §2-3).
+# Tuple: (metrics key, zh label, predicate, threshold caption, format, weight).
+# Score = round(100 * passed_weight / total_weight); a check whose value is
+# missing/non-finite is dropped from the denominator ("corrected" mode — FinLab
+# itself fails missing values, which we consider a data gap, not a strategy flaw).
+_QUALITY_CHECKS: dict[str, list[tuple]] = {
+    "profitability": [
+        ("annualReturn", "年度回報", lambda v: v > 0.15, "需 ≥ 15%", "pct", 1),
+        ("alpha", "Alpha", lambda v: v > 0.10, "需 ≥ 10%", "pct", 1),
+        ("beta", "Beta", lambda v: 0 < v < 0.8, "需介於 0–0.8", "num", 1),
+        ("avgNStock", "平均持有", lambda v: v >= 5, "需 ≥ 5 檔", "int", 1),
+        ("maxNStock", "最多持有", lambda v: v <= 20, "需 ≤ 20 檔", "int", 1),
+    ],
+    "risk": [
+        ("maxDrawdown", "最大回檔", lambda v: v > -0.30, "需 < 30%", "pct", 1),
+        ("avgDrawdown", "平均回檔幅度", lambda v: v > -0.10, "需 < 10%", "pct", 1),
+        ("avgDrawdownDays", "平均回檔時間", lambda v: v < 40, "需 < 40 天", "days", 1),
+        ("volatility", "波動性", lambda v: v < 0.20, "需 < 20%", "pct", 1),
+        ("valueAtRisk", "Value at Risk", lambda v: v > -0.07, "需 < 7%", "pct", 1),
+        ("cvalueAtRisk", "Conditional VaR", lambda v: v > -0.10, "需 < 10%", "pct", 1),
+    ],
+    "ratio": [
+        ("sharpeRatio", "夏普值", lambda v: v > 1.3, "需 > 1.3", "num", 1),
+        ("sortinoRatio", "Sortino Ratio", lambda v: v > 1.8, "需 > 1.8", "num", 1),
+        ("calmarRatio", "Calmar Ratio", lambda v: v > 0.9, "需 > 0.9", "num", 1),
+        ("profitFactor", "Profit Factor", lambda v: v > 1.5, "需 > 1.5", "num", 1),
+        ("tailRatio", "Tail Ratio", lambda v: v > 1.0, "需 > 1", "num", 1),
+    ],
+    "winrate": [
+        ("winRate", "逐筆交易勝率", lambda v: v > 0.55, "需 ≥ 55%", "pct", 1),
+        ("m12WinRate", "12個月勝大盤", lambda v: v > 0.70, "需 ≥ 70%", "pct", 1),
+        ("expectancy", "期望值", lambda v: v > 0.02, "需 ≥ 2%", "pct", 1),
+        ("mae", "最大不利偏移", lambda v: v > -0.10, "需 < 10%", "pct", 1),
+        ("mfe", "最大有利偏移", lambda v: v > 0.10, "需 ≥ 10%", "pct", 1),
+    ],
+    "liquidity": [
+        ("capacity", "胃納量", lambda v: v > 500_000, "需 > 50 萬", "wan", 11),
+        ("buyHigh", "買在漲停", lambda v: v < 0.05, "需 < 5%", "pct", 1),
+        ("sellLow", "賣在跌停", lambda v: v < 0.05, "需 < 5%", "pct", 1),
+        ("disposalStockRatio", "處置股", lambda v: v < 0.05, "需 < 5%", "pct", 1),
+        ("warningStockRatio", "警示股", lambda v: v < 0.05, "需 < 5%", "pct", 1),
+        ("fullDeliveryStockRatio", "全額交割股", lambda v: v < 0.05, "需 < 5%", "pct", 1),
+    ],
+}
+
+_QUALITY_LABELS = {
+    "profitability": "獲利",
+    "risk": "風險",
+    "ratio": "報酬比",
+    "winrate": "勝率",
+    "liquidity": "流動性",
+}
+
+
+def _quality(metrics: dict[str, Any]) -> dict[str, Any]:
+    """Evaluate the FinLab quality checks and 0-100 dimension scores."""
+
+    def _num(v: Any) -> float | None:
+        if isinstance(v, (int, float)) and math.isfinite(v):
+            return float(v)
+        return None
+
+    out: dict[str, Any] = {}
+    for dim, checks in _QUALITY_CHECKS.items():
+        results = []
+        passed_w = total_w = 0
+        for key, label, pred, caption, fmt, weight in checks:
+            value = _num(metrics.get(key))
+            ok: bool | None = None
+            if value is not None:
+                ok = bool(pred(value))
+                total_w += weight
+                if ok:
+                    passed_w += weight
+            results.append({
+                "key": key, "label": label, "value": value,
+                "pass": ok, "caption": caption, "fmt": fmt,
+            })
+        out[dim] = {
+            "label": _QUALITY_LABELS[dim],
+            "score": round(100 * passed_w / total_w) if total_w else None,
+            "checks": results,
+        }
+    return out
 
 
 def _param_chips(report: Any) -> list[str]:
@@ -208,14 +452,33 @@ def _stat_groups(
     return [perf, ratios, trades]
 
 
-def report_data(report: Any, *, title: str = "Backtest Report") -> dict[str, Any]:
+def report_data(
+    report: Any,
+    *,
+    title: str = "Backtest Report",
+    input_df: pl.DataFrame | None = None,
+    symbol_names: dict[str, str] | None = None,
+) -> dict[str, Any]:
     """Extract a JSON-serializable payload from a report object.
 
     Works with both the long-format ``BacktestReport`` and the wide-format
     ``Report`` (anything exposing ``creturn``/``stats``; other sections are
     included when available). This payload is also the data contract for
-    external dashboards/services.
+    external dashboards/services (``schema`` versions it).
+
+    Args:
+        input_df: the backtest input frame; when it carries ``limit_up``/
+            ``limit_down`` columns, per-trade limit-hit flags (漲停買不到 /
+            跌停賣不掉) are derived from it.
+        symbol_names: optional ``{symbol: display name}`` mapping for the
+            trade table.
+
+    Note: ``stat_groups`` contains pre-formatted display strings for the
+    embedded template and is NOT part of the stable contract — external
+    consumers should format from ``stats``/``metrics`` themselves.
     """
+    from polars_backtest._polars_backtest import __version__
+
     curve = _daily_curve(report)
     stats = _stats_row(report)
     monthly: dict[str, Any] = {}
@@ -223,30 +486,60 @@ def report_data(report: Any, *, title: str = "Backtest Report") -> dict[str, Any
         monthly_df = report.get_monthly_stats()
         if isinstance(monthly_df, pl.DataFrame) and monthly_df.height:
             monthly = monthly_df.to_dicts()[0]
-    trades, trade_summary = _trades_payload(report)
+    trades, trade_summary = _trades_payload(report, input_df, symbol_names)
+
+    dates = curve.get_column("date").to_list()
+    creturn = curve.get_column("creturn").to_list()
+    benchmark = _benchmark_series(report, curve)
+    bench_episodes = None
+    if benchmark is not None:
+        pairs = [(d, v) for d, v in zip(dates, benchmark) if v is not None]
+        if pairs:
+            bench_episodes = _drawdown_episodes([p[0] for p in pairs], [p[1] for p in pairs])
+
+    quality_metrics = dict(payload_metrics := _metrics_row(report))
+    # limit-hit ratios derived from input_df fill in for missing engine metrics
+    if quality_metrics.get("buyHigh") is None and "buy_high_ratio" in trade_summary:
+        quality_metrics["buyHigh"] = trade_summary["buy_high_ratio"]
+    if quality_metrics.get("sellLow") is None and "sell_low_ratio" in trade_summary:
+        quality_metrics["sellLow"] = trade_summary["sell_low_ratio"]
 
     payload = {
+        "schema": 3,
+        "version": str(__version__),
         "title": title,
         "params": _param_chips(report),
         "stats": stats,
+        "metrics": payload_metrics,
+        "quality": _quality(quality_metrics),
         "trade_summary": trade_summary,
         "daily": {
-            "dates": curve.get_column("date").to_list(),
-            "creturn": curve.get_column("creturn").to_list(),
-            "benchmark": _benchmark_series(report, curve),
+            "dates": dates,
+            "creturn": creturn,
+            "benchmark": benchmark,
+            # multi-strategy-ready shape; "creturn" above is the compat alias
+            "series": [{"name": "strategy", "creturn": creturn}],
         },
         "return_table": _return_table(report),
+        "dd_episodes": _drawdown_episodes(dates, creturn),
+        "benchmark_dd_episodes": bench_episodes,
         "trades": trades,
         "stat_groups": _stat_groups(stats, monthly, trade_summary),
     }
     return _clean(payload)
 
 
-def report_html(report: Any, *, title: str = "Backtest Report") -> str:
+def report_html(
+    report: Any,
+    *,
+    title: str = "Backtest Report",
+    input_df: pl.DataFrame | None = None,
+    symbol_names: dict[str, str] | None = None,
+) -> str:
     """Render a report to a self-contained HTML string."""
     from polars_backtest._polars_backtest import __version__
 
-    payload = report_data(report, title=title)
+    payload = report_data(report, title=title, input_df=input_df, symbol_names=symbol_names)
     return (
         TEMPLATE.replace("__TITLE__", _escape(title))
         .replace("__VERSION__", str(__version__))
@@ -254,16 +547,33 @@ def report_html(report: Any, *, title: str = "Backtest Report") -> str:
     )
 
 
-def save_html(report: Any, path: str | Path, *, title: str = "Backtest Report") -> Path:
+def save_html(
+    report: Any,
+    path: str | Path,
+    *,
+    title: str = "Backtest Report",
+    input_df: pl.DataFrame | None = None,
+    symbol_names: dict[str, str] | None = None,
+) -> Path:
     """Render a report and write it to ``path``. Returns the written path."""
     out = Path(path)
-    out.write_text(report_html(report, title=title), encoding="utf-8")
+    out.write_text(
+        report_html(report, title=title, input_df=input_df, symbol_names=symbol_names),
+        encoding="utf-8",
+    )
     return out
 
 
-def show(report: Any, *, title: str = "Backtest Report", height: int = 1400) -> None:
+def show(
+    report: Any,
+    *,
+    title: str = "Backtest Report",
+    height: int = 1400,
+    input_df: pl.DataFrame | None = None,
+    symbol_names: dict[str, str] | None = None,
+) -> None:
     """Display the report: inline iframe in notebooks, browser tab otherwise."""
-    html = report_html(report, title=title)
+    html = report_html(report, title=title, input_df=input_df, symbol_names=symbol_names)
     try:  # notebook path
         import IPython
         from IPython.display import HTML, display
