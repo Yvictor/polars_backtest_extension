@@ -83,7 +83,7 @@ method="finlab" | "min_leg" | "adv")`:
 ### dalpha data wiring
 | backtest column | source | note |
 |---|---|---|
-| `trading_value` | `txn_value` (TwStkPriceDaily.txnValue) | TWD 元; pass `trading_value="txn_value"` |
+| `trading_value` | `txn_value` (TwStkPriceDaily.txnValue) | **千元 — multiply by 1000 before passing** (verified 2026-07-05 vs close×volume); capacity expects TWD 元 |
 | `limit_up`/`limit_down` | **TwStkRefPrice.upPrice/dnPrice** (same-day, exact incl. ex-div) | extend `load_ref_price`; keep raw, keep `factor` column in input |
 | alt | `oNextUp`/`oNextDn` shifted +1 trading day | fallback |
 | 處置股 flag | not in catalog | future data source |
