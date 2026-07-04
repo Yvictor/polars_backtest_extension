@@ -53,30 +53,27 @@ pub fn sharpe_ratio(returns: &[f64], rf: f64, annualize: f64) -> f64 {
 /// # Returns
 /// Annualized Sortino ratio
 pub fn sortino_ratio(returns: &[f64], rf: f64, annualize: f64) -> f64 {
-    if returns.is_empty() {
+    // ffn-style definition, matching report.rs `daily_sortino`:
+    // mean(excess) / std_ddof1(min(excess, 0) over ALL observations) * sqrt(annualize)
+    let n = returns.len() as f64;
+    if n < 2.0 {
         return 0.0;
     }
 
-    let n = returns.len() as f64;
-    let mean: f64 = returns.iter().sum::<f64>() / n;
     let daily_rf = rf / annualize;
+    let excess: Vec<f64> = returns.iter().map(|r| r - daily_rf).collect();
+    let mean: f64 = excess.iter().sum::<f64>() / n;
 
-    // Only consider returns below the risk-free rate
-    let downside_returns: Vec<f64> = returns
-        .iter()
-        .filter(|&&r| r < daily_rf)
-        .map(|&r| (r - daily_rf).powi(2))
-        .collect();
-
-    if downside_returns.is_empty() {
-        return f64::INFINITY; // No downside risk
-    }
-
-    let downside_variance: f64 = downside_returns.iter().sum::<f64>() / n;
+    let clamped: Vec<f64> = excess.iter().map(|e| e.min(0.0)).collect();
+    let clamped_mean: f64 = clamped.iter().sum::<f64>() / n;
+    let downside_variance: f64 =
+        clamped.iter().map(|c| (c - clamped_mean).powi(2)).sum::<f64>() / (n - 1.0);
     let downside_std = downside_variance.sqrt();
 
     if downside_std > 0.0 {
-        (mean - daily_rf) / downside_std * annualize.sqrt()
+        mean / downside_std * annualize.sqrt()
+    } else if mean > 0.0 {
+        f64::INFINITY // No downside risk
     } else {
         0.0
     }
@@ -275,6 +272,17 @@ mod tests {
         let cagr = calc_cagr(1.0, 2.0, 5.0);
         let expected = 2.0_f64.powf(1.0 / 5.0) - 1.0;
         assert!((cagr - expected).abs() < 1e-10);
+    }
+
+    #[test]
+    fn test_sortino_ratio_matches_report_definition() {
+        // returns [0.10, -0.05], rf=0:
+        //   excess mean = 0.025
+        //   clamped = [0, -0.05], clamped mean = -0.025
+        //   var(ddof=1) = (0.025^2 + 0.025^2) / 1 = 0.00125, std = 0.03535534
+        //   sortino = 0.025 / 0.03535534 * sqrt(252) = 11.22497
+        let sortino = sortino_ratio(&[0.10, -0.05], 0.0, 252.0);
+        assert!((sortino - 11.224972160321824).abs() < 1e-9, "got {}", sortino);
     }
 
     #[test]

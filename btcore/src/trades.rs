@@ -166,7 +166,15 @@ impl TradeBook {
             0.0
         };
 
-        let profit_factor = if avg_loss.abs() > 0.0 {
+        // profit_factor = gross wins / gross losses (sum-based, matching
+        // report.rs and finlab/ffn). The avg-based ratio is the payoff ratio.
+        let loss_sum: f64 = losses.iter().sum::<f64>();
+        let profit_factor = if loss_sum.abs() > 0.0 {
+            wins.iter().sum::<f64>() / loss_sum.abs()
+        } else {
+            f64::INFINITY
+        };
+        let payoff_ratio = if avg_loss.abs() > 0.0 {
             avg_win / avg_loss.abs()
         } else {
             f64::INFINITY
@@ -191,6 +199,7 @@ impl TradeBook {
             avg_win,
             avg_loss,
             profit_factor,
+            payoff_ratio,
             avg_holding_days,
         }
     }
@@ -205,13 +214,37 @@ pub struct TradeStats {
     pub win_rate: f64,
     pub avg_win: f64,
     pub avg_loss: f64,
+    /// Gross wins / gross losses (sum-based)
     pub profit_factor: f64,
+    /// Average win / average loss (avg-based)
+    pub payoff_ratio: f64,
     pub avg_holding_days: f64,
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_profit_factor_is_sum_based() {
+        // wins: +10%, +30% (sum 0.4); losses: -20% (sum 0.2)
+        // profit_factor = 0.4 / 0.2 = 2.0
+        // payoff_ratio = avg_win 0.2 / avg_loss 0.2 = 1.0
+        let mut book = TradeBook::new(0.0, 0.0);
+        let d0 = NaiveDate::from_ymd_opt(2024, 1, 1).unwrap();
+        let d1 = NaiveDate::from_ymd_opt(2024, 1, 10).unwrap();
+        for (i, (entry, exit)) in [(100.0, 110.0), (100.0, 130.0), (100.0, 80.0)]
+            .iter()
+            .enumerate()
+        {
+            let sym = format!("S{}", i);
+            book.open_trade(sym.clone(), d0, *entry, 1.0, TradeSide::Long);
+            book.close_trade(&sym, d1, *exit);
+        }
+        let stats = book.stats();
+        assert!((stats.profit_factor - 2.0).abs() < 1e-10, "pf {}", stats.profit_factor);
+        assert!((stats.payoff_ratio - 1.0).abs() < 1e-10, "payoff {}", stats.payoff_ratio);
+    }
 
     fn date(year: i32, month: u32, day: u32) -> NaiveDate {
         NaiveDate::from_ymd_opt(year, month, day).unwrap()
