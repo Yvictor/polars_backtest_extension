@@ -33,6 +33,22 @@ df = pl.DataFrame({
 result = df.bt.backtest(trade_at_price="close", position="weight")
 ```
 
+## Visualization
+
+Interactive, self-contained HTML report — no extra dependencies, works offline:
+
+```python
+report = df.bt.backtest_with_report(position="weight", resample="M")
+
+pl_bt.viz.show(report)                      # browser tab, or inline in notebooks
+pl_bt.viz.save_html(report, "report.html")  # standalone shareable file
+pl_bt.viz.report_data(report)               # JSON-safe payload for custom dashboards
+```
+
+Includes equity curve (benchmark overlay, log scale, range presets), drawdown,
+monthly return heatmap, trade return distribution, MAE scatter, and full stats.
+Light/dark mode follows the system.
+
 ## Performance
 
 **300-day breakout strategy** (~2000 stocks, 17 years daily data, 12M rows):

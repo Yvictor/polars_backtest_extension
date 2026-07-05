@@ -535,7 +535,7 @@ fn backtest(
     skip_sort: bool,
 ) -> PyResult<PyBacktestResult> {
     use fastant::Instant;
-    use polars_arrow::array::{PrimitiveArray, Utf8ViewArray};
+    use polars_arrow::array::{Array, PrimitiveArray, Utf8ViewArray};
 
     let total_start = Instant::now();
     let mut step_start = Instant::now();
@@ -678,6 +678,26 @@ fn backtest(
         .downcast_ref::<Utf8ViewArray>()
         .ok_or_else(|| PyValueError::new_err("Failed to downcast symbol array"))?;
 
+    // Validity bitmaps are not consulted past this point, so null slots would be
+    // read as undefined buffer bytes — reject them here.
+    if dates_arrow.null_count() > 0 {
+        return Err(PyValueError::new_err(
+            "date column contains null values; drop or fill them before backtesting",
+        ));
+    }
+    if symbols_arrow.null_count() > 0 {
+        return Err(PyValueError::new_err(
+            "symbol column contains null values; drop or fill them before backtesting",
+        ));
+    }
+    // skip_sort callers promise date-sorted data; unsorted input silently corrupts
+    // day grouping, so verify the promise.
+    if skip_sort && dates_arrow.values().windows(2).any(|w| w[0] > w[1]) {
+        return Err(PyValueError::new_err(
+            "skip_sort=true but the date column is not sorted in ascending order",
+        ));
+    }
+
     let prices_arrow = price_chunks[0]
         .as_any()
         .downcast_ref::<PrimitiveArray<f64>>()
@@ -787,7 +807,21 @@ fn backtest(
 
     // Parse resample frequency and offset
     let resample_freq = ResampleFreq::from_str(resample);
-    let offset = ResampleOffset::from_str(resample_offset);
+    // from_str returns None for anything it cannot parse (e.g. negative offsets like
+    // "-1D") — erroring beats silently rebalancing on unshifted boundaries.
+    let offset = match resample_offset {
+        Some(raw) => match ResampleOffset::from_str(resample_offset) {
+            Some(parsed) => Some(parsed),
+            None => {
+                return Err(PyValueError::new_err(format!(
+                    "Unsupported resample_offset '{}': only non-negative day/week \
+offsets such as '5D' or '1W' are supported",
+                    raw
+                )))
+            }
+        },
+        None => None,
+    };
 
     // Build arrow input for btcore
     let input = LongFormatArrowInput {
@@ -931,7 +965,7 @@ fn backtest_with_report(
     limit_down: &str,
     trading_value: &str,
 ) -> PyResult<PyBacktestReport> {
-    use polars_arrow::array::{PrimitiveArray, Utf8ViewArray};
+    use polars_arrow::array::{Array, PrimitiveArray, Utf8ViewArray};
 
     let df = df.0;
     let n_rows = df.height();
@@ -1062,6 +1096,26 @@ fn backtest_with_report(
         .downcast_ref::<Utf8ViewArray>()
         .ok_or_else(|| PyValueError::new_err("Failed to downcast symbol array"))?;
 
+    // Validity bitmaps are not consulted past this point, so null slots would be
+    // read as undefined buffer bytes — reject them here.
+    if dates_arrow.null_count() > 0 {
+        return Err(PyValueError::new_err(
+            "date column contains null values; drop or fill them before backtesting",
+        ));
+    }
+    if symbols_arrow.null_count() > 0 {
+        return Err(PyValueError::new_err(
+            "symbol column contains null values; drop or fill them before backtesting",
+        ));
+    }
+    // skip_sort callers promise date-sorted data; unsorted input silently corrupts
+    // day grouping, so verify the promise.
+    if skip_sort && dates_arrow.values().windows(2).any(|w| w[0] > w[1]) {
+        return Err(PyValueError::new_err(
+            "skip_sort=true but the date column is not sorted in ascending order",
+        ));
+    }
+
     let prices_arrow = price_chunks[0]
         .as_any()
         .downcast_ref::<PrimitiveArray<f64>>()
@@ -1159,7 +1213,21 @@ fn backtest_with_report(
 
     // Parse resample frequency and offset
     let resample_freq = ResampleFreq::from_str(resample);
-    let offset = ResampleOffset::from_str(resample_offset);
+    // from_str returns None for anything it cannot parse (e.g. negative offsets like
+    // "-1D") — erroring beats silently rebalancing on unshifted boundaries.
+    let offset = match resample_offset {
+        Some(raw) => match ResampleOffset::from_str(resample_offset) {
+            Some(parsed) => Some(parsed),
+            None => {
+                return Err(PyValueError::new_err(format!(
+                    "Unsupported resample_offset '{}': only non-negative day/week \
+offsets such as '5D' or '1W' are supported",
+                    raw
+                )))
+            }
+        },
+        None => None,
+    };
 
     // Build arrow input for btcore
     let input = LongFormatArrowInput {
@@ -1228,7 +1296,11 @@ fn backtest_with_report(
             if has_limit_down {
                 select_cols.push(col(limit_down).alias("limit_down"));
             }
-            Some(df.clone().lazy().select(select_cols).collect()
+            // Dedup: duplicate (date, symbol) rows would multiply trades in the
+            // liquidity-metric joins and silently skew buyHigh/sellLow/capacity
+            Some(df.clone().lazy().select(select_cols)
+                .unique(Some(cols(["date", "symbol"])), UniqueKeepStrategy::First)
+                .collect()
                 .map_err(|e| PyValueError::new_err(format!("Failed to extract limit prices: {}", e)))?)
         } else {
             None
@@ -1241,7 +1313,9 @@ fn backtest_with_report(
             col(date).alias("date"),
             col(symbol).alias("symbol"),
             col(trading_value).alias("trading_value"),
-        ]).collect()
+        ])
+            .unique(Some(cols(["date", "symbol"])), UniqueKeepStrategy::First)
+            .collect()
             .map_err(|e| PyValueError::new_err(format!("Failed to extract trading value: {}", e)))?)
     } else {
         None
@@ -1494,6 +1568,10 @@ fn df_to_f64_2d(df: &DataFrame) -> Result<Vec<Vec<f64>>, String> {
 
 #[pymodule]
 fn _polars_backtest(m: &Bound<'_, PyModule>) -> PyResult<()> {
+    // The zero-copy FFI path transmutes between polars-arrow and arrow-rs C-ABI
+    // structs; verify layout compatibility once instead of assuming it forever.
+    ffi_convert::verify_ffi_compatibility()
+        .map_err(|e| PyValueError::new_err(format!("Arrow FFI incompatibility: {}", e)))?;
     m.add("__version__", env!("CARGO_PKG_VERSION"))?;
     // Config
     m.add_class::<PyBacktestConfig>()?;

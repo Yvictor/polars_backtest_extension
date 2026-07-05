@@ -14,8 +14,8 @@
 | Parameter | Finlab Default | Notes |
 |-----------|----------------|-------|
 | `position` | (required) | Position signals/weights |
-| `resample` | None | D/W/M/Q/Y, W-FRI, W-MON, MS, QS |
-| `resample_offset` | None | e.g., '1D', '-1D' |
+| `resample` | None | D/W/M/Q/Y, W-FRI, W-MON. Long format rejects MS/QS (no start-of-period boundaries in the engine; they used to be silently treated as M/Q) |
+| `resample_offset` | None | Long format: non-negative only, e.g. '1D', '1W' — '-1D' raises ValueError (used to be silently ignored). Wide format supports negative offsets |
 | `trade_at_price` | 'close' | Trading execution price |
 | `position_limit` | 1.0 | Max weight per stock |
 | `fee_ratio` | 0.001425 | Transaction fee |

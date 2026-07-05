@@ -4,7 +4,7 @@ build-backend = "maturin"
 
 [project]
 name = "polars_backtest"
-version = "0.1.6"
+version = "0.1.7"
 description = "Polars extension for portfolio backtesting"
 readme = "README.md"
 license = { text = "PolyForm Noncommercial 1.0.0" }
@@ -27,7 +27,10 @@ classifiers = [
 keywords = ["polars", "backtest", "trading", "finance", "quantitative"]
 dependencies = [
     "polars>=1.0.0",
-    "pyarrow>=21.0.0",
+    # pyo3-polars converts DataFrames via Series.to_arrow(), which requires
+    # pyarrow at runtime — this is a real dependency even though nothing
+    # imports it directly.
+    "pyarrow>=15.0.0",
 ]
 
 [project.optional-dependencies]
@@ -68,5 +71,4 @@ dev = [
     "patchelf>=0.17.2.4; sys_platform == 'linux'",
     "pytest>=8.4.2",
     "ruff>=0.14.10",
-    "yfinance>=1.0",
 ]

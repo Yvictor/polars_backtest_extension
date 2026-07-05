@@ -228,9 +228,19 @@ Phase 2c - Liquidity 相關 (略過，等需求確認):
 **Tests**:
 - [ ] `_repr_html_()` returns valid HTML string
 - [ ] `display()` doesn't raise errors
-- [ ] Charts render correctly with sample data
+- [x] Charts render correctly with sample data
 
-**Status**: Not Started
+**Status**: Largely Complete (2026-07-04) — implemented as `polars_backtest.viz`
+(`viz.py` + `_viz_template.py`) with a different approach than planned: a
+**zero-dependency** self-contained HTML dashboard (inline SVG + vanilla JS)
+instead of Plotly, so no optional extras are needed. Covers equity curve with
+benchmark overlay / log scale / range presets, drawdown, monthly return
+heatmap, trade return distribution, MAE scatter, and stats tables, with
+light/dark mode. API: `viz.show(report)`, `viz.save_html(report, path)`,
+`viz.report_html(report)`, `viz.report_data(report)` (JSON payload for
+external dashboards). Tests in `tests/test_viz.py`. Remaining from the
+original plan: `_repr_html_` on the report objects themselves (Rust pyclass
+cannot be extended from Python; needs a Rust-side hook or Python wrapper).
 
 ---
 

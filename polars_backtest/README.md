@@ -50,6 +50,20 @@ BacktestReport(
 )
 ```
 
+### Visualization
+
+Interactive, self-contained HTML report — no extra dependencies, works offline:
+
+```python
+pl_bt.viz.show(report)                      # browser tab, or inline in notebooks
+pl_bt.viz.save_html(report, "report.html")  # standalone shareable file
+pl_bt.viz.report_data(report)               # JSON-safe payload for custom dashboards
+```
+
+Includes equity curve (benchmark overlay, log scale, range presets), drawdown,
+monthly return heatmap, trade return distribution, MAE scatter, and full stats.
+Light/dark mode follows the system.
+
 ```python
 report.get_stats()  # or report.stats
 ```
