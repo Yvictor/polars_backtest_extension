@@ -270,3 +270,17 @@ def test_template_v2_script_syntax(report, tmp_path):
     js = tmp_path / "viz.js"
     js.write_text("\n".join(scripts), encoding="utf-8")
     subprocess.run([node, "--check", str(js)], check=True)
+
+
+def test_html_from_payload_matches_report_html(report):
+    payload = viz.report_data(report, title="T1")
+    a = viz.html_from_payload(payload, title="T1")
+    b = viz.report_html(report, title="T1")
+    assert a == b
+
+
+def test_trade_rows_carry_index_for_kline_bridge(report):
+    """Embedded hosts identify clicked trades via data-i row attributes."""
+    html = viz.report_html(report)
+    assert 'data-i="' in html  # row template
+    assert "pbt-kline" in html  # postMessage bridge for iframe embedding

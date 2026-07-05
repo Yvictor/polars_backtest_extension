@@ -654,8 +654,6 @@ def report_html(
     fill_scenarios: list[dict[str, Any]] | None = None,
 ) -> str:
     """Render a report to a self-contained HTML string."""
-    from polars_backtest._polars_backtest import __version__
-
     payload = report_data(
         report,
         title=title,
@@ -663,6 +661,14 @@ def report_html(
         symbol_names=symbol_names,
         fill_scenarios=fill_scenarios,
     )
+    return html_from_payload(payload, title=title)
+
+
+def html_from_payload(payload: dict, *, title: str = "Backtest Report") -> str:
+    """Render the self-contained HTML page from an existing ``report_data()``
+    payload (e.g. one stored by a service and rendered on demand later)."""
+    from polars_backtest._polars_backtest import __version__
+
     # "<" must not appear raw inside the <script> block: "</script>" in any
     # payload string (title, symbol names, ...) would terminate the element at
     # HTML-parse time. \u003c is the JSON-native escape; ensure_ascii already

@@ -1650,13 +1650,31 @@ function renderTradesPanel() {
     const px = (v) => v == null ? "" : '<div class="tsub">$' + v + "</div>";
     const exitCell = T.exit[i] ? T.exit[i] + px(T.exit_px[i]) : '<span class="tsub">持有中</span>';
     const flags = flagBadges(T, i);
-    html += "<tr><td>" + esc(T.stock[i]) + name + "</td><td>" + ret + "</td>"
+    html += '<tr data-i="' + i + '"><td>' + esc(T.stock[i]) + name + "</td><td>" + ret + "</td>"
       + "<td>" + (T.entry[i] || "–") + px(T.entry_px[i]) + "</td><td>" + exitCell + "</td>"
       + "<td>" + fmtPct(T.pos[i], 1) + "</td>"
       + '<td><span class="tsub">MAE ' + fmtPct(T.mae[i], 1) + " · GMFE " + fmtPct(T.gmfe[i], 1) + "</span></td>"
       + "<td>" + flags + "</td></tr>";
   }
   $("ttable-wrap").innerHTML = html + "</tbody></table>";
+  // embedded host (e.g. the btx service) gets row-click events for K-line drill-down
+  if (window.parent !== window) {
+    $("ttable-wrap").querySelectorAll("tbody tr[data-i]").forEach(tr => {
+      tr.style.cursor = "pointer";
+      tr.addEventListener("click", () => {
+        const i = +tr.dataset.i;
+        window.parent.postMessage({
+          type: "pbt-kline",
+          symbol: T.stock[i],
+          name: (T.name && T.name[i]) || null,
+          entry: T.entry[i] || null,
+          exit: T.exit[i] || null,
+          entry_px: T.entry_px[i] == null ? null : T.entry_px[i],
+          exit_px: T.exit_px[i] == null ? null : T.exit_px[i],
+        }, "*");
+      });
+    });
+  }
   $("ttable-wrap").querySelectorAll("th.sortable").forEach(th => th.addEventListener("click", () => {
     const k = th.dataset.s;
     if (state.tsort === k) state.tdir = -state.tdir; else { state.tsort = k; state.tdir = -1; }
