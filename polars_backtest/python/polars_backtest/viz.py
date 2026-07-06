@@ -180,6 +180,68 @@ def _with_limit_kinds(trades: pl.DataFrame, input_df: pl.DataFrame | None) -> pl
     return classify_limit_trades(trades, input_df)
 
 
+def _merge_rolled_trades(trades: pl.DataFrame) -> pl.DataFrame:
+    """Collapse per-rebalance rolled segments into round-trip trades.
+
+    The engine re-targets every held position on each rebalance date, so
+    ``report.trades`` contains one segment per (position, rebalance period) —
+    an event-driven strategy that holds through daily rebalances produces
+    millions of 1-day segments. A round trip chains segments of the same
+    stock where each segment's entry_date equals the previous segment's
+    exit_date (the roll). Returns compound exactly across the chain; path
+    stats (mae/gmfe/bmfe/mdd) are reconstructed on the segment envelope
+    (exact at segment boundaries).
+    """
+    needed = {"stock_id", "entry_date", "exit_date", "return"}
+    if trades.is_empty() or not needed <= set(trades.columns):
+        return trades
+    entered = trades.filter(pl.col("entry_date").is_not_null())
+    pending = trades.filter(pl.col("entry_date").is_null())
+    if entered.is_empty():
+        return trades
+
+    t = entered.sort("stock_id", "entry_date")
+    prev_exit = pl.col("exit_date").shift(1)
+    t = t.with_columns(
+        (
+            (pl.col("stock_id") != pl.col("stock_id").shift(1))
+            | prev_exit.is_null()
+            | (pl.col("entry_date") != prev_exit)
+        )
+        .fill_null(True)
+        .cum_sum()
+        .alias("_trip")
+    )
+    growth = pl.col("return").fill_null(0.0) + 1.0
+    # compounded return of the trip BEFORE each segment (exact at boundaries)
+    t = t.with_columns((growth.cum_prod().over("_trip") / growth).alias("_base"))
+
+    def _env(col: str, agg: str) -> pl.Expr:
+        e = pl.col("_base") * (pl.col(col) + 1.0) - 1.0
+        return (e.min() if agg == "min" else e.max()).alias(col)
+
+    first = ["entry_sig_date", "position", "entry_price", "entry_raw_price"]
+    last = ["exit_sig_date", "exit_price", "exit_raw_price"]
+    sums = ["period", "pdays"]
+    aggs = [
+        pl.col("entry_date").first(),
+        pl.col("exit_date").last(),
+        (growth.product() - 1.0).alias("return"),
+        pl.len().alias("n_segments"),
+    ]
+    cols = set(t.columns)
+    aggs += [pl.col(c).first().alias(c) for c in first if c in cols]
+    aggs += [pl.col(c).last().alias(c) for c in last if c in cols]
+    aggs += [pl.col(c).sum().alias(c) for c in sums if c in cols]
+    aggs += [_env(c, "min") for c in ("mae", "mdd") if c in cols]
+    aggs += [_env(c, "max") for c in ("gmfe", "bmfe") if c in cols]
+
+    merged = t.group_by("_trip", "stock_id", maintain_order=True).agg(aggs).drop("_trip")
+    if pending.height:
+        merged = pl.concat([merged, pending], how="diagonal")
+    return merged
+
+
 def _trades_payload(
     report: Any,
     input_df: pl.DataFrame | None = None,
@@ -188,6 +250,8 @@ def _trades_payload(
     trades = getattr(report, "trades", None)
     if not isinstance(trades, pl.DataFrame) or trades.is_empty():
         return None, {}
+    segments_total = trades.height
+    trades = _merge_rolled_trades(trades)
     total = trades.height
     closed = trades.filter(pl.col("return").is_not_null() & pl.col("return").is_finite())
     rets = closed.get_column("return")
@@ -316,6 +380,8 @@ def _trades_payload(
         pl.col("stock_id"),
         pl.col("entry_date"),
         pl.col("exit_date"),
+        _opt("entry_sig_date", "entry_sig"),
+        _opt("exit_sig_date", "exit_sig"),
         pl.col("return").alias("ret"),
         _opt("mae"),
         _opt("pdays"),
@@ -329,11 +395,14 @@ def _trades_payload(
         _opt("lim_exit"),
         _opt("entry_kind"),
         _opt("exit_kind"),
+        _opt("n_segments"),
     )
     payload = {
         "stock": cols.get_column("stock_id").to_list(),
         "entry": cols.get_column("entry_date").to_list(),
         "exit": cols.get_column("exit_date").to_list(),
+        "entry_sig": cols.get_column("entry_sig").to_list(),
+        "exit_sig": cols.get_column("exit_sig").to_list(),
         "ret": cols.get_column("ret").to_list(),
         "mae": cols.get_column("mae").to_list(),
         "pdays": cols.get_column("pdays").to_list(),
@@ -347,8 +416,12 @@ def _trades_payload(
         "lim_exit": cols.get_column("lim_exit").to_list(),
         "entry_kind": cols.get_column("entry_kind").to_list(),
         "exit_kind": cols.get_column("exit_kind").to_list(),
+        "n_segments": (
+            cols.get_column("n_segments").to_list() if "n_segments" in cols.columns else None
+        ),
         "sampled": total > MAX_EMBEDDED_TRADES,
         "total": total,
+        "segments_total": segments_total,
     }
     if symbol_names:
         payload["name"] = [symbol_names.get(sym) for sym in payload["stock"]]

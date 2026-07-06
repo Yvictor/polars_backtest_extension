@@ -270,3 +270,65 @@ def test_template_v2_script_syntax(report, tmp_path):
     js = tmp_path / "viz.js"
     js.write_text("\n".join(scripts), encoding="utf-8")
     subprocess.run([node, "--check", str(js)], check=True)
+
+
+def test_trades_payload_includes_signal_dates(report):
+    payload = viz.report_data(report)
+    t = payload["trades"]
+    assert "entry_sig" in t and "exit_sig" in t
+    assert len(t["entry_sig"]) == len(t["entry"])
+    # signal precedes execution (T+1)
+    for sig, ent in zip(t["entry_sig"], t["entry"]):
+        if sig and ent:
+            assert sig <= ent
+
+
+class TestMergeRolledTrades:
+    def _seg(self, stock, entry, exit, ret, sig=None, mae=None, pos=0.01):
+        import datetime as dt
+        d = lambda s: dt.date.fromisoformat(s) if s else None
+        return {
+            "stock_id": stock, "entry_date": d(entry), "exit_date": d(exit),
+            "entry_sig_date": d(sig or entry), "exit_sig_date": d(exit),
+            "return": ret, "mae": mae if mae is not None else min(ret, 0.0),
+            "gmfe": max(ret, 0.0), "bmfe": 0.0, "mdd": min(ret, 0.0),
+            "position": pos, "period": 1, "pdays": 1 if ret > 0 else 0,
+            "entry_price": 100.0, "exit_price": 100.0 * (1 + ret),
+            "entry_raw_price": 100.0, "exit_raw_price": 100.0 * (1 + ret),
+        }
+
+    def test_chained_segments_merge_into_round_trip(self):
+        import polars as pl
+        segs = pl.DataFrame([
+            self._seg("2330", "2024-01-02", "2024-01-03", 0.10),
+            self._seg("2330", "2024-01-03", "2024-01-04", -0.05),
+            self._seg("2330", "2024-01-04", "2024-01-05", 0.02),
+            # gap → separate round trip
+            self._seg("2330", "2024-01-10", "2024-01-11", 0.01),
+            self._seg("1101", "2024-01-03", "2024-01-04", 0.03),
+        ])
+        merged = viz._merge_rolled_trades(segs).sort("stock_id", "entry_date")
+        assert merged.height == 3
+        trip = merged.filter(
+            (pl.col("stock_id") == "2330") & (pl.col("entry_date") == pl.date(2024, 1, 2))
+        ).to_dicts()[0]
+        assert trip["exit_date"].isoformat() == "2024-01-05"
+        assert trip["return"] == pytest.approx(1.10 * 0.95 * 1.02 - 1)
+        assert trip["n_segments"] == 3
+        assert trip["period"] == 3
+        # never below trip entry (seg maes are 0/-5%/0 but compounding keeps
+        # the envelope at/above entry) -> whole-trip MAE is 0
+        assert trip["mae"] == pytest.approx(0.0)
+        assert trip["gmfe"] == pytest.approx(0.10)
+
+    def test_open_position_terminates_chain(self):
+        import polars as pl
+        segs = pl.DataFrame([
+            self._seg("2330", "2024-01-02", "2024-01-03", 0.10),
+            {**self._seg("2330", "2024-01-03", None, -0.001), "exit_sig_date": None},
+        ])
+        merged = viz._merge_rolled_trades(segs)
+        assert merged.height == 1
+        row = merged.to_dicts()[0]
+        assert row["exit_date"] is None and row["n_segments"] == 2
+        assert row["return"] == pytest.approx(1.10 * 0.999 - 1)
