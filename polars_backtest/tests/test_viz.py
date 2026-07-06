@@ -270,3 +270,14 @@ def test_template_v2_script_syntax(report, tmp_path):
     js = tmp_path / "viz.js"
     js.write_text("\n".join(scripts), encoding="utf-8")
     subprocess.run([node, "--check", str(js)], check=True)
+
+
+def test_trades_payload_includes_signal_dates(report):
+    payload = viz.report_data(report)
+    t = payload["trades"]
+    assert "entry_sig" in t and "exit_sig" in t
+    assert len(t["entry_sig"]) == len(t["entry"])
+    # signal precedes execution (T+1)
+    for sig, ent in zip(t["entry_sig"], t["entry"]):
+        if sig and ent:
+            assert sig <= ent
