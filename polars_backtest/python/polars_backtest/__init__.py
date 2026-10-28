@@ -38,6 +38,15 @@ else:
 # Liquidity analysis: limit-lock classification and fill-stress scenarios
 # Visualization: self-contained interactive HTML report (no extra dependencies)
 from polars_backtest import liquidity, viz
+from polars_backtest.swing import (
+    SwingCosts,
+    SwingResult,
+    SwingRules,
+    backtest_swing,
+    bench_book,
+    phase_rebalance_dates,
+    swing_books,
+)
 
 # Wide format API (optional, for Finlab compatibility)
 from polars_backtest.wide import (
@@ -56,6 +65,13 @@ __all__ = [
     # Main API (long format)
     "backtest",
     "backtest_with_report",
+    "backtest_swing",
+    "SwingCosts",
+    "SwingRules",
+    "SwingResult",
+    "swing_books",
+    "phase_rebalance_dates",
+    "bench_book",
     # Wide format API
     "backtest_wide",
     "backtest_with_report_wide",

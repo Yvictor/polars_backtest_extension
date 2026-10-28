@@ -18,6 +18,7 @@
 mod expressions;
 mod ffi_convert;
 mod report;
+mod swing;
 
 pub use report::PyBacktestReport;
 
@@ -1585,6 +1586,7 @@ fn _polars_backtest(m: &Bound<'_, PyModule>) -> PyResult<()> {
     // Main API (long format)
     m.add_function(wrap_pyfunction!(backtest, m)?)?;
     m.add_function(wrap_pyfunction!(backtest_with_report, m)?)?;
+    m.add_function(wrap_pyfunction!(swing::swing_impl, m)?)?;
     // Wide format API (for validation)
     m.add_function(wrap_pyfunction!(backtest_wide, m)?)?;
     m.add_function(wrap_pyfunction!(backtest_with_report_wide_impl, m)?)?;

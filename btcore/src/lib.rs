@@ -41,18 +41,19 @@ pub mod returns;
 pub mod simulation;
 pub mod stats;
 pub mod stops;
+pub mod swing;
 pub mod tracker;
 pub mod trades;
 pub mod weights;
 
 // Re-export commonly used items
+pub use mae_mfe::{calculate_mae_mfe, calculate_mae_mfe_at_exit, MaeMfeConfig, MaeMfeMetrics};
+pub use position::PositionSnapshot;
 pub use returns::{cumulative_returns, daily_returns, portfolio_return};
 pub use simulation::{
-    run_backtest, run_backtest_with_trades, BacktestConfig, BacktestResult, WideBacktestResult,
-    PriceData, TradeRecord, WideTradeRecord,
+    run_backtest, run_backtest_with_trades, BacktestConfig, BacktestResult, PriceData, TradeRecord,
+    WideBacktestResult, WideTradeRecord,
 };
 pub use stats::{calc_cagr, max_drawdown, sharpe_ratio, sortino_ratio, BacktestStats};
-pub use position::PositionSnapshot;
 pub use trades::TradeRecord as TradeBookRecord;
 pub use weights::IntoWeights;
-pub use mae_mfe::{MaeMfeConfig, MaeMfeMetrics, calculate_mae_mfe, calculate_mae_mfe_at_exit};
