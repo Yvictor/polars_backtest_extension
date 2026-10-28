@@ -55,7 +55,7 @@
 
 Adversarial review of `btcore` + `polars_backtest` (Rust engine, pyo3 bindings,
 Python layer, tests, packaging). `cargo test -p btcore` passes (101+19 tests).
-Suspected engine bugs were verified by driving `btcore` directly from a scratch
+Suspected engine bugs were verified by driving `btcore` directly from a standalone
 crate. The Python test suite could not run on this machine (see P-1).
 
 ## HIGH

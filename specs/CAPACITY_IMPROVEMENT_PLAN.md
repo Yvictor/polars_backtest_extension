@@ -46,7 +46,7 @@ a. Same-day TV includes the strategy's own volume; on limit-locked days TV≈0
 b. `(entry+exit)/2` averaging overstates — binding constraint is `min(entry, exit)`.
 c. Per-trade quantile ignores same-day concurrent entries binding jointly.
 d. Weight drift / intermediate rebalances between entry and exit not modeled.
-e. No 處置股 haircut (batch auctions cut participatable volume).
+e. No 處置股 haircut (periodic auctions cut participatable volume).
 
 ## Plan
 

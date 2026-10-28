@@ -16,6 +16,11 @@ check:
 test-rust:
     cargo test -p btcore
 
+# Dependency-free rule tests using the same production core
+test-swing-core:
+    rustc --edition=2021 --test btcore/src/swing.rs -o "${CARGO_TARGET_DIR:?set CARGO_TARGET_DIR}/swing-tests"
+    "${CARGO_TARGET_DIR:?set CARGO_TARGET_DIR}/swing-tests"
+
 # Lint Rust code
 clippy:
     cargo clippy
