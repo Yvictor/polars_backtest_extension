@@ -99,6 +99,31 @@ Returned by `backtest_with_report()`. Implemented in Rust (`src/report.rs`).
 | `report.trade_at` | str | Always `"close"` currently. |
 | `report.resample` | str \| None | Resample frequency used. |
 | `report.benchmark` | DataFrame \| None | Get/set. Setter validates `date` + `creturn` columns. |
+| `report.daily` | DataFrame \| None | With `ledger=True`. One row per engine day, see below. |
+| `report.fills` | DataFrame \| None | With `ledger=True`. One row per executed leg, see below. |
+
+### Ledger (`ledger=True`)
+
+`backtest_with_report(..., ledger=True)` records what was actually booked. It does
+not change `creturn` or `trades`. All amounts are in units of the starting capital
+of 1.0. `trades` stays one row per rebalance; `fills` holds the net leg per symbol.
+
+**`daily`**: `date`, `equity`, `cash`, `commission`, `tax`, `gross_long`,
+`gross_short` (both nonnegative), `net_exposure`, `gross_exposure`,
+`traded_notional` (sum of `abs(notional)`) and `turnover` (`traded_notional` over
+the previous day's equity, null if that was not positive). Dates start at the first
+signal, so `daily` can start earlier than the trimmed `creturn`.
+
+`tax` is the engine's exit-side tax: `abs(notional) * tax_ratio` on any leg that
+reduces a position, **including buy-to-cover**, and nothing on opening a short.
+
+**`fills`**: `date`, `symbol`, signed `notional` (positive for buys), `price` (NaN
+for a leg booked on a day with no valid price) and `reason` (`rebalance` or `stop`).
+
+Each day `equity` moves by market P&L minus `commission` and `tax`. A buy that keeps
+a position pays its cost out of the position: it adds `notional - cost` of market
+value and takes `notional` of cash. A sell or a full exit pays from cash: the market
+value moves by `notional` and cash by `-notional - cost`.
 
 ### Methods
 

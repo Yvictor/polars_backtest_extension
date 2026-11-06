@@ -12,6 +12,8 @@ use polars_ops::pivot::pivot;
 
 use btcore::BacktestConfig;
 
+use crate::ledger::LedgerFrames;
+
 // Helper to convert PolarsError to PyErr
 fn to_py_err(e: PolarsError) -> PyErr {
     PyValueError::new_err(format!("{}", e))
@@ -34,6 +36,8 @@ pub struct PyBacktestReport {
     pub(crate) weights_df: Option<DataFrame>,
     /// Next period target weights (symbol -> normalized weight)
     pub(crate) next_weights_df: Option<DataFrame>,
+    /// Ledger tables, when requested with `ledger=True`
+    pub(crate) ledger: Option<LedgerFrames>,
 }
 
 impl PyBacktestReport {
@@ -59,12 +63,31 @@ impl PyBacktestReport {
             trading_value_df,
             weights_df,
             next_weights_df,
+            ledger: None,
         }
+    }
+
+    /// Attach the ledger tables
+    pub(crate) fn with_ledger(mut self, ledger: Option<LedgerFrames>) -> Self {
+        self.ledger = ledger;
+        self
     }
 }
 
 #[pymethods]
 impl PyBacktestReport {
+    /// One row per day: equity, cash, costs and exposure; None without `ledger=True`
+    #[getter]
+    fn daily(&self) -> Option<PyDataFrame> {
+        self.ledger.as_ref().map(|l| PyDataFrame(l.daily.clone()))
+    }
+
+    /// One row per executed leg; None without `ledger=True`
+    #[getter]
+    fn fills(&self) -> Option<PyDataFrame> {
+        self.ledger.as_ref().map(|l| PyDataFrame(l.fills.clone()))
+    }
+
     /// Get cumulative returns as a Polars DataFrame with date column
     #[getter]
     fn creturn(&self) -> PyDataFrame {

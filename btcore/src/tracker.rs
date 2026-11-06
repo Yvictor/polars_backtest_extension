@@ -13,6 +13,7 @@
 use std::collections::{BTreeMap, HashMap};
 use std::hash::Hash;
 
+use crate::ledger::{DayClose, Ledger, LegFill};
 use crate::mae_mfe::calculate_mae_mfe_at_exit;
 
 /// Round raw price to avoid floating point precision issues
@@ -221,6 +222,8 @@ pub struct BacktestResult {
     pub trades: Vec<TradeRecord>,
     /// Stock operations (actions, weights, next_weights) - Finlab compatible
     pub stock_operations: Option<StockOperations>,
+    /// Daily and per-leg ledger, when requested
+    pub ledger: Option<Ledger<String, i32>>,
 }
 
 // ============================================================================
@@ -284,6 +287,20 @@ pub trait TradeTracker {
 
     /// Finalize all open trades at the end of simulation
     fn finalize(self, fee_ratio: f64, tax_ratio: f64) -> Vec<Self::Record>;
+
+    /// Whether this tracker keeps a ledger; callers skip ledger work when false
+    #[inline]
+    fn wants_ledger(&self) -> bool {
+        false
+    }
+
+    /// Record an executed leg
+    #[inline]
+    fn record_fill(&mut self, _key: &Self::Key, _date: Self::Date, _fill: &LegFill) {}
+
+    /// Record the portfolio after the close of a day
+    #[inline]
+    fn record_day(&mut self, _date: Self::Date, _close: &DayClose) {}
 }
 
 // ============================================================================
@@ -844,6 +861,19 @@ impl RecordBuilder for TradeRecord {
 pub struct GenericTracker<R: RecordBuilder> {
     open_trades: HashMap<R::Key, OpenTradeInfo<R::Key, R::Date>>,
     completed_trades: Vec<R>,
+    ledger: Option<Ledger<R::Key, R::Date>>,
+}
+
+impl<R: RecordBuilder> GenericTracker<R> {
+    /// Start collecting a ledger for a portfolio that starts at `initial_equity`
+    pub fn enable_ledger(&mut self, initial_equity: f64) {
+        self.ledger = Some(Ledger::new(initial_equity));
+    }
+
+    /// Take the collected ledger, if one was enabled
+    pub fn take_ledger(&mut self) -> Option<Ledger<R::Key, R::Date>> {
+        self.ledger.take()
+    }
 }
 
 impl<R: RecordBuilder> TradeTracker for GenericTracker<R> {
@@ -855,6 +885,23 @@ impl<R: RecordBuilder> TradeTracker for GenericTracker<R> {
         Self {
             open_trades: HashMap::new(),
             completed_trades: Vec::new(),
+            ledger: None,
+        }
+    }
+
+    fn wants_ledger(&self) -> bool {
+        self.ledger.is_some()
+    }
+
+    fn record_fill(&mut self, key: &Self::Key, date: Self::Date, fill: &LegFill) {
+        if let Some(ledger) = &mut self.ledger {
+            ledger.add_fill(key.clone(), date, *fill);
+        }
+    }
+
+    fn record_day(&mut self, date: Self::Date, close: &DayClose) {
+        if let Some(ledger) = &mut self.ledger {
+            ledger.close_day(date, *close);
         }
     }
 

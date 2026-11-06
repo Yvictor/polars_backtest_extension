@@ -16,6 +16,7 @@ use std::collections::{BTreeMap, HashMap, VecDeque};
 use arrow::array::{Float64Array, Int32Array, StringViewArray};
 
 use crate::config::{BacktestConfig, ExecOptions};
+use crate::ledger::{DayClose, FillReason, LegFill};
 use crate::position::{Position, PositionSnapshot};
 use crate::tracker::{BacktestResult, StockOperations, TradeRecord, NoopSymbolTracker, SymbolTracker, TradeTracker};
 use crate::{is_valid_price, FLOAT_EPSILON};
@@ -506,6 +507,7 @@ where
             if has_first_signal {
                 dates.push(prev_date);
                 creturn.push(session.portfolio.balance());
+                record_day_close(&session.portfolio, prev_date, tracker);
             }
 
             today_prices.clear();
@@ -563,6 +565,7 @@ where
             if has_first_signal {
                 dates.push(last_date);
                 creturn.push(session.portfolio.balance());
+                record_day_close(&session.portfolio, last_date, tracker);
             }
         }
     }
@@ -693,6 +696,24 @@ fn run_session_day<T>(
     }
 }
 
+/// Give a ledger-keeping tracker the portfolio after the close
+fn record_day_close<T>(portfolio: &Portfolio, date: i32, tracker: &mut T)
+where
+    T: TradeTracker<Key = String, Date = i32, Record = TradeRecord>,
+{
+    if !tracker.wants_ledger() {
+        return;
+    }
+    let values = || portfolio.positions.values().map(|p| p.last_market_value);
+    let close = DayClose {
+        equity: portfolio.balance(),
+        cash: portfolio.cash,
+        gross_long: values().filter(|v| *v > 0.0).sum(),
+        gross_short: -values().filter(|v| *v < 0.0).sum::<f64>(),
+    };
+    tracker.record_day(date, &close);
+}
+
 /// Run backtest with closure-based data access (public API, no trade tracking)
 ///
 /// # Arguments
@@ -771,6 +792,7 @@ where
         creturn,
         trades: vec![],
         stock_operations: None,
+        ledger: None,
     }
 }
 
@@ -900,6 +922,9 @@ pub fn backtest_with_report_long_arrow(
     config: &BacktestConfig,
 ) -> BacktestResult {
     let mut tracker = SymbolTracker::new();
+    if config.exec.ledger {
+        tracker.enable_ledger(Portfolio::new().balance());
+    }
 
     // Build factor accessor (default to 1.0 if not provided)
     let get_factor: Box<dyn Fn(usize) -> f64> = if let Some(factor_arr) = input.factor {
@@ -953,6 +978,8 @@ pub fn backtest_with_report_long_arrow(
             ohlc,
         )
     };
+
+    let ledger = tracker.take_ledger();
 
     // Finalize trades (include open positions)
     let mut trades = tracker.finalize(config.fee_ratio, config.tax_ratio);
@@ -1010,6 +1037,7 @@ pub fn backtest_with_report_long_arrow(
         creturn,
         trades,
         stock_operations: Some(stock_operations),
+        ledger,
     }
 }
 
@@ -1714,6 +1742,13 @@ where
                 config.tax_ratio,
             );
 
+            let leg = LegContext {
+                symbol: &stop.symbol,
+                date: current_date,
+                price: exit_price,
+                reason: FillReason::Stop,
+            };
+            leg.record_exit(exit_value, config, tracker);
             portfolio.cash += exit_proceeds(exit_value, config);
 
             if config.stop_trading_next_period {
@@ -1723,9 +1758,104 @@ where
     }
 }
 
+/// Where and why a leg trades, for the ledger
+#[derive(Clone, Copy)]
+struct LegContext<'s> {
+    symbol: &'s String,
+    date: i32,
+    price: f64,
+    reason: FillReason,
+}
+
+impl<'s> LegContext<'s> {
+    fn rebalance(symbol: &'s String, date: i32, price: f64) -> Self {
+        Self {
+            symbol,
+            date,
+            price,
+            reason: FillReason::Rebalance,
+        }
+    }
+
+    /// Report a leg of signed `notional`, taxed unless it adds to the position
+    fn record<T>(&self, notional: f64, taxed: bool, config: &BacktestConfig, tracker: &mut T)
+    where
+        T: TradeTracker<Key = String, Date = i32, Record = TradeRecord>,
+    {
+        if !tracker.wants_ledger() || notional == 0.0 {
+            return;
+        }
+        let cost = LegCost::of(notional, taxed, config);
+        let fill = LegFill {
+            notional,
+            price: self.price,
+            commission: cost.commission,
+            tax: cost.tax,
+            reason: self.reason,
+        };
+        tracker.record_fill(self.symbol, self.date, &fill);
+    }
+
+    /// Report the full exit of a position worth `value`
+    fn record_exit<T>(&self, value: f64, config: &BacktestConfig, tracker: &mut T)
+    where
+        T: TradeTracker<Key = String, Date = i32, Record = TradeRecord>,
+    {
+        self.record(-value, true, config, tracker);
+    }
+
+    /// Report the leg `book_leg` books between the same two values
+    fn record_move<T>(
+        &self,
+        current_value: f64,
+        target_value: f64,
+        config: &BacktestConfig,
+        tracker: &mut T,
+    ) where
+        T: TradeTracker<Key = String, Date = i32, Record = TradeRecord>,
+    {
+        let amount = target_value - current_value;
+        let taxed = !is_entry_leg(amount, target_value);
+        self.record(amount, taxed, config, tracker);
+    }
+}
+
+/// What a leg costs, shared by the booking and the ledger
+struct LegCost {
+    commission: f64,
+    tax: f64,
+    /// What the leg pays. `traded * (fee + tax)`, which can differ from
+    /// `commission + tax` in the last bit.
+    total: f64,
+}
+
+impl LegCost {
+    fn of(notional: f64, taxed: bool, config: &BacktestConfig) -> Self {
+        let traded = notional.abs();
+        let (tax, total) = if taxed {
+            (
+                traded * config.tax_ratio,
+                traded * (config.fee_ratio + config.tax_ratio),
+            )
+        } else {
+            (0.0, traded * config.fee_ratio)
+        };
+        Self {
+            commission: traded * config.fee_ratio,
+            tax,
+            total,
+        }
+    }
+}
+
 /// Cash received for closing a position worth `value`, after fee and tax
 fn exit_proceeds(value: f64, config: &BacktestConfig) -> f64 {
-    value - value.abs() * (config.fee_ratio + config.tax_ratio)
+    value - LegCost::of(value, true, config).total
+}
+
+/// Whether a leg of `amount` towards `target_value` adds to the position
+fn is_entry_leg(amount: f64, target_value: f64) -> bool {
+    (target_value >= 0.0 && amount > 0.0) || (target_value <= 0.0 && amount < 0.0)
 }
 
 /// Book the leg that moves a position from `current_value` to `target_value`
@@ -1735,12 +1865,7 @@ fn exit_proceeds(value: f64, config: &BacktestConfig) -> f64 {
 fn book_leg(cash: &mut f64, current_value: f64, target_value: f64, config: &BacktestConfig) -> f64 {
     let amount = target_value - current_value;
     let is_buy = amount > 0.0;
-    let is_entry = (target_value >= 0.0 && amount > 0.0) || (target_value <= 0.0 && amount < 0.0);
-    let cost = if is_entry {
-        amount.abs() * config.fee_ratio
-    } else {
-        amount.abs() * (config.fee_ratio + config.tax_ratio)
-    };
+    let cost = LegCost::of(amount, !is_entry_leg(amount, target_value), config).total;
 
     if is_buy {
         *cash -= amount;
@@ -1835,6 +1960,9 @@ where
         let all_positions: Vec<String> = portfolio.positions.keys().cloned().collect();
         for sym in all_positions {
             if let Some(pos) = portfolio.positions.remove(&sym) {
+                let price = today_prices.get(sym.as_str()).copied().unwrap_or(f64::NAN);
+                let leg = LegContext::rebalance(&sym, current_date, price);
+                leg.record_exit(pos.value, config, tracker);
                 portfolio.cash += exit_proceeds(pos.value, config);
             }
         }
@@ -1874,6 +2002,8 @@ where
             if target_weight.abs() < FLOAT_EPSILON {
                 if let Some(snap) = snapshot {
                     if snap.market_value.abs() > FLOAT_EPSILON {
+                        let leg = LegContext::rebalance(sym, current_date, f64::NAN);
+                        leg.record_exit(snap.market_value, config, tracker);
                         cash += exit_proceeds(snap.market_value, config);
                     }
                 }
@@ -1882,6 +2012,8 @@ where
 
             // Finlab behavior: Enter/modify position even with NaN price
             if target_value.abs() > FLOAT_EPSILON {
+                let leg = LegContext::rebalance(sym, current_date, f64::NAN);
+                leg.record_move(current_value, target_value, config, tracker);
                 let new_value = book_leg(&mut cash, current_value, target_value, config);
 
                 if new_value.abs() > FLOAT_EPSILON {
@@ -1898,16 +2030,19 @@ where
         }
 
         let price = price_opt.unwrap();
+        let leg = LegContext::rebalance(sym, current_date, price);
 
         // Valid price case: exit position if target is 0
         // Note: close_trade was already called at the start for ALL positions
         if target_weight.abs() < FLOAT_EPSILON {
             if current_value.abs() > FLOAT_EPSILON {
+                leg.record_exit(current_value, config, tracker);
                 cash += exit_proceeds(current_value, config);
             }
             continue;
         }
 
+        leg.record_move(current_value, target_value, config, tracker);
         let new_position_value = book_leg(&mut cash, current_value, target_value, config);
 
         if new_position_value.abs() > FLOAT_EPSILON {
@@ -1937,6 +2072,9 @@ where
     for sym in &open_positions {
         let snap = &old_snapshots[sym];
         if !effective_weights.contains_key(sym) && snap.cost_basis.abs() > FLOAT_EPSILON {
+            let price = today_prices.get(sym.as_str()).copied().unwrap_or(f64::NAN);
+            let leg = LegContext::rebalance(sym, current_date, price);
+            leg.record_exit(snap.cost_basis, config, tracker);
             cash += exit_proceeds(snap.cost_basis, config);
         }
     }
