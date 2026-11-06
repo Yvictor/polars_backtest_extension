@@ -17,6 +17,20 @@ from polars_backtest.report.schema import SCHEMA_VERSION
 
 MAX_REASONS = 8
 WORST_DAYS = 5
+STRUCTURE_KEYS = (
+    "sides",
+    "top10_contrib_ratio",
+    "buy_high_n",
+    "buy_high_ratio",
+    "sell_low_n",
+    "sell_low_ratio",
+    "buy_high_contrib_ratio",
+    "entry_locked_n",
+    "entry_touched_n",
+    "entry_locked_contrib_ratio",
+    "exit_locked_n",
+    "exit_touched_n",
+)
 
 
 def _safe(value: Any) -> Any:
@@ -63,6 +77,11 @@ def _execution(tables: dict[str, pl.DataFrame]) -> dict[str, Any] | None:
     return out
 
 
+def _structure(trade_summary: dict[str, Any]) -> dict[str, Any]:
+    """Where the return came from, from every trade rather than the embedded rows."""
+    return {key: trade_summary[key] for key in STRUCTURE_KEYS if key in trade_summary}
+
+
 def _entry_date(curve: pl.DataFrame) -> dict[str, Any] | None:
     entry = M.entry_date_risk(curve)
     if entry is None:
@@ -102,6 +121,7 @@ def build_summary(
         "net_of_costs": M.net_of_costs(curve),
         "limit_fills": M.limit_fills(tables.get("trades")),
         "trades": M.trade_stats(tables.get("trades"), segment_win_rate),
+        "structure": _structure(trade_summary),
         "costs": cost,
         "exposure": M.exposure(ledger),
         "turnover": M.turnover(ledger, trade_summary),

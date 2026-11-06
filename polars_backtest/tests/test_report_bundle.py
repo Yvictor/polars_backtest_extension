@@ -324,6 +324,11 @@ class TestSummary:
         assert opened.height > 0
         assert opened["exit_date"].null_count() == opened.height
 
+    def test_structure_comes_from_every_trade(self, full):
+        structure = full.summary()["structure"]
+        assert structure["sides"]["long"]["n"] > 0
+        assert "top10_contrib_ratio" in structure
+
     def test_ledger_costs_replace_the_estimate(self, full, ledger):
         costs = full.summary()["costs"]
         assert costs["source"] == "ledger"
