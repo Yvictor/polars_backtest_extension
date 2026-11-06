@@ -202,3 +202,49 @@ def test_fee_options_match_simple_api_and_ledger_off(touched):
     assert_frame_equal(plain.creturn, ledger.creturn, check_exact=True)
     assert_frame_equal(plain.trades, ledger.trades, check_exact=True)
     assert_frame_equal(bt.backtest(df, **options), ledger.creturn, check_exact=True)
+
+
+@pytest.mark.parametrize("weights", [(1.0, -1.0, -1.0, -1.0), (-1.0, 1.0, 1.0, 1.0)])
+@pytest.mark.parametrize("slippage", [0.0, 0.1])
+def test_surcharge_only_reversal_preserves_legacy_exit_tax(weights, slippage):
+    report = bt.backtest_with_report(
+        prices(weights),
+        resample=None,
+        fee_ratio=0.0,
+        tax_ratio=0.02,
+        short_sale_fee_ratio=0.01,
+        slippage_ratio=slippage,
+        ledger=True,
+    )
+    assert report.daily["tax"].sum() == 0.0
+    reversal = report.fills.filter(pl.col("date") == dt.date(2024, 1, 8))
+    assert reversal.height == 2
+    costs = report.daily.select(pl.sum_horizontal("tax", "surcharge", "slippage")).to_series()
+    assert report.daily["equity"].to_list() == pytest.approx((1.0 - costs.cum_sum()).to_list())
+
+
+@pytest.mark.parametrize("weight", [1.0, -1.0])
+def test_sell_tax_partial_reduction_with_slippage(weight):
+    report = bt.backtest_with_report(
+        prices((weight, weight * 0.5, weight * 0.5, weight * 0.5)),
+        resample=None,
+        fee_ratio=0.01,
+        tax_ratio=0.02,
+        tax_side="sell",
+        short_sale_fee_ratio=0.03,
+        slippage_ratio=0.1,
+        ledger=True,
+    )
+    fills = report.fills
+    reduction = fills.row(1, named=True)
+    assert reduction["notional"] * weight < 0.0
+    assert reduction["price"] == pytest.approx(90.0 if weight > 0 else 110.0)
+    day = report.daily.filter(pl.col("date") == reduction["date"]).row(0, named=True)
+    assert day["tax"] == pytest.approx(abs(reduction["notional"]) * 0.02 if weight > 0 else 0.0)
+    assert day["commission"] == pytest.approx(abs(reduction["notional"]) * 0.01)
+    assert day["surcharge"] == 0.0
+    assert report.trades["entry_price"][1] == 100.0
+    costs = report.daily.select(
+        pl.sum_horizontal("commission", "tax", "slippage", "surcharge", "borrow_cost")
+    ).to_series()
+    assert report.daily["equity"].to_list() == pytest.approx((1.0 - costs.cum_sum()).to_list())

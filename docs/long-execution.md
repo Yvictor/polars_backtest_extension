@@ -62,6 +62,12 @@ nonnegative. A short-sale surcharge applies only to newly added short notional.
 When surcharge or sell-side taxation is enabled, a direction reversal books the
 closing leg before the new opening leg. Same-direction changes charge only the
 net traded value.
+Under `tax_side="exit"`, each split reversal leg keeps the legacy net-leg tax
+classification: a reversal is entry-classified, so adding a short-sale surcharge
+does not introduce closing-leg tax. `tax_side="sell"` decides separately from
+each leg's sell or buy direction, including partial reductions with slippage.
+For both `tax_side` and `short_sale_fee_ratio`, `trades.return` keeps the legacy
+convention and can differ from daily equity returns.
 
 Borrowing costs `abs(previous_mark_value) * borrow_fee_ratio * calendar_days / 365`
 at the start of a session, before updating prices or closing positions. Friday

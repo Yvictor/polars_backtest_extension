@@ -667,8 +667,10 @@ fn run_session_day<T>(
         if config.exec.borrow_fee_ratio > 0.0 {
             for (sym, pos) in &session.portfolio.positions {
                 if pos.last_market_value < 0.0 {
-                    let cost = pos.last_market_value.abs() * config.exec.borrow_fee_ratio
-                        * f64::from(date - previous) / 365.0;
+                    let cost = pos.last_market_value.abs()
+                        * config.exec.borrow_fee_ratio
+                        * f64::from(date - previous)
+                        / 365.0;
                     session.portfolio.cash -= cost;
                     tracker.record_borrow(sym, date, cost);
                 }
@@ -2136,7 +2138,11 @@ fn book_leg(current: f64, target: f64, config: &BacktestConfig) -> BookedLeg {
     } else {
         amount * (1.0 - s)
     };
-    let legacy_tax = if is_entry_leg(amount, target) { LegacyTax::Entry } else { LegacyTax::Exit };
+    let legacy_tax = if is_entry_leg(amount, target) {
+        LegacyTax::Entry
+    } else {
+        LegacyTax::Exit
+    };
     let cost = LegCost::of(notional, legacy_tax, config);
     let surcharge = if amount < 0.0 && target < 0.0 {
         notional.abs() * config.exec.short_sale_fee_ratio
@@ -2168,7 +2174,11 @@ fn book_leg(current: f64, target: f64, config: &BacktestConfig) -> BookedLeg {
         tax: cost.tax,
         slippage,
         surcharge,
-        cash_delta: if surcharge > 0.0 { cash_delta - surcharge } else { cash_delta },
+        cash_delta: if surcharge > 0.0 {
+            cash_delta - surcharge
+        } else {
+            cash_delta
+        },
         new_value,
     }
 }

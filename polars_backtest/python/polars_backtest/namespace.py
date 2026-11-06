@@ -312,8 +312,10 @@ class BacktestNamespace:
                 legacy budget base; only the traded fraction slips. Continuing
                 trade segments use an unslipped entry basis.
             short_sale_fee_ratio: Additional fee on new short-sale notional
+                trades.return keeps the legacy convention and can differ from daily.
             borrow_fee_ratio: Annual carrying rate, using calendar days / 365
             tax_side: "exit" (default) or "sell" for tax on all sells
+                trades.return keeps the legacy convention and can differ from daily.
             position: Position/weight column name or Expr (default: "weight")
             date: Date column name or Expr (default: "date")
             symbol: Symbol column name or Expr (default: "symbol")
@@ -440,8 +442,10 @@ class BacktestNamespace:
                 legacy budget base; only the traded fraction slips. Continuing
                 trade segments use an unslipped entry basis.
             short_sale_fee_ratio: Additional fee on new short-sale notional
+                trades.return keeps the legacy convention and can differ from daily.
             borrow_fee_ratio: Annual carrying rate, using calendar days / 365
             tax_side: "exit" (default) or "sell" for tax on all sells
+                trades.return keeps the legacy convention and can differ from daily.
             position: Position/weight column name or Expr (default: "weight")
             date: Date column name or Expr (default: "date")
             symbol: Symbol column name or Expr (default: "symbol")
@@ -610,8 +614,10 @@ def backtest(
                 legacy budget base; only the traded fraction slips. Continuing
                 trade segments use an unslipped entry basis.
         short_sale_fee_ratio: Additional fee on new short-sale notional
+            trades.return keeps the legacy convention and can differ from daily.
         borrow_fee_ratio: Annual carrying rate, using calendar days / 365
         tax_side: "exit" (default) or "sell" for tax on all sells
+            trades.return keeps the legacy convention and can differ from daily.
         position: Position/weight column name or Expr (default: "weight")
         date: Date column name or Expr (default: "date")
         symbol: Symbol column name or Expr (default: "symbol")
@@ -721,8 +727,10 @@ def backtest_with_report(
                 legacy budget base; only the traded fraction slips. Continuing
                 trade segments use an unslipped entry basis.
         short_sale_fee_ratio: Additional fee on new short-sale notional
+            trades.return keeps the legacy convention and can differ from daily.
         borrow_fee_ratio: Annual carrying rate, using calendar days / 365
         tax_side: "exit" (default) or "sell" for tax on all sells
+            trades.return keeps the legacy convention and can differ from daily.
         position: Position/weight column name or Expr (default: "weight")
         date: Date column name or Expr (default: "date")
         symbol: Symbol column name or Expr (default: "symbol")
