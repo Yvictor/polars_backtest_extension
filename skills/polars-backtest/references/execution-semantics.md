@@ -183,6 +183,17 @@ last trading day ≤ (boundary + offset), then executed T+1.
 - **Only non-negative offsets are supported.** `"-1D"` or any unparseable
   string raises `ValueError` (the wide-format API supports negative offsets).
 
+### rebalance_every
+
+With a weekly `resample`, `rebalance_every=k` keeps only every k-th calendar week.
+A week is selected when `(date - monday_of(rebalance_anchor)) // 7 % k ==
+rebalance_phase`, so weeks without trading days still count and slicing the input
+does not move the phase. A selected week that has no trading day produces no
+rebalance. With `resample_offset`, the schedule selects the week of each boundary
+(its Sunday) before the delay is applied. Input that ends inside an unselected week
+before any signal gives an empty result. `next_weight_date` comes from the calendar:
+the next selected boundary on or after the last reported date.
+
 ## Prices, factor, and raw prices
 
 - `trade_at_price` should be an **adjusted** price series (dividends/splits

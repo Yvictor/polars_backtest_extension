@@ -5,6 +5,7 @@ Provides df.bt.backtest() API for long format DataFrames.
 
 from __future__ import annotations
 
+import datetime as dt
 import re
 from typing import TYPE_CHECKING, Iterable, NamedTuple, Union, cast
 
@@ -84,6 +85,31 @@ def _validate_resample(resample: str | None, resample_offset: str | None) -> Non
             " Negative offsets like '-1D' are not supported (they used to be silently"
             " ignored); use the wide-format API if you need them."
         )
+
+
+def _schedule_int(name: str, value: int) -> int:
+    """Reject values the 32-bit engine fields would coerce or refuse with another error."""
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ValueError(f"{name} must be an int, got {type(value).__name__}")
+    if not -(2**31) <= value < 2**31:
+        raise ValueError(f"{name} is out of range: {value}")
+    return value
+
+
+def _schedule_args(
+    every: int, phase: int, anchor: dt.date | None
+) -> tuple[int, int, int | None]:
+    """Validate the schedule; the anchor becomes days since 1970-01-01."""
+    anchor_days = None
+    if anchor is not None:
+        if isinstance(anchor, dt.datetime) or not isinstance(anchor, dt.date):
+            raise ValueError(f"rebalance_anchor must be a date, got {type(anchor).__name__}")
+        anchor_days = anchor.toordinal() - dt.date(1970, 1, 1).toordinal()
+    return (
+        _schedule_int("rebalance_every", every),
+        _schedule_int("rebalance_phase", phase),
+        anchor_days,
+    )
 
 
 def _validate_no_nulls(df: pl.DataFrame, columns: Iterable[str]) -> None:
@@ -256,6 +282,9 @@ class BacktestNamespace:
         retain_cost_when_rebalance: bool = False,
         stop_trading_next_period: bool = True,
         touched_exit: bool = False,
+        rebalance_every: int = 1,
+        rebalance_phase: int = 0,
+        rebalance_anchor: dt.date | None = None,
     ) -> pl.DataFrame:
         """Run backtest on long format DataFrame.
 
@@ -280,6 +309,10 @@ class BacktestNamespace:
             retain_cost_when_rebalance: Retain costs when rebalancing
             stop_trading_next_period: Stop trading after stop triggered
             touched_exit: Use OHLC for intraday stop detection (requires open/high/low)
+            rebalance_every: Rebalance every k calendar weeks (weekly resample only)
+            rebalance_phase: Which of the k weeks rebalances, in [0, k)
+            rebalance_anchor: A date in week 0. Required when rebalance_every > 1 or
+                rebalance_phase > 0.
 
         Returns:
             DataFrame with columns: date, creturn
@@ -325,6 +358,7 @@ class BacktestNamespace:
             resample_offset,
             config,
             skip_sort,
+            *_schedule_args(rebalance_every, rebalance_phase, rebalance_anchor),
         )
 
         return result.creturn
@@ -354,6 +388,9 @@ class BacktestNamespace:
         limit_up: str = "limit_up",
         limit_down: str = "limit_down",
         trading_value: str = "trading_value",
+        rebalance_every: int = 1,
+        rebalance_phase: int = 0,
+        rebalance_anchor: dt.date | None = None,
     ) -> BacktestReport:
         """Run backtest with trade tracking, returning a BacktestReport object.
 
@@ -388,6 +425,10 @@ class BacktestNamespace:
             limit_up: Limit-up price column name, used by get_metrics() liquidity section
             limit_down: Limit-down price column name, used by get_metrics() liquidity section
             trading_value: Trading value column name, used by get_metrics() capacity metric
+            rebalance_every: Rebalance every k calendar weeks (weekly resample only)
+            rebalance_phase: Which of the k weeks rebalances, in [0, k)
+            rebalance_anchor: A date in week 0. Required when rebalance_every > 1 or
+                rebalance_phase > 0.
 
         Returns:
             BacktestReport object with creturn (list) and trades (DataFrame)
@@ -470,6 +511,7 @@ class BacktestNamespace:
             limit_up,
             limit_down,
             trading_value,
+            *_schedule_args(rebalance_every, rebalance_phase, rebalance_anchor),
         )
 
 # =============================================================================
@@ -498,6 +540,9 @@ def backtest(
     retain_cost_when_rebalance: bool = False,
     stop_trading_next_period: bool = True,
     touched_exit: bool = False,
+    rebalance_every: int = 1,
+    rebalance_phase: int = 0,
+    rebalance_anchor: dt.date | None = None,
 ) -> pl.DataFrame:
     """Run backtest on long format DataFrame.
 
@@ -523,6 +568,10 @@ def backtest(
         retain_cost_when_rebalance: Retain costs when rebalancing
         stop_trading_next_period: Stop trading after stop triggered
         touched_exit: Use OHLC for intraday stop detection (requires open/high/low)
+        rebalance_every: Rebalance every k calendar weeks (weekly resample only)
+        rebalance_phase: Which of the k weeks rebalances, in [0, k)
+        rebalance_anchor: A date in week 0. Required when rebalance_every > 1 or
+            rebalance_phase > 0.
 
     Returns:
         DataFrame with columns: date, creturn
@@ -551,6 +600,9 @@ def backtest(
         retain_cost_when_rebalance=retain_cost_when_rebalance,
         stop_trading_next_period=stop_trading_next_period,
         touched_exit=touched_exit,
+        rebalance_every=rebalance_every,
+        rebalance_phase=rebalance_phase,
+        rebalance_anchor=rebalance_anchor,
     )
 
 
@@ -579,6 +631,9 @@ def backtest_with_report(
     limit_up: str = "limit_up",
     limit_down: str = "limit_down",
     trading_value: str = "trading_value",
+    rebalance_every: int = 1,
+    rebalance_phase: int = 0,
+    rebalance_anchor: dt.date | None = None,
 ) -> BacktestReport:
     """Run backtest with trade tracking on long format DataFrame.
 
@@ -610,6 +665,10 @@ def backtest_with_report(
         retain_cost_when_rebalance: Retain costs when rebalancing
         stop_trading_next_period: Stop trading after stop triggered
         touched_exit: Use OHLC for intraday stop detection (requires open/high/low)
+        rebalance_every: Rebalance every k calendar weeks (weekly resample only)
+        rebalance_phase: Which of the k weeks rebalances, in [0, k)
+        rebalance_anchor: A date in week 0. Required when rebalance_every > 1 or
+            rebalance_phase > 0.
 
     Returns:
         BacktestReport object with creturn (list) and trades (DataFrame)
@@ -644,4 +703,7 @@ def backtest_with_report(
         limit_up=limit_up,
         limit_down=limit_down,
         trading_value=trading_value,
+        rebalance_every=rebalance_every,
+        rebalance_phase=rebalance_phase,
+        rebalance_anchor=rebalance_anchor,
     )

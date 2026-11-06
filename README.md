@@ -241,6 +241,9 @@ Metrics return `null` if the required column is not present.
 | `benchmark` | `None` | Benchmark: symbol str or DataFrame with (date, creturn) |
 | `resample` | `"D"` | Rebalance frequency |
 | `resample_offset` | `None` | Delay rebalance by N days (e.g., `"1d"`, `"2d"`, `"1W"`) |
+| `rebalance_every` | `1` | Rebalance every k calendar weeks (weekly `resample` only) |
+| `rebalance_phase` | `0` | Which of the k weeks rebalances, in `[0, k)` |
+| `rebalance_anchor` | `None` | A date in week 0; required when `rebalance_every` or `rebalance_phase` is not default |
 | `fee_ratio` | `0.001425` | Transaction fee |
 | `tax_ratio` | `0.003` | Transaction tax |
 | `stop_loss` | `1.0` | Stop loss threshold (1.0 = disabled) |

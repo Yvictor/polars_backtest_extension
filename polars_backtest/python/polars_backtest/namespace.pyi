@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import datetime as dt
 from typing import Union
 
 import polars as pl
@@ -37,6 +38,9 @@ class BacktestNamespace:
         retain_cost_when_rebalance: bool = False,
         stop_trading_next_period: bool = True,
         touched_exit: bool = False,
+        rebalance_every: int = 1,
+        rebalance_phase: int = 0,
+        rebalance_anchor: dt.date | None = None,
     ) -> pl.DataFrame:
         """Run backtest on long format DataFrame.
 
@@ -70,6 +74,9 @@ class BacktestNamespace:
         limit_up: str = "limit_up",
         limit_down: str = "limit_down",
         trading_value: str = "trading_value",
+        rebalance_every: int = 1,
+        rebalance_phase: int = 0,
+        rebalance_anchor: dt.date | None = None,
     ) -> BacktestReport:
         """Run backtest with trade tracking.
 
@@ -100,6 +107,9 @@ def backtest(
     retain_cost_when_rebalance: bool = False,
     stop_trading_next_period: bool = True,
     touched_exit: bool = False,
+    rebalance_every: int = 1,
+    rebalance_phase: int = 0,
+    rebalance_anchor: dt.date | None = None,
 ) -> pl.DataFrame:
     """Standalone function for backtest."""
     ...
@@ -130,6 +140,9 @@ def backtest_with_report(
     limit_up: str = "limit_up",
     limit_down: str = "limit_down",
     trading_value: str = "trading_value",
+    rebalance_every: int = 1,
+    rebalance_phase: int = 0,
+    rebalance_anchor: dt.date | None = None,
 ) -> BacktestReport:
     """Standalone function for backtest with report."""
     ...

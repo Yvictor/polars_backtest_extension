@@ -45,11 +45,87 @@ pub struct BacktestConfig {
     pub exec: ExecOptions,
 }
 
+/// Largest `rebalance_every`, about a century of weeks
+pub const MAX_REBALANCE_EVERY: i32 = 5200;
+
 /// Long-format execution options
 ///
 /// Every field defaults to today's behaviour. The wide engine ignores this struct.
-#[derive(Debug, Clone, Default, PartialEq)]
-pub struct ExecOptions {}
+#[derive(Debug, Clone, PartialEq)]
+pub struct ExecOptions {
+    /// Rebalance every k calendar weeks. Weekly resample only.
+    pub rebalance_every: i32,
+    /// Which of the k weeks rebalances, in `0..rebalance_every`
+    pub rebalance_phase: i32,
+    /// Any date (days since epoch) in the week counted as week 0
+    pub rebalance_anchor: Option<i32>,
+}
+
+impl Default for ExecOptions {
+    fn default() -> Self {
+        Self {
+            rebalance_every: 1,
+            rebalance_phase: 0,
+            rebalance_anchor: None,
+        }
+    }
+}
+
+impl ExecOptions {
+    /// Reject schedule settings the loop cannot honour
+    pub fn validate_schedule(&self, weekly_resample: bool) -> Result<(), String> {
+        let every = self.rebalance_every;
+        let phase = self.rebalance_phase;
+        if !(1..=MAX_REBALANCE_EVERY).contains(&every) || phase < 0 || phase >= every {
+            return Err(format!(
+                "rebalance_every must be positive, at most {MAX_REBALANCE_EVERY}, and \
+rebalance_phase in [0, every): every={every}, phase={phase}"
+            ));
+        }
+        let scheduled = every != 1 || phase != 0;
+        if (scheduled || self.rebalance_anchor.is_some()) && !weekly_resample {
+            return Err("rebalance_every requires a weekly resample".into());
+        }
+        if scheduled && self.rebalance_anchor.is_none() {
+            return Err("rebalance_every requires rebalance_anchor".into());
+        }
+        Ok(())
+    }
+
+    /// Whether `date` falls in a week selected by the schedule
+    ///
+    /// Weeks are counted on the calendar from Monday of the anchor's week, so
+    /// a week without trading days still counts and slicing the input does not
+    /// shift the phase.
+    pub fn week_selected(&self, date: i32) -> bool {
+        if self.rebalance_every == 1 {
+            return true;
+        }
+        let anchor_monday = monday_of(self.rebalance_anchor.unwrap_or(0));
+        let week = (date - anchor_monday).div_euclid(7);
+        week.rem_euclid(self.rebalance_every) == self.rebalance_phase
+    }
+
+    /// First date on or after `date` that lies `days_after_monday` past the
+    /// Monday of a selected week
+    pub fn next_selected_date(&self, date: i32, days_after_monday: i32) -> i32 {
+        let mut monday = monday_of(date - days_after_monday);
+        if monday + days_after_monday < date {
+            monday += 7;
+        }
+        (0..self.rebalance_every)
+            .map(|weeks| monday + 7 * weeks)
+            .find(|&candidate| self.week_selected(candidate))
+            .unwrap_or(monday)
+            + days_after_monday
+    }
+}
+
+/// Monday of the week holding `date` (days since epoch)
+fn monday_of(date: i32) -> i32 {
+    // 1970-01-01 (day 0) was a Thursday
+    date - (date + 3).rem_euclid(7)
+}
 
 impl Default for BacktestConfig {
     fn default() -> Self {
@@ -72,6 +148,64 @@ impl Default for BacktestConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn schedule(every: i32, phase: i32, anchor: Option<i32>) -> ExecOptions {
+        ExecOptions {
+            rebalance_every: every,
+            rebalance_phase: phase,
+            rebalance_anchor: anchor,
+        }
+    }
+
+    #[test]
+    fn test_default_schedule_selects_every_week() {
+        let exec = ExecOptions::default();
+        assert!(exec.validate_schedule(false).is_ok());
+        assert!((-20..20).all(|day| exec.week_selected(day)));
+    }
+
+    #[test]
+    fn test_week_selected_counts_calendar_weeks_from_the_anchor_monday() {
+        // Day 4 (1970-01-05) is a Monday; a Saturday anchor names the same week
+        let exec = schedule(2, 0, Some(9));
+        assert!((4..11).all(|day| exec.week_selected(day)));
+        assert!((11..18).all(|day| !exec.week_selected(day)));
+        assert!((18..25).all(|day| exec.week_selected(day)));
+    }
+
+    #[test]
+    fn test_week_selected_handles_dates_before_the_anchor() {
+        let exec = schedule(3, 1, Some(4));
+        assert!(exec.week_selected(4 - 14));
+        assert!(!exec.week_selected(4 - 7));
+    }
+
+    #[test]
+    fn test_next_selected_date_stays_on_selected_weeks() {
+        // Weeks start on days 4, 11, 18, 25; every other week is selected
+        let exec = schedule(2, 0, Some(4));
+        assert_eq!(exec.next_selected_date(4, 4), 8);
+        assert_eq!(exec.next_selected_date(8, 4), 8);
+        assert_eq!(exec.next_selected_date(9, 4), 22);
+        assert_eq!(exec.next_selected_date(15, 4), 22);
+    }
+
+    #[test]
+    fn test_validate_schedule() {
+        assert!(schedule(2, 1, Some(0)).validate_schedule(true).is_ok());
+        assert!(schedule(0, 0, Some(0)).validate_schedule(true).is_err());
+        assert!(schedule(MAX_REBALANCE_EVERY, 0, Some(0))
+            .validate_schedule(true)
+            .is_ok());
+        assert!(schedule(MAX_REBALANCE_EVERY + 1, 0, Some(0))
+            .validate_schedule(true)
+            .is_err());
+        assert!(schedule(2, 2, Some(0)).validate_schedule(true).is_err());
+        assert!(schedule(2, -1, Some(0)).validate_schedule(true).is_err());
+        assert!(schedule(2, 0, None).validate_schedule(true).is_err());
+        assert!(schedule(2, 0, Some(0)).validate_schedule(false).is_err());
+        assert!(schedule(1, 0, Some(0)).validate_schedule(false).is_err());
+    }
 
     #[test]
     fn test_default_config() {
