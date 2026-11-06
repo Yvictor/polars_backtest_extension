@@ -162,6 +162,69 @@ pending_exits   = report.trades.filter(
 )
 ```
 
+## Report bundle
+
+A bundle is a folder of Parquet tables and two summaries. Read the cheapest layer that
+answers the question. L0, L1 and L3 are plain JSON and Parquet, so they work without
+this library.
+
+| Layer | Get it from | Size | Answers |
+|---|---|---|---|
+| L0 | `manifest.json` | ~4 KB | Which tables exist, rows, what is missing, did checks pass |
+| L1 | `SUMMARY.md` or `summary.json` | 2 KB, 8 KB | Is it any good, what is flagged |
+| L2 | `db.day()`, `db.symbol()`, `db.sql()`, the CLI | 100 rows by default | A specific question |
+| L3 | Any Parquet reader | full | Your own analysis |
+
+```python
+db = report.to_bundle("my_run", title="demo", input_df=df)  # no path: in memory only
+db = pl_bt.open_bundle("my_run")
+report.summary()                   # same dict, without writing a folder
+db.summary("md")
+db.coverage                        # table -> present / partial / absent / empty
+db.table("fills")                  # LazyFrame; MissingTableError says why it is absent
+db.sql("select symbol, ret from trades order by ret", limit=5)
+db.day("2024-03-15")               # summary, fills, blocks, cashflows, holdings
+db.symbol("FAKE001")               # summary, trades, fills, blocks
+```
+
+`day()` and `symbol()` leave out a table the bundle lacks instead of returning it
+empty, so "no fills that day" and "no fills table" stay different answers. `holdings`
+comes from the trades table, so its weight is the weight at entry.
+
+```
+python -m polars_backtest.report summary my_run [--md]
+python -m polars_backtest.report schema  my_run
+python -m polars_backtest.report day     my_run 2024-03-15
+python -m polars_backtest.report symbol  my_run FAKE001
+python -m polars_backtest.report sql     my_run "select ..." --limit 50
+```
+
+Query output says whether the caller saw everything:
+`{"rows": [...], "returned": 50, "total": 1234, "truncated": true}`.
+
+`specs/report_bundle.schema.json` is the full table contract. Optional columns are left
+out when absent, never filled with null. Bundle names differ from engine names on
+purpose: `symbol` for `stock_id`, `ret` for `return`, `weight` for `position`.
+
+| Name | Meaning |
+|---|---|
+| `win_rate` | Closed round trips with `ret > 0` |
+| `segment_win_rate` | The same over engine rows, equal to `get_metrics()` `winRate` |
+| `contrib_proxy` | `ret × abs(weight)`, an approximation, not booked P&L |
+| `costs.annual_drag` | Booked with `source: "ledger"`, turnover × fee settings with `"estimate"` |
+| `turnover.annual_two_sided` | Ledger, two-sided |
+| `turnover.annual_entry_weight` | From trades, one-sided, not comparable with the line above |
+| `drawdown.longest_underwater_days` | Calendar days from a high to regaining it, or to the last day |
+| `entry_date.*` | Every 252-day hold, one per start date. Windows overlap |
+| `concentration.cagr_ex_best` | Annualised return with the best 5% of months set flat |
+| `net_of_costs.cost_share` | `(gross_cagr - net_cagr) / gross_cagr`, ledger only |
+| `limit_fills.share_return` | Share of summed `contrib_proxy` from limit-price fills, needs `input_df` |
+| `yearly.mdd` | Worst fall counted from highs inside the year |
+
+`summary["flags"]` holds the whole-period judgement: `capacity`, `limit_dependence`,
+`cost_sensitivity`, `alpha_decay`, and `long_short_balance` when there are shorts. Each
+has a `level` of `green`, `amber`, `red` or `na`, its `value`, `rule` and bounds.
+
 ## Wide-format API (Finlab-style matrices)
 
 For users holding wide DataFrames (first column = date, one column per symbol).
