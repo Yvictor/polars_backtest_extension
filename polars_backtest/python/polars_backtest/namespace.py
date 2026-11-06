@@ -174,7 +174,12 @@ def _prepare_long(
 
     mark_col = None
     if mark_price is not None:
-        df, mark_col = _resolve_column(df, mark_price, "_bt_mark")
+        trade_expr = pl.col(trade_at_price) if isinstance(trade_at_price, str) else trade_at_price
+        mark_expr = pl.col(mark_price) if isinstance(mark_price, str) else mark_price
+        if mark_expr.meta.eq(trade_expr):
+            mark_col = price_col
+        else:
+            df, mark_col = _resolve_column(df, mark_price, "_bt_mark")
 
     # Validate columns exist
     required = [date_col, symbol_col, price_col, position_col]
@@ -300,7 +305,9 @@ class BacktestNamespace:
         Args:
             trade_at_price: Next-session execution price column or Expr
             mark_price: Closing valuation column or Expr; None uses trade_at_price
-            slippage_ratio: Adverse fill price ratio in [0, 1)
+            slippage_ratio: Adverse fill price ratio in [0, 1). Buy fees retain the
+                legacy budget base; only the traded fraction slips. Continuing
+                trade segments use an unslipped entry basis.
             position: Position/weight column name or Expr (default: "weight")
             date: Date column name or Expr (default: "date")
             symbol: Symbol column name or Expr (default: "symbol")
@@ -417,7 +424,9 @@ class BacktestNamespace:
         Args:
             trade_at_price: Next-session execution price column or Expr
             mark_price: Closing valuation column or Expr; None uses trade_at_price
-            slippage_ratio: Adverse fill price ratio in [0, 1)
+            slippage_ratio: Adverse fill price ratio in [0, 1). Buy fees retain the
+                legacy budget base; only the traded fraction slips. Continuing
+                trade segments use an unslipped entry basis.
             position: Position/weight column name or Expr (default: "weight")
             date: Date column name or Expr (default: "date")
             symbol: Symbol column name or Expr (default: "symbol")
@@ -576,7 +585,9 @@ def backtest(
         df: Long format DataFrame with date, symbol, price, position columns
         trade_at_price: Next-session execution price column or Expr
         mark_price: Closing valuation column or Expr; None uses trade_at_price
-        slippage_ratio: Adverse fill price ratio in [0, 1)
+        slippage_ratio: Adverse fill price ratio in [0, 1). Buy fees retain the
+                legacy budget base; only the traded fraction slips. Continuing
+                trade segments use an unslipped entry basis.
         position: Position/weight column name or Expr (default: "weight")
         date: Date column name or Expr (default: "date")
         symbol: Symbol column name or Expr (default: "symbol")
@@ -676,7 +687,9 @@ def backtest_with_report(
         df: Long format DataFrame with date, symbol, price, position columns
         trade_at_price: Next-session execution price column or Expr
         mark_price: Closing valuation column or Expr; None uses trade_at_price
-        slippage_ratio: Adverse fill price ratio in [0, 1)
+        slippage_ratio: Adverse fill price ratio in [0, 1). Buy fees retain the
+                legacy budget base; only the traded fraction slips. Continuing
+                trade segments use an unslipped entry basis.
         position: Position/weight column name or Expr (default: "weight")
         date: Date column name or Expr (default: "date")
         symbol: Symbol column name or Expr (default: "symbol")

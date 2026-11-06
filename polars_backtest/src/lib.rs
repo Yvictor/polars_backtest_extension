@@ -929,7 +929,8 @@ fn backtest(
     let offset = parse_resample_offset(resample_offset)?;
 
     // Run backtest using btcore with arrow-rs arrays
-    let result = backtest_long_arrow(&arrays.input(), resample_freq, offset, &cfg);
+    let result = backtest_long_arrow(&arrays.input(), resample_freq, offset, &cfg)
+        .map_err(|e| PyValueError::new_err(e.to_string()))?;
 
     profile!("[PROFILE] Backtest (btcore): {:?}", step_start.elapsed());
     step_start = Instant::now();
@@ -1044,7 +1045,8 @@ fn backtest_with_report(
     let offset = parse_resample_offset(resample_offset)?;
 
     // Run backtest with report using btcore
-    let result = backtest_with_report_long_arrow(&arrays.input(), resample_freq, offset, &cfg);
+    let result = backtest_with_report_long_arrow(&arrays.input(), resample_freq, offset, &cfg)
+        .map_err(|e| PyValueError::new_err(e.to_string()))?;
 
     // Process benchmark parameter (can be str column name or PyDataFrame)
     let benchmark_df: Option<DataFrame> = if let Some(bm_obj) = benchmark {

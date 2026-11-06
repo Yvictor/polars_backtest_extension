@@ -177,3 +177,103 @@ def test_collecting_ledger_with_open_marks_changes_no_bits(touched):
     ledger = bt.backtest_with_report(df, ledger=True, **options)
     assert_frame_equal(plain.creturn, ledger.creturn, check_exact=True)
     assert_frame_equal(plain.trades, ledger.trades, check_exact=True)
+
+
+def test_stop_timing_is_prefix_invariant():
+    df = prices(weights=(1.0,) * 4, opens=(100.0,) * 4, closes=(100.0,) * 4).with_columns(
+        pl.lit(105.0).alias("high"), pl.lit(99.0).alias("low")
+    )
+    options = dict(trade_at_price="open", mark_price="close", touched_exit=True, take_profit=0.04)
+    original = run(df, **options)
+    changed = run(df.with_columns(pl.Series("close", [100.0, 100.0, 100.0, 101.0])), **options)
+    prefix = run(df.head(3), **options)
+    for report in (changed, prefix):
+        assert_frame_equal(original.daily.head(3), report.daily.head(3), check_exact=True)
+        assert_frame_equal(
+            original.fills.filter(pl.col("date") <= dt.date(2024, 1, 4)),
+            report.fills.filter(pl.col("date") <= dt.date(2024, 1, 4)),
+            check_exact=True,
+        )
+
+
+def test_touched_gap_exit_uses_open_after_prior_gain():
+    df = prices(
+        weights=(1.0,) * 4, opens=(100.0, 100.0, 80.0, 80.0), closes=(100.0, 100.0, 90.0, 90.0)
+    ).with_columns(
+        pl.Series("high", [105.0, 105.0, 95.0, 95.0]),
+        pl.Series("low", [99.0, 99.0, 79.0, 79.0]),
+    )
+    report = run(df, trade_at_price="open", mark_price="close", touched_exit=True, stop_loss=0.1)
+    stop = report.fills.filter(pl.col("reason") == "stop")
+    assert stop["price"][0] == pytest.approx(80.0)
+    assert report.creturn["creturn"][-1] == pytest.approx(0.8)
+
+
+def test_touched_exit_metrics_exclude_the_later_closing_mark():
+    df = prices(
+        weights=(1.0,) * 4, opens=(100.0, 100.0, 80.0, 80.0), closes=(100.0, 100.0, 200.0, 200.0)
+    ).with_columns(
+        pl.Series("high", [105.0, 105.0, 210.0, 210.0]),
+        pl.Series("low", [99.0, 99.0, 79.0, 79.0]),
+    )
+    report = run(df, trade_at_price="open", mark_price="close", touched_exit=True, stop_loss=0.1)
+    trade = report.trades.row(0, named=True)
+    assert trade["return"] == pytest.approx(-0.2)
+    assert trade["mae"] == pytest.approx(-0.2)
+    assert trade["mdd"] == pytest.approx(-0.2)
+    assert trade["gmfe"] == pytest.approx(0.0)
+
+
+@pytest.mark.parametrize("stopped", [False, True])
+def test_exit_observation_is_in_metrics_without_later_close(stopped):
+    df = prices(
+        weights=(1.0, 0.0, 0.0, 0.0),
+        opens=(100.0, 100.0, 50.0, 50.0),
+        closes=(100.0, 100.0, 200.0, 200.0),
+    )
+    if stopped:
+        df = df.with_columns(pl.Series("close", [100.0, 90.0, 200.0, 200.0]))
+    report = run(df, trade_at_price="open", mark_price="close", stop_loss=0.05 if stopped else 1.0)
+    trade = report.trades.row(0, named=True)
+    assert trade["return"] == pytest.approx(-0.5)
+    assert trade["mae"] == pytest.approx(-0.5)
+    assert trade["mdd"] == pytest.approx(-0.5)
+    assert trade["gmfe"] == pytest.approx(0.0)
+
+
+@pytest.mark.parametrize("weight", [0.5, 0.9])
+def test_continuing_position_resets_to_unslipped_basis(weight):
+    df = prices(weights=(0.8, weight, weight, weight), opens=(100.0,) * 4, closes=(100.0,) * 4)
+    df = df.vstack(df.tail(1).with_columns(pl.lit(dt.date(2024, 1, 6)).alias("date")))
+    report = run(df, slippage_ratio=0.1, take_profit=0.05, retain_cost_when_rebalance=False)
+    assert report.fills.filter(pl.col("reason") == "stop").is_empty()
+    assert report.trades["entry_price"][1] == 100.0
+
+
+def test_buy_fee_base_is_continuous_at_zero_slippage():
+    df = prices(opens=(100.0,) * 4, closes=(100.0,) * 4)
+    options = dict(resample=None, fee_ratio=0.01, tax_ratio=0.02, ledger=True)
+    plain = bt.backtest_with_report(df, **options)
+    tiny = bt.backtest_with_report(df, slippage_ratio=1e-12, **options)
+    assert tiny.daily["commission"].to_list() == pytest.approx(
+        plain.daily["commission"].to_list(), abs=1e-12
+    )
+    assert tiny.creturn["creturn"].to_list() == pytest.approx(
+        plain.creturn["creturn"].to_list(), abs=3e-12
+    )
+
+
+@pytest.mark.parametrize(
+    "weights",
+    [(0.8, 0.5, 0.0, 0.0), (0.5, 0.8, 0.0, 0.0), (1.0, -1.0, 0.0, 0.0), (-1.0, 1.0, 0.0, 0.0)],
+)
+def test_net_leg_costs_reconcile_with_flat_equity(weights):
+    df = prices(weights=weights, opens=(100.0,) * 4, closes=(100.0,) * 4)
+    report = bt.backtest_with_report(
+        df, resample=None, fee_ratio=0.01, tax_ratio=0.02, slippage_ratio=0.1, ledger=True
+    )
+    costs = report.daily.select(pl.sum_horizontal("commission", "tax", "slippage")).to_series()
+    assert report.daily["equity"].to_list() == pytest.approx((1.0 - costs.cum_sum()).to_list())
+    assert report.daily["traded_notional"].sum() == pytest.approx(
+        report.fills["notional"].abs().sum()
+    )
