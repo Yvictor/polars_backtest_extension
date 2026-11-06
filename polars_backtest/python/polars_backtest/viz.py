@@ -56,7 +56,9 @@ def _stats_row(report: Any) -> dict[str, Any]:
 
 def _daily_curve(report: Any) -> pl.DataFrame:
     if hasattr(report, "daily_creturn"):
-        curve = report.daily_creturn()
+        # A method on the long report, a cached property on the wide one.
+        curve = report.daily_creturn
+        curve = curve() if callable(curve) else curve
     else:
         curve = report.creturn
     if not isinstance(curve, pl.DataFrame) or curve.is_empty():
@@ -180,6 +182,12 @@ def _with_limit_kinds(trades: pl.DataFrame, input_df: pl.DataFrame | None) -> pl
     return classify_limit_trades(trades, input_df)
 
 
+def _dated_trades(trades: pl.DataFrame) -> pl.DataFrame:
+    """Date columns as dates. The wide report carries them as text."""
+    text = [c for c, kind in trades.schema.items() if c.endswith("_date") and kind == pl.String]
+    return trades.with_columns(pl.col(c).str.to_date() for c in text)
+
+
 def _merge_rolled_trades(trades: pl.DataFrame) -> pl.DataFrame:
     """Collapse per-rebalance rolled segments into round-trip trades.
 
@@ -250,6 +258,7 @@ def _trades_payload(
     trades = getattr(report, "trades", None)
     if not isinstance(trades, pl.DataFrame) or trades.is_empty():
         return None, {}
+    trades = _dated_trades(trades)
     segments_total = trades.height
     trades = _merge_rolled_trades(trades)
     total = trades.height
