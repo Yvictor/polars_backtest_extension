@@ -11,7 +11,7 @@
 //! - Zero-copy access to price/weight data
 //! - Only processes active stocks per day O(k) instead of O(n_stocks)
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 
 use arrow::array::{Float64Array, Int32Array, StringViewArray};
 
@@ -21,16 +21,19 @@ use crate::tracker::{BacktestResult, StockOperations, TradeRecord, NoopSymbolTra
 use crate::{is_valid_price, FLOAT_EPSILON};
 
 /// Portfolio with string symbol keys (for zero-copy backtest)
+///
+/// Positions are ordered by symbol: floating-point sums over them depend on
+/// the visit order, and results must not vary between processes.
 pub struct Portfolio {
     pub cash: f64,
-    pub positions: HashMap<String, Position>,
+    pub positions: BTreeMap<String, Position>,
 }
 
 impl Portfolio {
     pub fn new() -> Self {
         Self {
             cash: 1.0,
-            positions: HashMap::new(),
+            positions: BTreeMap::new(),
         }
     }
 
@@ -247,14 +250,10 @@ where
         return (vec![], vec![]);
     }
 
-    let mut portfolio = Portfolio::new();
+    let mut session = SessionState::new();
     let mut dates: Vec<i32> = Vec::new();
     let mut creturn: Vec<f64> = Vec::new();
-    let mut stopped_stocks: HashMap<String, bool> = HashMap::new();
-    let mut pending_weights: Option<HashMap<String, f64>> = None;
-    let mut pending_signal_date: Option<i32> = None;
-    let mut pending_stop_exits: Vec<String> = Vec::new();
-    let mut active_weights: HashMap<String, f64> = HashMap::new();
+    let mut active_weights: BTreeMap<String, f64> = BTreeMap::new();
     let mut has_first_signal = false;
     let mut position_changed = false;
     let mut current_date: Option<i32> = None;
@@ -283,66 +282,18 @@ where
         if date_changed && current_date.is_some() {
             let prev_date = current_date.unwrap();
 
-            // STEP 1: Update positions (cr *= r, maxcr update)
-            update_positions(&mut portfolio, &today_prices);
+            // STEP 1-3: Update positions, run stops, execute the pending rebalance
+            run_session_day(
+                &mut session,
+                &today_prices,
+                &today_factor,
+                touched_exit_enabled.then_some((&today_open, &today_high, &today_low)),
+                config,
+                prev_date,
+                tracker,
+            );
 
-            // Record prices for MAE/MFE calculation
-            for (sym, _pos) in portfolio.positions.iter() {
-                if let Some(&price) = today_prices.get(sym.as_str()) {
-                    tracker.record_price(sym, price, price);
-                }
-            }
-
-            // STEP 2: Stop detection and execution
-            if touched_exit_enabled {
-                // touched_exit mode: detect and execute IMMEDIATELY (T+0)
-                let ohlc_refs = Some((&today_open, &today_high, &today_low));
-                let stops = detect_stops_unified(&portfolio, &today_prices, ohlc_refs, config);
-                execute_stops_impl(
-                    &mut portfolio,
-                    stops,
-                    &mut stopped_stocks,
-                    &today_prices,
-                    &today_factor,
-                    config,
-                    prev_date,
-                    Some(prev_date), // exit_sig_date = current date (same day)
-                    tracker,
-                );
-                // Clear pending stops (not used in touched_exit mode)
-                pending_stop_exits.clear();
-            } else {
-                // Regular mode: execute pending stops (T+1), then detect new stops
-                // Execute pending stops from yesterday's detection
-                let pending_results: Vec<StopResult> = pending_stop_exits
-                    .drain(..)
-                    .map(|sym| StopResult { symbol: sym, exit_ratio: 1.0 })
-                    .collect();
-                execute_stops_impl(
-                    &mut portfolio,
-                    pending_results,
-                    &mut stopped_stocks,
-                    &today_prices,
-                    &today_factor,
-                    config,
-                    prev_date,
-                    None, // No exit_sig_date for regular stops
-                    tracker,
-                );
-
-                // Detect new stops for tomorrow's execution
-                let new_stops = detect_stops_unified(&portfolio, &today_prices, None, config);
-                for stop in new_stops {
-                    pending_stop_exits.push(stop.symbol);
-                }
-            }
-
-            // Update previous_price AFTER stop detection (matches wide format behavior)
-            // This ensures touched_exit uses the correct previous_price for ratio calculations
-            update_previous_prices(&mut portfolio, &today_prices);
-
-            // Check if any delayed rebalances are due
-            // Move them to pending_weights for execution
+            // Delayed rebalances move to pending_weights in STEP 5b
             //
             // Wide format behavior with offset:
             // - _resample_position shifts boundary dates forward by offset
@@ -370,40 +321,11 @@ where
             // - prev_date (Apr1) is the last trading day <= Apr1
             // - Use today_weights (Apr1's weights)
             //
-            // Note: The delayed rebalance is checked AFTER queueing new ones (below).
+            // Note: The delayed rebalance is checked AFTER queueing new ones.
             // This ensures that if a delayed rebalance is queued and triggers on
             // the same transition, it uses the correct weights (today_weights).
-            let delayed_triggered = false;
-
-            // STEP 3: Execute pending rebalance
-            // Skip if delayed triggered this iteration - execute on T+1
-            // This matches Wide format where signal_date records creturn BEFORE rebalance
-            if delayed_triggered {
-                // Keep pending_weights for next day (T+1 execution)
-                // Don't take() so it stays in pending_weights
-            } else if let Some(target_weights) = pending_weights.take() {
-                let sig_date = pending_signal_date.take().unwrap_or(prev_date);
-                execute_rebalance_impl(
-                    &mut portfolio,
-                    &target_weights,
-                    &today_prices,
-                    &today_factor,
-                    &stopped_stocks,
-                    config,
-                    prev_date,
-                    sig_date,
-                    tracker,
-                );
-                stopped_stocks.clear();
-            }
 
             // STEP 4: Update active weights based on today's signals
-            let normalized = normalize_weights(
-                &today_weights,
-                &stopped_stocks,
-                config.position_limit,
-            );
-
             // Check if prev_date is a rebalance boundary
             let is_month_end = is_month_end_i32(prev_date, date);
             let is_week_end = is_week_end_i32(prev_date, date);
@@ -416,6 +338,26 @@ where
             // When offset > 0, has_first_signal is set when delayed rebalance triggers
             // (already handled above), not at boundary. This matches Wide format behavior.
             let set_first_signal_at_boundary = offset_days == 0;
+
+            let at_boundary = match resample {
+                ResampleFreq::Monthly | ResampleFreq::MonthStart => is_month_end,
+                ResampleFreq::Weekly => is_week_end,
+                ResampleFreq::WeeklyOn(weekday) => prev_weekday == weekday,
+                ResampleFreq::Quarterly | ResampleFreq::QuarterStart => is_quarter_end,
+                ResampleFreq::Yearly => is_year_end,
+                ResampleFreq::Daily | ResampleFreq::PositionChange => true,
+            };
+
+            // Today's weights only matter on a boundary
+            let normalized = if at_boundary {
+                normalize_weights(
+                    &today_weights,
+                    &session.stopped_stocks,
+                    config.position_limit,
+                )
+            } else {
+                BTreeMap::new()
+            };
 
             // Track if we have signals for later use
             let has_signals = !normalized.is_empty();
@@ -486,13 +428,8 @@ where
             // (has_first_signal will be set when delayed rebalance triggers)
             // When offset = 0: only rebalance after first signal (normal behavior)
             let should_rebalance = match resample {
-                ResampleFreq::Monthly | ResampleFreq::MonthStart => is_month_end,
-                ResampleFreq::Weekly => is_week_end,
-                ResampleFreq::WeeklyOn(weekday) => prev_weekday == weekday,
-                ResampleFreq::Quarterly | ResampleFreq::QuarterStart => is_quarter_end,
-                ResampleFreq::Yearly => is_year_end,
-                ResampleFreq::Daily => true,
                 ResampleFreq::PositionChange => position_changed,
+                _ => at_boundary,
             };
 
             if should_rebalance {
@@ -511,8 +448,8 @@ where
                     }
                 } else if has_first_signal {
                     // No offset: set pending_weights for next day (T+1)
-                    pending_weights = Some(active_weights.clone());
-                    pending_signal_date = Some(prev_date);
+                    session.pending_weights = Some(active_weights.clone());
+                    session.pending_signal_date = Some(prev_date);
                 }
             }
 
@@ -545,7 +482,7 @@ where
                 // Use today_weights (prev_date's weights, which is the signal date)
                 let signal_weights = normalize_weights(
                     &today_weights,
-                    &stopped_stocks,
+                    &session.stopped_stocks,
                     config.position_limit,
                 );
 
@@ -555,18 +492,15 @@ where
                 if !has_first_signal && !signal_weights.is_empty() {
                     has_first_signal = true;
                 }
-                pending_weights = Some(signal_weights);
-                pending_signal_date = Some(prev_date);
-                // Note: delayed_triggered is set for documentation purposes
-                // The actual skip logic is in STEP 3 which runs before this
-                let _ = delayed_triggered;  // suppress unused warning
+                session.pending_weights = Some(signal_weights);
+                session.pending_signal_date = Some(prev_date);
             }
 
             // STEP 6: Record date and creturn (only after first signal)
             // This matches Wide format behavior where creturn starts from first signal date
             if has_first_signal {
                 dates.push(prev_date);
-                creturn.push(portfolio.balance());
+                creturn.push(session.portfolio.balance());
             }
 
             today_prices.clear();
@@ -602,62 +536,15 @@ where
     // Final day
     if let Some(last_date) = current_date {
         if !today_prices.is_empty() {
-            update_positions(&mut portfolio, &today_prices);
-
-            // Record prices for MAE/MFE calculation (final day)
-            for (sym, _pos) in portfolio.positions.iter() {
-                if let Some(&price) = today_prices.get(sym.as_str()) {
-                    tracker.record_price(sym, price, price);
-                }
-            }
-
-            // Stop detection and execution (same logic as main loop)
-            if touched_exit_enabled {
-                // touched_exit mode: detect and execute immediately (T+0)
-                let ohlc_refs = Some((&today_open, &today_high, &today_low));
-                let stops = detect_stops_unified(&portfolio, &today_prices, ohlc_refs, config);
-                execute_stops_impl(
-                    &mut portfolio,
-                    stops,
-                    &mut stopped_stocks,
-                    &today_prices,
-                    &today_factor,
-                    config,
-                    last_date,
-                    Some(last_date),
-                    tracker,
-                );
-            } else {
-                // Regular mode: execute pending stops (T+1)
-                execute_pending_stops_impl(
-                    &mut portfolio,
-                    &mut pending_stop_exits,
-                    &mut stopped_stocks,
-                    &today_prices,
-                    &today_factor,
-                    config,
-                    last_date,
-                    tracker,
-                );
-            }
-
-            // Update previous_price AFTER stop detection
-            update_previous_prices(&mut portfolio, &today_prices);
-
-            if let Some(target_weights) = pending_weights.take() {
-                let sig_date = pending_signal_date.take().unwrap_or(last_date);
-                execute_rebalance_impl(
-                    &mut portfolio,
-                    &target_weights,
-                    &today_prices,
-                    &today_factor,
-                    &stopped_stocks,
-                    config,
-                    last_date,
-                    sig_date,
-                    tracker,
-                );
-            }
+            run_session_day(
+                &mut session,
+                &today_prices,
+                &today_factor,
+                touched_exit_enabled.then_some((&today_open, &today_high, &today_low)),
+                config,
+                last_date,
+                tracker,
+            );
 
             // Handle single-date case: if we have weights but no first signal yet,
             // record the signal day with creturn=1.0 (matching Wide format behavior)
@@ -668,12 +555,135 @@ where
             // Only record if we have first signal (consistent with main loop)
             if has_first_signal {
                 dates.push(last_date);
-                creturn.push(portfolio.balance());
+                creturn.push(session.portfolio.balance());
             }
         }
     }
 
     (dates, creturn)
+}
+
+/// State carried from one session to the next
+struct SessionState {
+    portfolio: Portfolio,
+    stopped_stocks: HashMap<String, bool>,
+    pending_weights: Option<BTreeMap<String, f64>>,
+    pending_signal_date: Option<i32>,
+    pending_stop_exits: Vec<String>,
+}
+
+impl SessionState {
+    fn new() -> Self {
+        Self {
+            portfolio: Portfolio::new(),
+            stopped_stocks: HashMap::new(),
+            pending_weights: None,
+            pending_signal_date: None,
+            pending_stop_exits: Vec::new(),
+        }
+    }
+}
+
+/// Open, high and low prices of one day, for touched_exit mode
+type DayOhlc<'d, 'a> = (
+    &'d HashMap<&'a str, f64>,
+    &'d HashMap<&'a str, f64>,
+    &'d HashMap<&'a str, f64>,
+);
+
+/// Process one trading day up to the signal step
+///
+/// Marks positions, runs stops, then executes the pending rebalance. The loop
+/// body and the final day both go through here; only the signal step differs,
+/// because it needs the next date.
+fn run_session_day<T>(
+    session: &mut SessionState,
+    today_prices: &HashMap<&str, f64>,
+    today_factor: &HashMap<&str, f64>,
+    ohlc: Option<DayOhlc<'_, '_>>,
+    config: &BacktestConfig,
+    date: i32,
+    tracker: &mut T,
+) where
+    T: TradeTracker<Key = String, Date = i32, Record = TradeRecord>,
+{
+    // Update positions (cr *= r, maxcr update)
+    update_positions(&mut session.portfolio, today_prices);
+
+    // Record prices for MAE/MFE calculation
+    for (sym, _pos) in session.portfolio.positions.iter() {
+        if let Some(&price) = today_prices.get(sym.as_str()) {
+            tracker.record_price(sym, price, price);
+        }
+    }
+
+    // Stop detection and execution
+    if ohlc.is_some() {
+        // touched_exit mode: detect and execute IMMEDIATELY (T+0)
+        let stops = detect_stops_unified(&session.portfolio, today_prices, ohlc, config);
+        execute_stops_impl(
+            &mut session.portfolio,
+            stops,
+            &mut session.stopped_stocks,
+            today_prices,
+            today_factor,
+            config,
+            date,
+            Some(date), // exit_sig_date = current date (same day)
+            tracker,
+        );
+        // Clear pending stops (not used in touched_exit mode)
+        session.pending_stop_exits.clear();
+    } else {
+        // Regular mode: execute pending stops (T+1), then detect new stops
+        // Execute pending stops from yesterday's detection
+        let pending_results: Vec<StopResult> = session
+            .pending_stop_exits
+            .drain(..)
+            .map(|sym| StopResult {
+                symbol: sym,
+                exit_ratio: 1.0,
+            })
+            .collect();
+        execute_stops_impl(
+            &mut session.portfolio,
+            pending_results,
+            &mut session.stopped_stocks,
+            today_prices,
+            today_factor,
+            config,
+            date,
+            None, // No exit_sig_date for regular stops
+            tracker,
+        );
+
+        // Detect new stops for tomorrow's execution
+        let new_stops = detect_stops_unified(&session.portfolio, today_prices, None, config);
+        for stop in new_stops {
+            session.pending_stop_exits.push(stop.symbol);
+        }
+    }
+
+    // Update previous_price AFTER stop detection (matches wide format behavior)
+    // This ensures touched_exit uses the correct previous_price for ratio calculations
+    update_previous_prices(&mut session.portfolio, today_prices);
+
+    // Execute pending rebalance
+    if let Some(target_weights) = session.pending_weights.take() {
+        let sig_date = session.pending_signal_date.take().unwrap_or(date);
+        execute_rebalance_impl(
+            &mut session.portfolio,
+            &target_weights,
+            today_prices,
+            today_factor,
+            &session.stopped_stocks,
+            config,
+            date,
+            sig_date,
+            tracker,
+        );
+        session.stopped_stocks.clear();
+    }
 }
 
 /// Run backtest with closure-based data access (public API, no trade tracking)
@@ -1118,7 +1128,7 @@ fn calculate_stock_operations(
     let n = input.dates.len();
     let mut current_signal_date: Option<i32> = None;
     let mut future_signal_date: Option<i32> = None;
-    let mut signal_weights: HashMap<String, f64> = HashMap::new();
+    let mut signal_weights: BTreeMap<String, f64> = BTreeMap::new();
 
     // First pass: find the NEXT signal date (first date > last_price_date with signals)
     for i in 0..n {
@@ -1177,7 +1187,7 @@ fn calculate_stock_operations(
 
     // Find current weights (from current positions)
     // For simplicity, we use position_weight from trades
-    let current_weights: HashMap<String, f64> = trades
+    let current_weights: BTreeMap<String, f64> = trades
         .iter()
         .filter(|t| t.entry_date.is_some() && t.exit_date.is_none())
         .map(|t| (t.symbol.clone(), t.position_weight))
@@ -1185,7 +1195,7 @@ fn calculate_stock_operations(
 
     // Calculate total current weight for normalization
     let total_current: f64 = current_weights.values().map(|w| w.abs()).sum();
-    let normalized_current: HashMap<String, f64> = if total_current > 1.0 {
+    let normalized_current: BTreeMap<String, f64> = if total_current > 1.0 {
         current_weights
             .iter()
             .map(|(k, v)| (k.clone(), v / total_current))
@@ -1505,47 +1515,6 @@ fn update_previous_prices(portfolio: &mut Portfolio, prices: &HashMap<&str, f64>
     }
 }
 
-/// Execute pending stop exits with optional trade tracking
-///
-/// This is the unified implementation that supports both:
-/// - No tracking: Use `NoopSymbolTracker`
-/// - Trade tracking: Use `SymbolTracker`
-fn execute_pending_stops_impl<T>(
-    portfolio: &mut Portfolio,
-    pending_stops: &mut Vec<String>,
-    stopped_stocks: &mut HashMap<String, bool>,
-    today_prices: &HashMap<&str, f64>,
-    today_factor: &HashMap<&str, f64>,
-    config: &BacktestConfig,
-    current_date: i32,
-    tracker: &mut T,
-)
-where
-    T: TradeTracker<Key = String, Date = i32, Record = TradeRecord>,
-{
-    for sym in pending_stops.drain(..) {
-        if let Some(pos) = portfolio.positions.remove(&sym) {
-            let exit_price = today_prices.get(sym.as_str()).copied().unwrap_or(pos.previous_price);
-            let exit_factor = today_factor.get(sym.as_str()).copied().unwrap_or(1.0);
-            tracker.close_trade(
-                &sym,
-                current_date,
-                None, // Stop exit, no signal date
-                exit_price,
-                exit_factor,
-                config.fee_ratio,
-                config.tax_ratio,
-            );
-            let sell_value =
-                pos.last_market_value - pos.last_market_value.abs() * (config.fee_ratio + config.tax_ratio);
-            portfolio.cash += sell_value;
-            if config.stop_trading_next_period {
-                stopped_stocks.insert(sym, true);
-            }
-        }
-    }
-}
-
 /// Stop detection result with optional exit ratio for touched_exit mode
 #[derive(Debug, Clone)]
 pub struct StopResult {
@@ -1711,13 +1680,41 @@ where
                 config.tax_ratio,
             );
 
-            let sell_value = exit_value - exit_value.abs() * (config.fee_ratio + config.tax_ratio);
-            portfolio.cash += sell_value;
+            portfolio.cash += exit_proceeds(exit_value, config);
 
             if config.stop_trading_next_period {
                 stopped_stocks.insert(stop.symbol, true);
             }
         }
+    }
+}
+
+/// Cash received for closing a position worth `value`, after fee and tax
+fn exit_proceeds(value: f64, config: &BacktestConfig) -> f64 {
+    value - value.abs() * (config.fee_ratio + config.tax_ratio)
+}
+
+/// Book the leg that moves a position from `current_value` to `target_value`
+///
+/// Moves the traded amount through `cash` and returns the new position value.
+/// A buy pays its cost out of the position, a sell out of the proceeds.
+fn book_leg(cash: &mut f64, current_value: f64, target_value: f64, config: &BacktestConfig) -> f64 {
+    let amount = target_value - current_value;
+    let is_buy = amount > 0.0;
+    let is_entry = (target_value >= 0.0 && amount > 0.0) || (target_value <= 0.0 && amount < 0.0);
+    let cost = if is_entry {
+        amount.abs() * config.fee_ratio
+    } else {
+        amount.abs() * (config.fee_ratio + config.tax_ratio)
+    };
+
+    if is_buy {
+        *cash -= amount;
+        current_value + amount - cost
+    } else {
+        let sell_amount = amount.abs();
+        *cash += sell_amount - cost;
+        current_value - sell_amount
     }
 }
 
@@ -1729,7 +1726,7 @@ where
 /// - Trade tracking: Use `SymbolTracker`
 fn execute_rebalance_impl<T>(
     portfolio: &mut Portfolio,
-    target_weights: &HashMap<String, f64>,
+    target_weights: &BTreeMap<String, f64>,
     today_prices: &HashMap<&str, f64>,
     today_factor: &HashMap<&str, f64>,
     stopped_stocks: &HashMap<String, bool>,
@@ -1773,7 +1770,7 @@ where
         let original_sum: f64 = target_weights.values().map(|w| w.abs()).sum();
 
         // Filter out stopped stocks
-        let filtered: HashMap<String, f64> = target_weights
+        let filtered: BTreeMap<String, f64> = target_weights
             .iter()
             .filter(|(sym, _)| !stopped_stocks.get(*sym).copied().unwrap_or(false))
             .map(|(k, &v)| (k.clone(), v))
@@ -1785,7 +1782,7 @@ where
         // Re-normalize: scale up remaining weights to maintain full investment
         if remaining_sum > 0.0 && remaining_sum < original_sum {
             let scale_factor = original_sum / remaining_sum;
-            let scaled: HashMap<String, f64> = filtered
+            let scaled: BTreeMap<String, f64> = filtered
                 .into_iter()
                 .map(|(k, v)| (k, v * scale_factor))
                 .collect();
@@ -1804,8 +1801,7 @@ where
         let all_positions: Vec<String> = portfolio.positions.keys().cloned().collect();
         for sym in all_positions {
             if let Some(pos) = portfolio.positions.remove(&sym) {
-                let sell_value = pos.value - pos.value.abs() * (config.fee_ratio + config.tax_ratio);
-                portfolio.cash += sell_value;
+                portfolio.cash += exit_proceeds(pos.value, config);
             }
         }
         return;
@@ -1844,8 +1840,7 @@ where
             if target_weight.abs() < FLOAT_EPSILON {
                 if let Some(snap) = snapshot {
                     if snap.market_value.abs() > FLOAT_EPSILON {
-                        let sell_fee = snap.market_value.abs() * (config.fee_ratio + config.tax_ratio);
-                        cash += snap.market_value - sell_fee;
+                        cash += exit_proceeds(snap.market_value, config);
                     }
                 }
                 continue;
@@ -1853,24 +1848,7 @@ where
 
             // Finlab behavior: Enter/modify position even with NaN price
             if target_value.abs() > FLOAT_EPSILON {
-                let amount = target_value - current_value;
-                let is_buy = amount > 0.0;
-                let is_entry =
-                    (target_value >= 0.0 && amount > 0.0) || (target_value <= 0.0 && amount < 0.0);
-                let cost = if is_entry {
-                    amount.abs() * config.fee_ratio
-                } else {
-                    amount.abs() * (config.fee_ratio + config.tax_ratio)
-                };
-
-                let new_value = if is_buy {
-                    cash -= amount;
-                    current_value + amount - cost
-                } else {
-                    let sell_amount = amount.abs();
-                    cash += sell_amount - cost;
-                    current_value - sell_amount
-                };
+                let new_value = book_leg(&mut cash, current_value, target_value, config);
 
                 if new_value.abs() > FLOAT_EPSILON {
                     // Finlab behavior: Open trade for ALL positions after rebalance
@@ -1891,30 +1869,12 @@ where
         // Note: close_trade was already called at the start for ALL positions
         if target_weight.abs() < FLOAT_EPSILON {
             if current_value.abs() > FLOAT_EPSILON {
-                let sell_fee = current_value.abs() * (config.fee_ratio + config.tax_ratio);
-                cash += current_value - sell_fee;
+                cash += exit_proceeds(current_value, config);
             }
             continue;
         }
 
-        let amount = target_value - current_value;
-
-        let is_buy = amount > 0.0;
-        let is_entry = (target_value >= 0.0 && amount > 0.0) || (target_value <= 0.0 && amount < 0.0);
-        let cost = if is_entry {
-            amount.abs() * config.fee_ratio
-        } else {
-            amount.abs() * (config.fee_ratio + config.tax_ratio)
-        };
-
-        let new_position_value = if is_buy {
-            cash -= amount;
-            current_value + amount - cost
-        } else {
-            let sell_amount = amount.abs();
-            cash += sell_amount - cost;
-            current_value - sell_amount
-        };
+        let new_position_value = book_leg(&mut cash, current_value, target_value, config);
 
         if new_position_value.abs() > FLOAT_EPSILON {
             // Finlab behavior: Open trade for ALL positions after rebalance
@@ -1940,10 +1900,10 @@ where
 
     // Handle positions outside effective_weights (sell them)
     // Note: close_trade was already called at the start for ALL positions
-    for (sym, snap) in old_snapshots.iter() {
+    for sym in &open_positions {
+        let snap = &old_snapshots[sym];
         if !effective_weights.contains_key(sym) && snap.cost_basis.abs() > FLOAT_EPSILON {
-            let sell_fee = snap.cost_basis.abs() * (config.fee_ratio + config.tax_ratio);
-            cash += snap.cost_basis - sell_fee;
+            cash += exit_proceeds(snap.cost_basis, config);
         }
     }
 
@@ -1955,7 +1915,7 @@ where
 /// Two weight maps differ if:
 /// 1. They have different keys (symbols)
 /// 2. Any corresponding weights differ by more than FLOAT_EPSILON
-fn weights_differ(a: &HashMap<String, f64>, b: &HashMap<String, f64>) -> bool {
+fn weights_differ(a: &BTreeMap<String, f64>, b: &BTreeMap<String, f64>) -> bool {
     // Different number of symbols
     if a.len() != b.len() {
         return true;
@@ -1981,9 +1941,9 @@ fn normalize_weights(
     weights: &HashMap<&str, f64>,
     stopped_stocks: &HashMap<String, bool>,
     position_limit: f64,
-) -> HashMap<String, f64> {
+) -> BTreeMap<String, f64> {
     // Filter out stopped stocks and zero weights
-    let filtered: Vec<(&str, f64)> = weights
+    let mut filtered: Vec<(&str, f64)> = weights
         .iter()
         .filter(|(sym, w)| {
             // sym is &&str, *sym is &str
@@ -1996,8 +1956,11 @@ fn normalize_weights(
         .collect();
 
     if filtered.is_empty() {
-        return HashMap::new();
+        return BTreeMap::new();
     }
+
+    // Sum in symbol order so the rounding does not depend on map order
+    filtered.sort_unstable_by_key(|&(sym, _)| sym);
 
     // Finlab normalization: divisor = max(abs_sum, 1.0)
     let abs_sum: f64 = filtered.iter().map(|(_, w)| w.abs()).sum();
@@ -2200,6 +2163,49 @@ mod tests {
         assert!((result.creturn[0] - 1.0).abs() < FLOAT_EPSILON, "Jan 31 (signal): {}", result.creturn[0]);
         assert!((result.creturn[1] - 1.0).abs() < FLOAT_EPSILON, "Feb 1 (entry): {}", result.creturn[1]);
         assert!((result.creturn[2] - 1.1).abs() < FLOAT_EPSILON, "Feb 2 (+10%): {}", result.creturn[2]);
+    }
+
+    #[test]
+    fn test_many_names_repeat_to_the_bit() {
+        // Every HashMap instance gets its own random seed, so unordered reductions
+        // would differ between these runs even inside one process.
+        let names: Vec<String> = (0..40).map(|i| format!("S{i:02}")).collect();
+        let (mut dates, mut symbols, mut prices, mut weights) = (vec![], vec![], vec![], vec![]);
+        for day in 0..30 {
+            for (i, name) in names.iter().enumerate() {
+                dates.push(date_to_days("2024-01-01") + day);
+                symbols.push(name.as_str());
+                prices.push(90.0 + (i as f64 * 1.7 + day as f64 * 0.37).sin() * 13.0 + i as f64);
+                weights.push(0.1 + i as f64 * 0.003);
+            }
+        }
+        let config = BacktestConfig {
+            stop_loss: 0.05,
+            ..Default::default()
+        };
+        let run = || {
+            backtest_long_slice(
+                &dates,
+                &symbols,
+                &prices,
+                &weights,
+                None,
+                None,
+                None,
+                None,
+                ResampleFreq::WeeklyOn(2),
+                None,
+                &config,
+            )
+            .creturn
+        };
+        let first: Vec<u64> = run().iter().map(|v| v.to_bits()).collect();
+        for _ in 0..20 {
+            assert_eq!(
+                first,
+                run().iter().map(|v| v.to_bits()).collect::<Vec<u64>>()
+            );
+        }
     }
 
     #[test]

@@ -10,7 +10,7 @@
 //! - `IndexTracker` - Wide format (usize keys, usize dates)
 //! - `SymbolTracker` - Long format (String keys, i32 dates)
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::hash::Hash;
 
 use crate::mae_mfe::calculate_mae_mfe_at_exit;
@@ -184,11 +184,11 @@ impl TradeRecord {
 #[derive(Debug, Clone, Default)]
 pub struct StockOperations {
     /// Actions for each stock: "enter", "exit", "hold", "sl", "tp", etc.
-    pub actions: HashMap<String, String>,
+    pub actions: BTreeMap<String, String>,
     /// Current normalized weights (at weight_date)
-    pub weights: HashMap<String, f64>,
+    pub weights: BTreeMap<String, f64>,
     /// Next signal weights (at next_weight_date)
-    pub next_weights: HashMap<String, f64>,
+    pub next_weights: BTreeMap<String, f64>,
     /// Date of current weights (days since epoch)
     pub weight_date: Option<i32>,
     /// Date of next weights/signal (days since epoch)
@@ -378,7 +378,7 @@ struct OpenTradeInfo<K: Clone, D: Copy> {
 
 /// Trait for building trade records from generic open trade info
 pub trait RecordBuilder: Sized {
-    type Key: Clone + Eq + Hash;
+    type Key: Clone + Ord + Hash;
     type Date: Copy;
 
     /// Build a completed trade record (without MAE/MFE calculation)
@@ -953,7 +953,10 @@ impl<R: RecordBuilder> TradeTracker for GenericTracker<R> {
     }
 
     fn finalize(mut self, fee_ratio: f64, tax_ratio: f64) -> Vec<R> {
-        for (_, open_trade) in self.open_trades.drain() {
+        // Open trades come out in key order, so the output does not depend on map order
+        let mut open_trades: Vec<_> = self.open_trades.drain().map(|(_, trade)| trade).collect();
+        open_trades.sort_by(|a, b| a.key.cmp(&b.key));
+        for open_trade in open_trades {
             // Calculate raw price for open positions with rounding
             let entry_raw_price = round_raw_price(open_trade.entry_price / open_trade.entry_factor);
 

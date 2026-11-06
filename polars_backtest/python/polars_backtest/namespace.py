@@ -6,7 +6,7 @@ Provides df.bt.backtest() API for long format DataFrames.
 from __future__ import annotations
 
 import re
-from typing import TYPE_CHECKING, Iterable, Union, cast
+from typing import TYPE_CHECKING, Iterable, NamedTuple, Union, cast
 
 import polars as pl
 
@@ -97,6 +97,19 @@ def _validate_no_nulls(df: pl.DataFrame, columns: Iterable[str]) -> None:
             )
 
 
+class _LongColumns(NamedTuple):
+    """Resolved column names, in the order the Rust bindings take them."""
+
+    date: str
+    symbol: str
+    price: str
+    position: str
+    open: str
+    high: str
+    low: str
+    factor: str | None
+
+
 def _floats_with_nan_nulls(df: pl.DataFrame, columns: Iterable[str | None]) -> pl.DataFrame:
     """Ensure Float64 dtype and represent nulls as NaN (the engine's missing marker).
 
@@ -109,6 +122,82 @@ def _floats_with_nan_nulls(df: pl.DataFrame, columns: Iterable[str | None]) -> p
         if series.dtype != pl.Float64 or series.null_count():
             exprs.append(pl.col(col).cast(pl.Float64).fill_null(float("nan")))
     return df.with_columns(exprs) if exprs else df
+
+
+def _prepare_long(
+    df: pl.DataFrame,
+    trade_at_price: ColumnSpec,
+    position: ColumnSpec,
+    date: ColumnSpec,
+    symbol: ColumnSpec,
+    open: ColumnSpec,
+    high: ColumnSpec,
+    low: ColumnSpec,
+    factor: str,
+    resample: str | None,
+    resample_offset: str | None,
+    touched_exit: bool,
+) -> tuple[pl.DataFrame, _LongColumns]:
+    """Resolve and validate columns, and clean values the Rust engine reads."""
+    # Resolve column specs (str or Expr) to column names
+    df, date_col = _resolve_column(df, date, "_bt_date")
+    df, symbol_col = _resolve_column(df, symbol, "_bt_symbol")
+    df, price_col = _resolve_column(df, trade_at_price, "_bt_price")
+    df, position_col = _resolve_column(df, position, "_bt_position")
+
+    # Validate columns exist
+    required = [date_col, symbol_col, price_col, position_col]
+    missing = [c for c in required if c not in df.columns]
+    if missing:
+        raise ValueError(f"Missing required columns: {missing}")
+
+    # Resolve OHLC columns only when touched_exit is True
+    open_col: str = "open"
+    high_col: str = "high"
+    low_col: str = "low"
+    if touched_exit:
+        df, open_col = _resolve_column(df, open, "_bt_open")
+        df, high_col = _resolve_column(df, high, "_bt_high")
+        df, low_col = _resolve_column(df, low, "_bt_low")
+
+        # Validate OHLC columns exist
+        ohlc_cols = [open_col, high_col, low_col]
+        ohlc_missing = [c for c in ohlc_cols if c not in df.columns]
+        if ohlc_missing:
+            raise ValueError(
+                f"touched_exit=True requires open/high/low columns. Missing: {ohlc_missing}"
+            )
+
+    # Check if position column is boolean (signals)
+    position_dtype = df.get_column(position_col).dtype
+    is_bool_signal = position_dtype == pl.Boolean
+
+    # Handle null values in position column
+    # Polars rolling operations return null for first N-1 rows (unlike pandas NaN -> False)
+    # Fill nulls with False/0.0, then cast bool to float for Rust path
+    if is_bool_signal:
+        # Cast bool to float (True -> 1.0, False -> 0.0)
+        # Rust's normalize_weights_finlab will convert to equal weights
+        df = df.with_columns(pl.col(position_col).fill_null(False).cast(pl.Float64))
+    else:
+        df = df.with_columns(pl.col(position_col).fill_null(0.0))
+
+    _validate_resample(resample, resample_offset)
+
+    # factor column: pass column name if exists, else None (defaults to 1.0 in Rust)
+    factor_col = factor if factor in df.columns else None
+
+    # Nulls must not reach the FFI boundary (validity bitmaps are not checked there)
+    _validate_no_nulls(df, (date_col, symbol_col))
+    float_cols: list[str | None] = [price_col, position_col, factor_col]
+    if touched_exit:
+        float_cols += [open_col, high_col, low_col]
+    df = _floats_with_nan_nulls(df, float_cols)
+
+    columns = _LongColumns(
+        date_col, symbol_col, price_col, position_col, open_col, high_col, low_col, factor_col
+    )
+    return df, columns
 
 
 @pl.api.register_dataframe_namespace("bt")
@@ -195,64 +284,20 @@ class BacktestNamespace:
         Returns:
             DataFrame with columns: date, creturn
         """
-        df = self._df
-
-        # Resolve column specs (str or Expr) to column names
-        df, date_col = _resolve_column(df, date, "_bt_date")
-        df, symbol_col = _resolve_column(df, symbol, "_bt_symbol")
-        df, price_col = _resolve_column(df, trade_at_price, "_bt_price")
-        df, position_col = _resolve_column(df, position, "_bt_position")
-
-        # Validate columns exist
-        required = [date_col, symbol_col, price_col, position_col]
-        missing = [c for c in required if c not in df.columns]
-        if missing:
-            raise ValueError(f"Missing required columns: {missing}")
-
-        # Resolve OHLC columns only when touched_exit is True
-        open_col: str = "open"
-        high_col: str = "high"
-        low_col: str = "low"
-        if touched_exit:
-            df, open_col = _resolve_column(df, open, "_bt_open")
-            df, high_col = _resolve_column(df, high, "_bt_high")
-            df, low_col = _resolve_column(df, low, "_bt_low")
-
-            # Validate OHLC columns exist
-            ohlc_cols = [open_col, high_col, low_col]
-            ohlc_missing = [c for c in ohlc_cols if c not in df.columns]
-            if ohlc_missing:
-                raise ValueError(
-                    f"touched_exit=True requires open/high/low columns. Missing: {ohlc_missing}"
-                )
-
-        # Check if position column is boolean (signals)
-        position_dtype = df.get_column(position_col).dtype
-        is_bool_signal = position_dtype == pl.Boolean
-
-        # Handle null values in position column
-        # Polars rolling operations return null for first N-1 rows (unlike pandas NaN -> False)
-        # Fill nulls with False/0.0, then cast bool to float for Rust path
-        if is_bool_signal:
-            # Cast bool to float (True -> 1.0, False -> 0.0)
-            # Rust's normalize_weights_finlab will convert to equal weights
-            df = df.with_columns(
-                pl.col(position_col).fill_null(False).cast(pl.Float64)
-            )
-        else:
-            df = df.with_columns(pl.col(position_col).fill_null(0.0))
-
-        _validate_resample(resample, resample_offset)
-
-        # factor column: pass column name if exists, else None (defaults to 1.0 in Rust)
-        factor_col = factor if factor in df.columns else None
-
-        # Nulls must not reach the FFI boundary (validity bitmaps are not checked there)
-        _validate_no_nulls(df, (date_col, symbol_col))
-        float_cols: list[str | None] = [price_col, position_col, factor_col]
-        if touched_exit:
-            float_cols += [open_col, high_col, low_col]
-        df = _floats_with_nan_nulls(df, float_cols)
+        df, columns = _prepare_long(
+            self._df,
+            trade_at_price,
+            position,
+            date,
+            symbol,
+            open,
+            high,
+            low,
+            factor,
+            resample,
+            resample_offset,
+            touched_exit,
+        )
 
         # Create config
         # Note: the long-format engine always uses finlab-style accounting; the former
@@ -271,18 +316,11 @@ class BacktestNamespace:
         )
 
         # Check if already sorted by date
-        skip_sort = df.get_column(date_col).is_sorted()
+        skip_sort = df.get_column(columns.date).is_sorted()
 
         result = _rust_backtest(
             df,
-            date_col,
-            symbol_col,
-            price_col,
-            position_col,
-            open_col,
-            high_col,
-            low_col,
-            factor_col,
+            *columns,
             resample,
             resample_offset,
             config,
@@ -354,60 +392,20 @@ class BacktestNamespace:
         Returns:
             BacktestReport object with creturn (list) and trades (DataFrame)
         """
-        df = self._df
-
-        # Resolve column specs (str or Expr) to column names
-        df, date_col = _resolve_column(df, date, "_bt_date")
-        df, symbol_col = _resolve_column(df, symbol, "_bt_symbol")
-        df, price_col = _resolve_column(df, trade_at_price, "_bt_price")
-        df, position_col = _resolve_column(df, position, "_bt_position")
-
-        # Validate required columns exist
-        required = [date_col, symbol_col, price_col, position_col]
-        missing = [c for c in required if c not in df.columns]
-        if missing:
-            raise ValueError(f"Missing required columns: {missing}")
-
-        # Resolve OHLC columns only when touched_exit is True
-        open_col: str | None = None
-        high_col: str | None = None
-        low_col: str | None = None
-        if touched_exit:
-            df, open_col = _resolve_column(df, open, "_bt_open")
-            df, high_col = _resolve_column(df, high, "_bt_high")
-            df, low_col = _resolve_column(df, low, "_bt_low")
-
-            # Validate OHLC columns exist
-            ohlc_cols = [open_col, high_col, low_col]
-            ohlc_missing = [c for c in ohlc_cols if c not in df.columns]
-            if ohlc_missing:
-                raise ValueError(
-                    f"touched_exit=True requires open/high/low columns. Missing: {ohlc_missing}"
-                )
-
-        # Check if position column is boolean (signals)
-        position_dtype = df.get_column(position_col).dtype
-        is_bool_signal = position_dtype == pl.Boolean
-
-        # Handle null values in position column
-        if is_bool_signal:
-            df = df.with_columns(
-                pl.col(position_col).fill_null(False).cast(pl.Float64)
-            )
-        else:
-            df = df.with_columns(pl.col(position_col).fill_null(0.0))
-
-        _validate_resample(resample, resample_offset)
-
-        # factor column: pass column name, Rust checks if it exists (defaults to 1.0 if not)
-        factor_col = factor if factor in df.columns else None
-
-        # Nulls must not reach the FFI boundary (validity bitmaps are not checked there)
-        _validate_no_nulls(df, (date_col, symbol_col))
-        float_cols: list[str | None] = [price_col, position_col, factor_col]
-        if touched_exit:
-            float_cols += [open_col, high_col, low_col]
-        df = _floats_with_nan_nulls(df, float_cols)
+        df, columns = _prepare_long(
+            self._df,
+            trade_at_price,
+            position,
+            date,
+            symbol,
+            open,
+            high,
+            low,
+            factor,
+            resample,
+            resample_offset,
+            touched_exit,
+        )
 
         # Build config
         # Note: the long-format engine always uses finlab-style accounting; the former
@@ -426,7 +424,7 @@ class BacktestNamespace:
         )
 
         # Check if already sorted
-        skip_sort = df.get_column(date_col).is_sorted()
+        skip_sort = df.get_column(columns.date).is_sorted()
 
         # Process benchmark parameter
         # - str: symbol 值，用該 symbol 的價格計算 creturn
@@ -443,11 +441,11 @@ class BacktestNamespace:
             elif isinstance(benchmark, str):
                 # str = symbol 值，用該 symbol 的價格計算 creturn
                 bm_df = (
-                    df.filter(pl.col(symbol_col) == benchmark)
-                    .select([pl.col(date_col).alias("date"), pl.col(price_col)])
+                    df.filter(pl.col(columns.symbol) == benchmark)
+                    .select([pl.col(columns.date).alias("date"), pl.col(columns.price)])
                     .sort("date")
                     .with_columns(
-                        (pl.col(price_col) / pl.col(price_col).first()).alias("creturn")
+                        (pl.col(columns.price) / pl.col(columns.price).first()).alias("creturn")
                     )
                     .select(["date", "creturn"])
                 )
@@ -463,14 +461,7 @@ class BacktestNamespace:
         # OHLC columns are only used when touched_exit=True
         return _rust_backtest_with_report(
             df,
-            date_col,
-            symbol_col,
-            price_col,
-            position_col,
-            open_col if open_col else "open",
-            high_col if high_col else "high",
-            low_col if low_col else "low",
-            factor_col,
+            *columns,
             resample,
             resample_offset,
             config,

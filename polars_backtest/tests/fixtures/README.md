@@ -71,3 +71,21 @@ Otherwise all scenarios match finlab within the tolerances asserted in
 count/exit dates exact, trade returns within 1e-6 after the roll fee
 adjustment). If a future engine change breaks a scenario, document the
 discrepancy here instead of loosening tolerances silently.
+
+## Exact snapshots
+
+Synthetic inputs only; see `tests/legacy_fixtures.py` and
+`tests/multi_name_fixtures.py`. Each file stores exact float bit strings, schemas,
+dates, nulls, trade rows and metadata.
+
+- `legacy_exact.json`, `legacy_paired_exact.json` and
+  `legacy_offset_touched_exact.json` were captured from master 62fd52f. They hold
+  one active name, or two names of equal market value, so they were bit-stable
+  even when position maps were unordered, and they stay bit-exact.
+- `multi_name_master.json` was captured from one master 62fd52f process. It holds
+  many names of unequal value, whose last bits varied between master processes,
+  so it is compared within rounding noise.
+- `multi_name_exact.json` is the same set of cases captured after positions became
+  ordered. It is bit-exact and identical across processes, and it is the reference
+  for later changes. Regenerate it only for an intended numeric change:
+  `uv run python tests/multi_name_fixtures.py tests/fixtures/multi_name_exact.json`

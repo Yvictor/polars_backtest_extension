@@ -35,6 +35,8 @@ macro_rules! profile {
     };
 }
 
+use arrow::array::{Float64Array, Int32Array, StringViewArray};
+use polars_arrow::array::{Array, PrimitiveArray, Utf8ViewArray};
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 use pyo3::types::{PyModule, PyModuleMethods};
@@ -43,6 +45,7 @@ use pyo3_polars::PyDataFrame;
 use polars::prelude::*;
 
 use btcore::{
+    config::ExecOptions,
     run_backtest, run_backtest_with_trades, BacktestConfig, WideBacktestResult,
     PriceData, TradeRecord, WideTradeRecord,
     simulation::{
@@ -101,6 +104,7 @@ impl PyBacktestConfig {
                 stop_trading_next_period,
                 finlab_mode,
                 touched_exit,
+                exec: ExecOptions::default(),
             },
         }
     }
@@ -477,6 +481,314 @@ fn stock_operations_to_dataframes(
 // PyBacktestReport is now defined in report.rs
 
 // =============================================================================
+// Long Format Input Conversion
+// =============================================================================
+
+/// Column names of a long format DataFrame
+struct LongColumnNames<'a> {
+    date: &'a str,
+    symbol: &'a str,
+    trade_at_price: &'a str,
+    position: &'a str,
+    open: &'a str,
+    high: &'a str,
+    low: &'a str,
+    factor: Option<&'a str>,
+}
+
+/// Long format columns as arrow-rs arrays (zero-copy), ready for btcore
+struct LongArrays {
+    dates: Int32Array,
+    symbols: StringViewArray,
+    prices: Float64Array,
+    weights: Float64Array,
+    open: Option<Float64Array>,
+    high: Option<Float64Array>,
+    low: Option<Float64Array>,
+    factor: Option<Float64Array>,
+}
+
+impl LongArrays {
+    fn input(&self) -> LongFormatArrowInput<'_> {
+        LongFormatArrowInput {
+            dates: &self.dates,
+            symbols: &self.symbols,
+            prices: &self.prices,
+            weights: &self.weights,
+            open_prices: self.open.as_ref(),
+            high_prices: self.high.as_ref(),
+            low_prices: self.low.as_ref(),
+            factor: self.factor.as_ref(),
+        }
+    }
+}
+
+/// Config passed by the caller, or the long format default
+fn long_config(config: Option<PyBacktestConfig>) -> BacktestConfig {
+    config.map(|c| c.inner).unwrap_or_else(|| BacktestConfig {
+        finlab_mode: true,
+        ..Default::default()
+    })
+}
+
+/// Check that the required columns exist, then sort by date unless told not to
+fn validated_long_frame(
+    df: DataFrame,
+    names: &LongColumnNames,
+    touched_exit: bool,
+    skip_sort: bool,
+) -> PyResult<DataFrame> {
+    for col_name in [
+        names.date,
+        names.symbol,
+        names.trade_at_price,
+        names.position,
+    ] {
+        if df.column(col_name).is_err() {
+            return Err(PyValueError::new_err(format!(
+                "Missing required column: '{}'",
+                col_name
+            )));
+        }
+    }
+
+    // Validate OHLC columns if touched_exit is enabled
+    if touched_exit {
+        for col_name in [names.open, names.high, names.low] {
+            if df.column(col_name).is_err() {
+                return Err(PyValueError::new_err(format!(
+                    "touched_exit=True requires column '{}', but it is missing",
+                    col_name
+                )));
+            }
+        }
+    }
+
+    if skip_sort {
+        return Ok(df);
+    }
+    df.sort([names.date], SortMultipleOptions::default())
+        .map_err(|e| PyValueError::new_err(format!("Failed to sort: {}", e)))
+}
+
+/// Convert a column to an arrow-rs Float64Array, casting and rechunking only when needed
+fn float_column_to_arrow(df: &DataFrame, name: &str) -> PyResult<Float64Array> {
+    let column = df
+        .column(name)
+        .map_err(|e| PyValueError::new_err(format!("Failed to get {} column: {}", name, e)))?;
+    let series = if column.dtype() == &DataType::Float64 {
+        column.clone()
+    } else {
+        column
+            .cast(&DataType::Float64)
+            .map_err(|e| PyValueError::new_err(format!("Failed to cast {}: {}", name, e)))?
+    };
+    let values = series
+        .f64()
+        .map_err(|e| PyValueError::new_err(format!("{} must be f64: {}", name, e)))?;
+    let rechunked;
+    let single_chunk: &Float64Chunked = if values.chunks().len() > 1 {
+        rechunked = values.rechunk();
+        &rechunked
+    } else {
+        values
+    };
+    let array = single_chunk.chunks()[0]
+        .as_any()
+        .downcast_ref::<PrimitiveArray<f64>>()
+        .ok_or_else(|| PyValueError::new_err(format!("Failed to downcast {} array", name)))?;
+    ffi_convert::polars_f64_to_arrow(array)
+        .map_err(|e| PyValueError::new_err(format!("FFI {} conversion failed: {}", name, e)))
+}
+
+/// Convert the columns btcore reads into arrow-rs arrays
+fn long_arrays(
+    df: &DataFrame,
+    names: &LongColumnNames,
+    touched_exit: bool,
+    skip_sort: bool,
+) -> PyResult<LongArrays> {
+    let date_col_ref = df
+        .column(names.date)
+        .map_err(|e| PyValueError::new_err(format!("Failed to get date column: {}", e)))?;
+    let date_series = if date_col_ref.dtype() == &DataType::Date {
+        date_col_ref.clone()
+    } else {
+        date_col_ref
+            .cast(&DataType::Date)
+            .map_err(|e| PyValueError::new_err(format!("Failed to cast date: {}", e)))?
+    };
+    let date_phys = date_series
+        .date()
+        .map_err(|e| PyValueError::new_err(format!("Date column must be Date: {}", e)))?
+        .physical();
+    let date_ca_rechunked;
+    let date_ca: &ChunkedArray<Int32Type> = if date_phys.chunks().len() > 1 {
+        date_ca_rechunked = date_phys.rechunk();
+        &date_ca_rechunked
+    } else {
+        date_phys
+    };
+
+    let symbol_ref = df
+        .column(names.symbol)
+        .map_err(|e| PyValueError::new_err(format!("Failed to get symbol column: {}", e)))?
+        .str()
+        .map_err(|e| PyValueError::new_err(format!("Symbol column must be string: {}", e)))?;
+    let symbol_ca_rechunked;
+    let symbol_ca: &StringChunked = if symbol_ref.chunks().len() > 1 {
+        symbol_ca_rechunked = symbol_ref.rechunk();
+        &symbol_ca_rechunked
+    } else {
+        symbol_ref
+    };
+
+    // Downcast to concrete polars-arrow types (single chunk guaranteed by rechunk)
+    let dates_arrow = date_ca.chunks()[0]
+        .as_any()
+        .downcast_ref::<PrimitiveArray<i32>>()
+        .ok_or_else(|| PyValueError::new_err("Failed to downcast date array"))?;
+
+    let symbols_arrow = symbol_ca.chunks()[0]
+        .as_any()
+        .downcast_ref::<Utf8ViewArray>()
+        .ok_or_else(|| PyValueError::new_err("Failed to downcast symbol array"))?;
+
+    // Validity bitmaps are not consulted past this point, so null slots would be
+    // read as undefined buffer bytes — reject them here.
+    if dates_arrow.null_count() > 0 {
+        return Err(PyValueError::new_err(
+            "date column contains null values; drop or fill them before backtesting",
+        ));
+    }
+    if symbols_arrow.null_count() > 0 {
+        return Err(PyValueError::new_err(
+            "symbol column contains null values; drop or fill them before backtesting",
+        ));
+    }
+    // skip_sort callers promise date-sorted data; unsorted input silently corrupts
+    // day grouping, so verify the promise.
+    if skip_sort && dates_arrow.values().windows(2).any(|w| w[0] > w[1]) {
+        return Err(PyValueError::new_err(
+            "skip_sort=true but the date column is not sorted in ascending order",
+        ));
+    }
+
+    // Convert polars-arrow arrays to arrow-rs arrays using FFI (zero-copy)
+    let dates = ffi_convert::polars_i32_to_arrow(dates_arrow)
+        .map_err(|e| PyValueError::new_err(format!("FFI date conversion failed: {}", e)))?;
+    let symbols = ffi_convert::polars_utf8view_to_arrow(symbols_arrow)
+        .map_err(|e| PyValueError::new_err(format!("FFI symbol conversion failed: {}", e)))?;
+    let prices = float_column_to_arrow(df, names.trade_at_price)?;
+    let weights = float_column_to_arrow(df, names.position)?;
+
+    // OHLC columns are only read when touched_exit is enabled
+    let (open, high, low) = if touched_exit {
+        (
+            Some(float_column_to_arrow(df, names.open)?),
+            Some(float_column_to_arrow(df, names.high)?),
+            Some(float_column_to_arrow(df, names.low)?),
+        )
+    } else {
+        (None, None, None)
+    };
+
+    // A factor column that doesn't exist defaults to 1.0 in btcore
+    let factor = match names.factor {
+        Some(factor_col) if df.column(factor_col).is_ok() => {
+            Some(float_column_to_arrow(df, factor_col)?)
+        }
+        _ => None,
+    };
+
+    Ok(LongArrays {
+        dates,
+        symbols,
+        prices,
+        weights,
+        open,
+        high,
+        low,
+        factor,
+    })
+}
+
+/// Parse resample_offset, failing on anything the engine cannot honour
+fn parse_resample_offset(resample_offset: Option<&str>) -> PyResult<Option<ResampleOffset>> {
+    // from_str returns None for anything it cannot parse (e.g. negative offsets like
+    // "-1D") — erroring beats silently rebalancing on unshifted boundaries.
+    match resample_offset {
+        Some(raw) => match ResampleOffset::from_str(resample_offset) {
+            Some(parsed) => Ok(Some(parsed)),
+            None => Err(PyValueError::new_err(format!(
+                "Unsupported resample_offset '{}': only non-negative day/week \
+offsets such as '5D' or '1W' are supported",
+                raw
+            ))),
+        },
+        None => Ok(None),
+    }
+}
+
+/// Build the creturn DataFrame: drop the flat head and rebase to the first kept value
+fn creturn_frame(date: &str, dates: &[i32], creturn: &[f64]) -> PyResult<DataFrame> {
+    // Create unique_dates Series directly from btcore result (zero overhead)
+    let unique_dates = Series::new(date.into(), dates)
+        .cast(&DataType::Date)
+        .map_err(|e| PyValueError::new_err(format!("Failed to cast to Date: {}", e)))?;
+
+    // Handle empty result case (e.g., no valid signals)
+    if creturn.is_empty() {
+        let empty_creturn = Series::new("creturn".into(), Vec::<f64>::new());
+        return DataFrame::new(vec![
+            unique_dates.into_column(),
+            empty_creturn.into_column(),
+        ])
+        .map_err(|e| PyValueError::new_err(format!("Failed to create empty DataFrame: {}", e)));
+    }
+
+    // Create creturn Series and find first index where != 1.0 using Polars boolean mask
+    let creturn_series = Series::new("creturn".into(), creturn);
+    let mask = creturn_series
+        .f64()
+        .map_err(|e| PyValueError::new_err(format!("creturn must be f64: {}", e)))?
+        .not_equal(1.0);
+
+    // Find first true index from boolean ChunkedArray
+    let first_change_idx = mask
+        .into_iter()
+        .position(|opt| opt == Some(true))
+        .unwrap_or(0);
+
+    // Go back one day to include the signal/entry day
+    let first_active_idx = if first_change_idx > 0 {
+        first_change_idx - 1
+    } else {
+        0
+    };
+    let len = creturn.len() - first_active_idx;
+
+    // Slice dates and creturn using Polars slice (zero-copy)
+    let sliced_dates = unique_dates.slice(first_active_idx as i64, len);
+    let sliced_creturn = creturn_series.slice(first_active_idx as i64, len);
+
+    // Normalize: divide by first value using Polars ops
+    let first_value = sliced_creturn.f64()
+        .map_err(|e| PyValueError::new_err(format!("slice f64 failed: {}", e)))?
+        .first()
+        .unwrap_or(1.0);
+
+    let creturn_col = if first_value != 0.0 && (first_value - 1.0).abs() > 1e-10 {
+        (sliced_creturn / first_value).into_column()
+    } else {
+        sliced_creturn.into_column()
+    };
+
+    DataFrame::new(vec![sliced_dates.into_column(), creturn_col])
+        .map_err(|e| PyValueError::new_err(format!("Failed to create creturn DataFrame: {}", e)))
+}
+
+// =============================================================================
 // Main API: Long Format Backtest (zero-copy)
 // =============================================================================
 
@@ -535,374 +847,51 @@ fn backtest(
     skip_sort: bool,
 ) -> PyResult<PyBacktestResult> {
     use fastant::Instant;
-    use polars_arrow::array::{Array, PrimitiveArray, Utf8ViewArray};
 
     let total_start = Instant::now();
     let mut step_start = Instant::now();
 
-    let df = df.0;
-    let n_rows = df.height();
-
-    // Get config first to check if touched_exit is enabled
-    let cfg = config.map(|c| c.inner).unwrap_or_else(|| {
-        BacktestConfig {
-            finlab_mode: true,
-            ..Default::default()
-        }
-    });
-    let touched_exit = cfg.touched_exit;
-
-    // Validate required columns exist
-    for col_name in [date, symbol, trade_at_price, position] {
-        if df.column(col_name).is_err() {
-            return Err(PyValueError::new_err(format!(
-                "Missing required column: '{}'", col_name
-            )));
-        }
-    }
-
-    // Validate OHLC columns if touched_exit is enabled
-    if touched_exit {
-        for col_name in [open, high, low] {
-            if df.column(col_name).is_err() {
-                return Err(PyValueError::new_err(format!(
-                    "touched_exit=True requires column '{}', but it is missing", col_name
-                )));
-            }
-        }
-    }
-
-    // Sort by date if needed
-    let df = if skip_sort {
-        profile!("[PROFILE] Sort: SKIPPED (skip_sort=true, rows={})", n_rows);
-        df
-    } else {
-        let sorted = df
-            .sort([date], SortMultipleOptions::default())
-            .map_err(|e| PyValueError::new_err(format!("Failed to sort: {}", e)))?;
-        profile!("[PROFILE] Sort: {:?} (rows={})", step_start.elapsed(), n_rows);
-        sorted
+    let n_rows = df.0.height();
+    let names = LongColumnNames {
+        date,
+        symbol,
+        trade_at_price,
+        position,
+        open,
+        high,
+        low,
+        factor,
     };
+    let cfg = long_config(config);
+    let df = validated_long_frame(df.0, &names, cfg.touched_exit, skip_sort)?;
+
+    profile!(
+        "[PROFILE] Sort: {:?} (rows={})",
+        step_start.elapsed(),
+        n_rows
+    );
     step_start = Instant::now();
 
-    // Get ChunkedArrays - only cast/rechunk when necessary
-    let date_col_ref = df.column(date)
-        .map_err(|e| PyValueError::new_err(format!("Failed to get date column: {}", e)))?;
-    let date_series = if date_col_ref.dtype() == &DataType::Date {
-        date_col_ref.clone()
-    } else {
-        date_col_ref.cast(&DataType::Date)
-            .map_err(|e| PyValueError::new_err(format!("Failed to cast date: {}", e)))?
-    };
-    let date_phys = date_series.date()
-        .map_err(|e| PyValueError::new_err(format!("Date column must be Date: {}", e)))?
-        .physical();
-    let date_nc = date_phys.chunks().len();
-    let date_ca_rechunked;
-    let date_ca: &ChunkedArray<Int32Type> = if date_nc > 1 {
-        date_ca_rechunked = date_phys.rechunk();
-        &date_ca_rechunked
-    } else {
-        date_phys
-    };
+    let arrays = long_arrays(&df, &names, cfg.touched_exit, skip_sort)?;
 
-    let symbol_ref = df.column(symbol)
-        .map_err(|e| PyValueError::new_err(format!("Failed to get symbol column: {}", e)))?
-        .str()
-        .map_err(|e| PyValueError::new_err(format!("Symbol column must be string: {}", e)))?;
-    let sym_nc = symbol_ref.chunks().len();
-    let symbol_ca_rechunked;
-    let symbol_ca: &StringChunked = if sym_nc > 1 {
-        symbol_ca_rechunked = symbol_ref.rechunk();
-        &symbol_ca_rechunked
-    } else {
-        symbol_ref
-    };
-
-    let price_col_ref = df.column(trade_at_price)
-        .map_err(|e| PyValueError::new_err(format!("Failed to get price column: {}", e)))?;
-    let price_series = if price_col_ref.dtype() == &DataType::Float64 {
-        price_col_ref.clone()
-    } else {
-        price_col_ref.cast(&DataType::Float64)
-            .map_err(|e| PyValueError::new_err(format!("Failed to cast price: {}", e)))?
-    };
-    let price_f64 = price_series.f64()
-        .map_err(|e| PyValueError::new_err(format!("Price must be f64: {}", e)))?;
-    let price_nc = price_f64.chunks().len();
-    let price_ca_rechunked;
-    let price_ca: &Float64Chunked = if price_nc > 1 {
-        price_ca_rechunked = price_f64.rechunk();
-        &price_ca_rechunked
-    } else {
-        price_f64
-    };
-
-    let position_col_ref = df.column(position)
-        .map_err(|e| PyValueError::new_err(format!("Failed to get position column: {}", e)))?;
-    let position_series = if position_col_ref.dtype() == &DataType::Float64 {
-        position_col_ref.clone()
-    } else {
-        position_col_ref.cast(&DataType::Float64)
-            .map_err(|e| PyValueError::new_err(format!("Failed to cast position: {}", e)))?
-    };
-    let position_f64 = position_series.f64()
-        .map_err(|e| PyValueError::new_err(format!("Position must be f64: {}", e)))?;
-    let position_nc = position_f64.chunks().len();
-    let position_ca_rechunked;
-    let position_ca: &Float64Chunked = if position_nc > 1 {
-        position_ca_rechunked = position_f64.rechunk();
-        &position_ca_rechunked
-    } else {
-        position_f64
-    };
-
-    profile!("[PROFILE] Get ChunkedArrays (chunks: d={}, s={}, p={}, pos={}): {:?}",
-              date_nc, sym_nc, price_nc, position_nc, step_start.elapsed());
+    profile!("[PROFILE] Columns to arrow-rs: {:?}", step_start.elapsed());
     step_start = Instant::now();
 
-    // Get underlying polars-arrow arrays (single chunk guaranteed by rechunk)
-    let date_chunks = date_ca.chunks();
-    let symbol_chunks = symbol_ca.chunks();
-    let price_chunks = price_ca.chunks();
-    let position_chunks = position_ca.chunks();
-
-    // Downcast to concrete polars-arrow types
-    let dates_arrow = date_chunks[0]
-        .as_any()
-        .downcast_ref::<PrimitiveArray<i32>>()
-        .ok_or_else(|| PyValueError::new_err("Failed to downcast date array"))?;
-
-    let symbols_arrow = symbol_chunks[0]
-        .as_any()
-        .downcast_ref::<Utf8ViewArray>()
-        .ok_or_else(|| PyValueError::new_err("Failed to downcast symbol array"))?;
-
-    // Validity bitmaps are not consulted past this point, so null slots would be
-    // read as undefined buffer bytes — reject them here.
-    if dates_arrow.null_count() > 0 {
-        return Err(PyValueError::new_err(
-            "date column contains null values; drop or fill them before backtesting",
-        ));
-    }
-    if symbols_arrow.null_count() > 0 {
-        return Err(PyValueError::new_err(
-            "symbol column contains null values; drop or fill them before backtesting",
-        ));
-    }
-    // skip_sort callers promise date-sorted data; unsorted input silently corrupts
-    // day grouping, so verify the promise.
-    if skip_sort && dates_arrow.values().windows(2).any(|w| w[0] > w[1]) {
-        return Err(PyValueError::new_err(
-            "skip_sort=true but the date column is not sorted in ascending order",
-        ));
-    }
-
-    let prices_arrow = price_chunks[0]
-        .as_any()
-        .downcast_ref::<PrimitiveArray<f64>>()
-        .ok_or_else(|| PyValueError::new_err("Failed to downcast price array"))?;
-
-    let positions_arrow = position_chunks[0]
-        .as_any()
-        .downcast_ref::<PrimitiveArray<f64>>()
-        .ok_or_else(|| PyValueError::new_err("Failed to downcast position array"))?;
-
-    profile!("[PROFILE] Get polars-arrow arrays: {:?}", step_start.elapsed());
-    step_start = Instant::now();
-
-    // Convert polars-arrow arrays to arrow-rs arrays using FFI (zero-copy)
-    let dates_rs = ffi_convert::polars_i32_to_arrow(dates_arrow)
-        .map_err(|e| PyValueError::new_err(format!("FFI date conversion failed: {}", e)))?;
-    let symbols_rs = ffi_convert::polars_utf8view_to_arrow(symbols_arrow)
-        .map_err(|e| PyValueError::new_err(format!("FFI symbol conversion failed: {}", e)))?;
-    let prices_rs = ffi_convert::polars_f64_to_arrow(prices_arrow)
-        .map_err(|e| PyValueError::new_err(format!("FFI price conversion failed: {}", e)))?;
-    let positions_rs = ffi_convert::polars_f64_to_arrow(positions_arrow)
-        .map_err(|e| PyValueError::new_err(format!("FFI position conversion failed: {}", e)))?;
-
-    profile!("[PROFILE] FFI conversion (polars-arrow -> arrow-rs): {:?}", step_start.elapsed());
-    step_start = Instant::now();
-
-    // Process OHLC columns if touched_exit is enabled
-    let (open_rs, high_rs, low_rs) = if touched_exit {
-        // Helper to process a float column
-        let process_float_col = |col_name: &str| -> PyResult<arrow::array::Float64Array> {
-            let col_ref = df.column(col_name)
-                .map_err(|e| PyValueError::new_err(format!("Failed to get {} column: {}", col_name, e)))?;
-            let col_series = if col_ref.dtype() == &DataType::Float64 {
-                col_ref.clone()
-            } else {
-                col_ref.cast(&DataType::Float64)
-                    .map_err(|e| PyValueError::new_err(format!("Failed to cast {}: {}", col_name, e)))?
-            };
-            let col_f64 = col_series.f64()
-                .map_err(|e| PyValueError::new_err(format!("{} must be f64: {}", col_name, e)))?;
-            let col_rechunked;
-            let col_ca: &Float64Chunked = if col_f64.chunks().len() > 1 {
-                col_rechunked = col_f64.rechunk();
-                &col_rechunked
-            } else {
-                col_f64
-            };
-            let col_chunks = col_ca.chunks();
-            let col_arrow = col_chunks[0]
-                .as_any()
-                .downcast_ref::<PrimitiveArray<f64>>()
-                .ok_or_else(|| PyValueError::new_err(format!("Failed to downcast {} array", col_name)))?;
-            ffi_convert::polars_f64_to_arrow(col_arrow)
-                .map_err(|e| PyValueError::new_err(format!("FFI {} conversion failed: {}", col_name, e)))
-        };
-
-        (
-            Some(process_float_col(open)?),
-            Some(process_float_col(high)?),
-            Some(process_float_col(low)?),
-        )
-    } else {
-        (None, None, None)
-    };
-
-    profile!("[PROFILE] OHLC processing: {:?}", step_start.elapsed());
-    step_start = Instant::now();
-
-    // Process factor column if provided
-    let factor_rs = if let Some(factor_col) = factor {
-        // Check if column exists
-        if df.column(factor_col).is_ok() {
-            let col_ref = df.column(factor_col)
-                .map_err(|e| PyValueError::new_err(format!("Failed to get {} column: {}", factor_col, e)))?;
-            let col_series = if col_ref.dtype() == &DataType::Float64 {
-                col_ref.clone()
-            } else {
-                col_ref.cast(&DataType::Float64)
-                    .map_err(|e| PyValueError::new_err(format!("Failed to cast {}: {}", factor_col, e)))?
-            };
-            let col_f64 = col_series.f64()
-                .map_err(|e| PyValueError::new_err(format!("{} must be f64: {}", factor_col, e)))?;
-            let col_rechunked;
-            let col_ca: &Float64Chunked = if col_f64.chunks().len() > 1 {
-                col_rechunked = col_f64.rechunk();
-                &col_rechunked
-            } else {
-                col_f64
-            };
-            let col_chunks = col_ca.chunks();
-            let col_arrow = col_chunks[0]
-                .as_any()
-                .downcast_ref::<PrimitiveArray<f64>>()
-                .ok_or_else(|| PyValueError::new_err(format!("Failed to downcast {} array", factor_col)))?;
-            Some(ffi_convert::polars_f64_to_arrow(col_arrow)
-                .map_err(|e| PyValueError::new_err(format!("FFI {} conversion failed: {}", factor_col, e)))?)
-        } else {
-            // Column doesn't exist, use None (defaults to 1.0 in btcore)
-            None
-        }
-    } else {
-        None
-    };
-
-    profile!("[PROFILE] Factor processing: {:?}", step_start.elapsed());
-    step_start = Instant::now();
-
-    // Parse resample frequency and offset
     let resample_freq = ResampleFreq::from_str(resample);
-    // from_str returns None for anything it cannot parse (e.g. negative offsets like
-    // "-1D") — erroring beats silently rebalancing on unshifted boundaries.
-    let offset = match resample_offset {
-        Some(raw) => match ResampleOffset::from_str(resample_offset) {
-            Some(parsed) => Some(parsed),
-            None => {
-                return Err(PyValueError::new_err(format!(
-                    "Unsupported resample_offset '{}': only non-negative day/week \
-offsets such as '5D' or '1W' are supported",
-                    raw
-                )))
-            }
-        },
-        None => None,
-    };
-
-    // Build arrow input for btcore
-    let input = LongFormatArrowInput {
-        dates: &dates_rs,
-        symbols: &symbols_rs,
-        prices: &prices_rs,
-        weights: &positions_rs,
-        open_prices: open_rs.as_ref(),
-        high_prices: high_rs.as_ref(),
-        low_prices: low_rs.as_ref(),
-        factor: factor_rs.as_ref(),
-    };
+    let offset = parse_resample_offset(resample_offset)?;
 
     // Run backtest using btcore with arrow-rs arrays
-    let result = backtest_long_arrow(&input, resample_freq, offset, &cfg);
+    let result = backtest_long_arrow(&arrays.input(), resample_freq, offset, &cfg);
 
     profile!("[PROFILE] Backtest (btcore): {:?}", step_start.elapsed());
     step_start = Instant::now();
 
-    // Handle empty result case (e.g., no valid signals)
-    if result.dates.is_empty() {
-        let empty_dates = Series::new(date.into(), Vec::<i32>::new())
-            .cast(&DataType::Date)
-            .map_err(|e| PyValueError::new_err(format!("Failed to cast to Date: {}", e)))?;
-        let empty_creturn = Series::new("creturn".into(), Vec::<f64>::new());
-        let creturn_df = DataFrame::new(vec![
-            empty_dates.into_column(),
-            empty_creturn.into_column(),
-        ]).map_err(|e| PyValueError::new_err(format!("Failed to create empty DataFrame: {}", e)))?;
-        return Ok(PyBacktestResult { creturn_df });
-    }
-
-    // Create unique_dates Series directly from btcore result (zero overhead)
-    let unique_dates = Series::new(date.into(), &result.dates)
-        .cast(&DataType::Date)
-        .map_err(|e| PyValueError::new_err(format!("Failed to cast to Date: {}", e)))?;
-
-    // Create creturn Series and find first index where != 1.0 using Polars boolean mask
-    let creturn_series = Series::new("creturn".into(), &result.creturn);
-    let mask = creturn_series
-        .f64()
-        .map_err(|e| PyValueError::new_err(format!("creturn must be f64: {}", e)))?
-        .not_equal(1.0);
-
-    // Find first true index from boolean ChunkedArray
-    let first_change_idx = mask.into_iter()
-        .position(|opt| opt == Some(true))
-        .unwrap_or(0);
-
-    // Go back one day to include the signal/entry day
-    let first_active_idx = if first_change_idx > 0 { first_change_idx - 1 } else { 0 };
-    let len = result.creturn.len() - first_active_idx;
-
-    // Slice dates and creturn using Polars slice (zero-copy)
-    let sliced_dates = unique_dates.slice(first_active_idx as i64, len);
-    let sliced_creturn = creturn_series.slice(first_active_idx as i64, len);
-
-    // Normalize: divide by first value using Polars ops
-    let first_value = sliced_creturn.f64()
-        .map_err(|e| PyValueError::new_err(format!("slice f64 failed: {}", e)))?
-        .first()
-        .unwrap_or(1.0);
-
-    let creturn_col = if first_value != 0.0 && (first_value - 1.0).abs() > 1e-10 {
-        (sliced_creturn / first_value).into_column()
-    } else {
-        sliced_creturn.into_column()
-    };
-
-    // Build creturn DataFrame
-    let creturn_df = DataFrame::new(vec![
-        sliced_dates.into_column(),
-        creturn_col,
-    ]).map_err(|e| PyValueError::new_err(format!("Failed to create creturn DataFrame: {}", e)))?;
+    let creturn_df = creturn_frame(date, &result.dates, &result.creturn)?;
 
     profile!("[PROFILE] Build result: {:?}", step_start.elapsed());
     profile!("[PROFILE] TOTAL: {:?}", total_start.elapsed());
 
-    Ok(PyBacktestResult {
-        creturn_df,
-    })
+    Ok(PyBacktestResult { creturn_df })
 }
 
 /// Run backtest with report (trades as Polars DataFrame)
@@ -965,284 +954,26 @@ fn backtest_with_report(
     limit_down: &str,
     trading_value: &str,
 ) -> PyResult<PyBacktestReport> {
-    use polars_arrow::array::{Array, PrimitiveArray, Utf8ViewArray};
-
-    let df = df.0;
-    let n_rows = df.height();
-
-    // Get config first to check if touched_exit is enabled
-    let cfg = config.map(|c| c.inner).unwrap_or_else(|| {
-        BacktestConfig {
-            finlab_mode: true,
-            ..Default::default()
-        }
-    });
-    let touched_exit = cfg.touched_exit;
-
-    // Validate required columns exist
-    for col_name in [date, symbol, trade_at_price, position] {
-        if df.column(col_name).is_err() {
-            return Err(PyValueError::new_err(format!(
-                "Missing required column: '{}'", col_name
-            )));
-        }
-    }
-
-    // Validate OHLC columns if touched_exit is enabled
-    if touched_exit {
-        for col_name in [open, high, low] {
-            if df.column(col_name).is_err() {
-                return Err(PyValueError::new_err(format!(
-                    "touched_exit=True requires column '{}', but it is missing", col_name
-                )));
-            }
-        }
-    }
-
-    // Sort by date if needed
-    let df = if skip_sort {
-        df
-    } else {
-        df.sort([date], SortMultipleOptions::default())
-            .map_err(|e| PyValueError::new_err(format!("Failed to sort: {}", e)))?
+    let n_rows = df.0.height();
+    let names = LongColumnNames {
+        date,
+        symbol,
+        trade_at_price,
+        position,
+        open,
+        high,
+        low,
+        factor,
     };
+    let cfg = long_config(config);
+    let df = validated_long_frame(df.0, &names, cfg.touched_exit, skip_sort)?;
+    let arrays = long_arrays(&df, &names, cfg.touched_exit, skip_sort)?;
 
-    // Get ChunkedArrays - only cast/rechunk when necessary
-    let date_col_ref = df.column(date)
-        .map_err(|e| PyValueError::new_err(format!("Failed to get date column: {}", e)))?;
-    let date_series = if date_col_ref.dtype() == &DataType::Date {
-        date_col_ref.clone()
-    } else {
-        date_col_ref.cast(&DataType::Date)
-            .map_err(|e| PyValueError::new_err(format!("Failed to cast date: {}", e)))?
-    };
-    let date_phys = date_series.date()
-        .map_err(|e| PyValueError::new_err(format!("Date column must be Date: {}", e)))?
-        .physical();
-    let date_nc = date_phys.chunks().len();
-    let date_ca_rechunked;
-    let date_ca: &ChunkedArray<Int32Type> = if date_nc > 1 {
-        date_ca_rechunked = date_phys.rechunk();
-        &date_ca_rechunked
-    } else {
-        date_phys
-    };
-
-    let symbol_ref = df.column(symbol)
-        .map_err(|e| PyValueError::new_err(format!("Failed to get symbol column: {}", e)))?
-        .str()
-        .map_err(|e| PyValueError::new_err(format!("Symbol column must be string: {}", e)))?;
-    let sym_nc = symbol_ref.chunks().len();
-    let symbol_ca_rechunked;
-    let symbol_ca: &StringChunked = if sym_nc > 1 {
-        symbol_ca_rechunked = symbol_ref.rechunk();
-        &symbol_ca_rechunked
-    } else {
-        symbol_ref
-    };
-
-    let price_col_ref = df.column(trade_at_price)
-        .map_err(|e| PyValueError::new_err(format!("Failed to get price column: {}", e)))?;
-    let price_series = if price_col_ref.dtype() == &DataType::Float64 {
-        price_col_ref.clone()
-    } else {
-        price_col_ref.cast(&DataType::Float64)
-            .map_err(|e| PyValueError::new_err(format!("Failed to cast price: {}", e)))?
-    };
-    let price_f64 = price_series.f64()
-        .map_err(|e| PyValueError::new_err(format!("Price must be f64: {}", e)))?;
-    let price_nc = price_f64.chunks().len();
-    let price_ca_rechunked;
-    let price_ca: &Float64Chunked = if price_nc > 1 {
-        price_ca_rechunked = price_f64.rechunk();
-        &price_ca_rechunked
-    } else {
-        price_f64
-    };
-
-    let position_col_ref = df.column(position)
-        .map_err(|e| PyValueError::new_err(format!("Failed to get position column: {}", e)))?;
-    let position_series = if position_col_ref.dtype() == &DataType::Float64 {
-        position_col_ref.clone()
-    } else {
-        position_col_ref.cast(&DataType::Float64)
-            .map_err(|e| PyValueError::new_err(format!("Failed to cast position: {}", e)))?
-    };
-    let position_f64 = position_series.f64()
-        .map_err(|e| PyValueError::new_err(format!("Position must be f64: {}", e)))?;
-    let position_nc = position_f64.chunks().len();
-    let position_ca_rechunked;
-    let position_ca: &Float64Chunked = if position_nc > 1 {
-        position_ca_rechunked = position_f64.rechunk();
-        &position_ca_rechunked
-    } else {
-        position_f64
-    };
-
-    // Get underlying polars-arrow arrays (single chunk guaranteed by rechunk)
-    let date_chunks = date_ca.chunks();
-    let symbol_chunks = symbol_ca.chunks();
-    let price_chunks = price_ca.chunks();
-    let position_chunks = position_ca.chunks();
-
-    // Downcast to concrete polars-arrow types
-    let dates_arrow = date_chunks[0]
-        .as_any()
-        .downcast_ref::<PrimitiveArray<i32>>()
-        .ok_or_else(|| PyValueError::new_err("Failed to downcast date array"))?;
-
-    let symbols_arrow = symbol_chunks[0]
-        .as_any()
-        .downcast_ref::<Utf8ViewArray>()
-        .ok_or_else(|| PyValueError::new_err("Failed to downcast symbol array"))?;
-
-    // Validity bitmaps are not consulted past this point, so null slots would be
-    // read as undefined buffer bytes — reject them here.
-    if dates_arrow.null_count() > 0 {
-        return Err(PyValueError::new_err(
-            "date column contains null values; drop or fill them before backtesting",
-        ));
-    }
-    if symbols_arrow.null_count() > 0 {
-        return Err(PyValueError::new_err(
-            "symbol column contains null values; drop or fill them before backtesting",
-        ));
-    }
-    // skip_sort callers promise date-sorted data; unsorted input silently corrupts
-    // day grouping, so verify the promise.
-    if skip_sort && dates_arrow.values().windows(2).any(|w| w[0] > w[1]) {
-        return Err(PyValueError::new_err(
-            "skip_sort=true but the date column is not sorted in ascending order",
-        ));
-    }
-
-    let prices_arrow = price_chunks[0]
-        .as_any()
-        .downcast_ref::<PrimitiveArray<f64>>()
-        .ok_or_else(|| PyValueError::new_err("Failed to downcast price array"))?;
-
-    let positions_arrow = position_chunks[0]
-        .as_any()
-        .downcast_ref::<PrimitiveArray<f64>>()
-        .ok_or_else(|| PyValueError::new_err("Failed to downcast position array"))?;
-
-    // Convert polars-arrow arrays to arrow-rs arrays using FFI (zero-copy)
-    let dates_rs = ffi_convert::polars_i32_to_arrow(dates_arrow)
-        .map_err(|e| PyValueError::new_err(format!("FFI date conversion failed: {}", e)))?;
-    let symbols_rs = ffi_convert::polars_utf8view_to_arrow(symbols_arrow)
-        .map_err(|e| PyValueError::new_err(format!("FFI symbol conversion failed: {}", e)))?;
-    let prices_rs = ffi_convert::polars_f64_to_arrow(prices_arrow)
-        .map_err(|e| PyValueError::new_err(format!("FFI price conversion failed: {}", e)))?;
-    let positions_rs = ffi_convert::polars_f64_to_arrow(positions_arrow)
-        .map_err(|e| PyValueError::new_err(format!("FFI position conversion failed: {}", e)))?;
-
-    // Process OHLC columns if touched_exit is enabled
-    let (open_rs, high_rs, low_rs) = if touched_exit {
-        // Helper to process a float column
-        let process_float_col = |col_name: &str| -> PyResult<arrow::array::Float64Array> {
-            let col_ref = df.column(col_name)
-                .map_err(|e| PyValueError::new_err(format!("Failed to get {} column: {}", col_name, e)))?;
-            let col_series = if col_ref.dtype() == &DataType::Float64 {
-                col_ref.clone()
-            } else {
-                col_ref.cast(&DataType::Float64)
-                    .map_err(|e| PyValueError::new_err(format!("Failed to cast {}: {}", col_name, e)))?
-            };
-            let col_f64 = col_series.f64()
-                .map_err(|e| PyValueError::new_err(format!("{} must be f64: {}", col_name, e)))?;
-            let col_rechunked;
-            let col_ca: &Float64Chunked = if col_f64.chunks().len() > 1 {
-                col_rechunked = col_f64.rechunk();
-                &col_rechunked
-            } else {
-                col_f64
-            };
-            let col_chunks = col_ca.chunks();
-            let col_arrow = col_chunks[0]
-                .as_any()
-                .downcast_ref::<PrimitiveArray<f64>>()
-                .ok_or_else(|| PyValueError::new_err(format!("Failed to downcast {} array", col_name)))?;
-            ffi_convert::polars_f64_to_arrow(col_arrow)
-                .map_err(|e| PyValueError::new_err(format!("FFI {} conversion failed: {}", col_name, e)))
-        };
-
-        (
-            Some(process_float_col(open)?),
-            Some(process_float_col(high)?),
-            Some(process_float_col(low)?),
-        )
-    } else {
-        (None, None, None)
-    };
-
-    // Process factor column if provided
-    let factor_rs = if let Some(factor_col) = factor {
-        // Check if column exists
-        if df.column(factor_col).is_ok() {
-            let col_ref = df.column(factor_col)
-                .map_err(|e| PyValueError::new_err(format!("Failed to get {} column: {}", factor_col, e)))?;
-            let col_series = if col_ref.dtype() == &DataType::Float64 {
-                col_ref.clone()
-            } else {
-                col_ref.cast(&DataType::Float64)
-                    .map_err(|e| PyValueError::new_err(format!("Failed to cast {}: {}", factor_col, e)))?
-            };
-            let col_f64 = col_series.f64()
-                .map_err(|e| PyValueError::new_err(format!("{} must be f64: {}", factor_col, e)))?;
-            let col_rechunked;
-            let col_ca: &Float64Chunked = if col_f64.chunks().len() > 1 {
-                col_rechunked = col_f64.rechunk();
-                &col_rechunked
-            } else {
-                col_f64
-            };
-            let col_chunks = col_ca.chunks();
-            let col_arrow = col_chunks[0]
-                .as_any()
-                .downcast_ref::<PrimitiveArray<f64>>()
-                .ok_or_else(|| PyValueError::new_err(format!("Failed to downcast {} array", factor_col)))?;
-            Some(ffi_convert::polars_f64_to_arrow(col_arrow)
-                .map_err(|e| PyValueError::new_err(format!("FFI {} conversion failed: {}", factor_col, e)))?)
-        } else {
-            // Column doesn't exist, use None (defaults to 1.0 in btcore)
-            None
-        }
-    } else {
-        None
-    };
-
-    // Parse resample frequency and offset
     let resample_freq = ResampleFreq::from_str(resample);
-    // from_str returns None for anything it cannot parse (e.g. negative offsets like
-    // "-1D") — erroring beats silently rebalancing on unshifted boundaries.
-    let offset = match resample_offset {
-        Some(raw) => match ResampleOffset::from_str(resample_offset) {
-            Some(parsed) => Some(parsed),
-            None => {
-                return Err(PyValueError::new_err(format!(
-                    "Unsupported resample_offset '{}': only non-negative day/week \
-offsets such as '5D' or '1W' are supported",
-                    raw
-                )))
-            }
-        },
-        None => None,
-    };
-
-    // Build arrow input for btcore
-    let input = LongFormatArrowInput {
-        dates: &dates_rs,
-        symbols: &symbols_rs,
-        prices: &prices_rs,
-        weights: &positions_rs,
-        open_prices: open_rs.as_ref(),
-        high_prices: high_rs.as_ref(),
-        low_prices: low_rs.as_ref(),
-        factor: factor_rs.as_ref(),
-    };
+    let offset = parse_resample_offset(resample_offset)?;
 
     // Run backtest with report using btcore
-    let result = backtest_with_report_long_arrow(&input, resample_freq, offset, &cfg);
+    let result = backtest_with_report_long_arrow(&arrays.input(), resample_freq, offset, &cfg);
 
     // Process benchmark parameter (can be str column name or PyDataFrame)
     let benchmark_df: Option<DataFrame> = if let Some(bm_obj) = benchmark {
@@ -1321,77 +1052,11 @@ offsets such as '5D' or '1W' are supported",
         None
     };
 
-    // Handle empty result (no signals/trades)
-    if result.dates.is_empty() {
-        let empty_dates = Series::new_empty(date.into(), &DataType::Date);
-        let empty_creturn = Series::new_empty("creturn".into(), &DataType::Float64);
-        let creturn_df = DataFrame::new(vec![
-            empty_dates.into_column(),
-            empty_creturn.into_column(),
-        ]).map_err(|e| PyValueError::new_err(format!("Failed to create empty creturn DataFrame: {}", e)))?;
-
-        let trades_df = trades_to_dataframe(&result.trades)
-            .map_err(|e| PyValueError::new_err(format!("Failed to create trades DataFrame: {}", e)))?;
-
-        return Ok(PyBacktestReport::new(
-            creturn_df,
-            trades_df,
-            cfg,
-            resample.map(|s| s.to_string()),
-            benchmark_df.clone(),
-            limit_prices_df.clone(),
-            trading_value_df.clone(),
-            None,
-            None,
-        ));
-    }
+    let creturn_df = creturn_frame(date, &result.dates, &result.creturn)?;
 
     // Convert trades to DataFrame
     let trades_df = trades_to_dataframe(&result.trades)
         .map_err(|e| PyValueError::new_err(format!("Failed to create trades DataFrame: {}", e)))?;
-
-    // Create unique_dates Series directly from btcore result (zero overhead)
-    let unique_dates = Series::new(date.into(), &result.dates)
-        .cast(&DataType::Date)
-        .map_err(|e| PyValueError::new_err(format!("Failed to cast to Date: {}", e)))?;
-
-    // Find first index where creturn != 1.0 using Polars boolean mask
-    let creturn_series = Series::new("creturn".into(), &result.creturn);
-    let mask = creturn_series
-        .f64()
-        .map_err(|e| PyValueError::new_err(format!("creturn must be f64: {}", e)))?
-        .not_equal(1.0);
-
-    // Find first true index from boolean ChunkedArray
-    let first_change_idx = mask.into_iter()
-        .position(|opt| opt == Some(true))
-        .unwrap_or(0);
-
-    // Go back one day to include the signal/entry day
-    let first_active_idx = if first_change_idx > 0 { first_change_idx - 1 } else { 0 };
-    let len = result.creturn.len() - first_active_idx;
-
-    // Slice dates and creturn using Polars slice (zero-copy)
-    let sliced_dates = unique_dates.slice(first_active_idx as i64, len);
-    let sliced_creturn = creturn_series.slice(first_active_idx as i64, len);
-
-    // Normalize: divide by first value using Polars ops
-    let first_value = sliced_creturn.f64()
-        .map_err(|e| PyValueError::new_err(format!("slice f64 failed: {}", e)))?
-        .first()
-        .unwrap_or(1.0);
-
-    let creturn_col = if first_value != 0.0 && (first_value - 1.0).abs() > 1e-10 {
-        (sliced_creturn / first_value).into_column()
-    } else {
-        sliced_creturn.into_column()
-    };
-
-    // Build creturn DataFrame
-    let creturn_df = DataFrame::new(vec![
-        sliced_dates.into_column(),
-        creturn_col,
-    ]).map_err(|e| PyValueError::new_err(format!("Failed to create creturn DataFrame: {}", e)))?;
 
     profile!("[PROFILE] backtest_with_report: {} rows, {} trades", n_rows, result.trades.len());
 
