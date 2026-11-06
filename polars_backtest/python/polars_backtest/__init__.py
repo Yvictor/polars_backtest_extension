@@ -46,6 +46,12 @@ from polars_backtest.wide import (
     backtest_with_report_wide,
 )
 
+# Report bundle: tables and summaries behind the report, for people and agents
+from polars_backtest import report  # noqa: E402
+from polars_backtest.report import ReportBundle, open_bundle  # noqa: E402
+
+report.attach(BacktestReport, Report)
+
 __all__ = [
     "__version__",
     # Core types
@@ -63,6 +69,10 @@ __all__ = [
     # Visualization / analysis
     "viz",
     "liquidity",
+    # Report bundle
+    "report",
+    "ReportBundle",
+    "open_bundle",
     # Statistics expressions
     "daily_returns",
     "cumulative_returns",

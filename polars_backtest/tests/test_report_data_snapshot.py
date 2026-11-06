@@ -12,9 +12,8 @@ from pathlib import Path
 from typing import Any
 
 import pytest
-from report_fixtures import NAMES, long_report, prices
-
 from polars_backtest import viz
+from report_fixtures import NAMES, long_report, prices
 
 SNAPSHOT = Path(__file__).parent / "fixtures" / "report_data_v3.json"
 UNSTABLE = ("version",)
@@ -48,8 +47,23 @@ def assert_same(actual: Any, expected: Any, path: str = "$") -> None:
         assert actual == expected, path
 
 
+def in_row_order(data: dict[str, Any]) -> dict[str, Any]:
+    """Pending trades come out of a hash map, so their row order is not stable."""
+    trades = data["trades"]
+    columns = ["stock", "entry", "exit"]
+    columns += sorted(k for k, v in trades.items() if isinstance(v, list) and k not in columns)
+    rows = sorted(
+        zip(*(trades[k] for k in columns)),
+        key=lambda row: tuple(str(v) for v in row[:3]),
+    )
+    for i, name in enumerate(columns):
+        trades[name] = [row[i] for row in rows]
+    return data
+
+
 def test_report_data_matches_snapshot():
-    assert_same(payload(), json.loads(SNAPSHOT.read_text(encoding="utf-8")))
+    expected = json.loads(SNAPSHOT.read_text(encoding="utf-8"))
+    assert_same(in_row_order(payload()), in_row_order(expected))
 
 
 if __name__ == "__main__":

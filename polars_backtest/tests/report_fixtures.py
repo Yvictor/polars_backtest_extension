@@ -6,7 +6,6 @@ import datetime as dt
 from typing import Any
 
 import polars as pl
-
 import polars_backtest as pl_bt
 
 SYMBOLS = ["FAKE001", "FAKE002", "FAKE003", "FAKE004", "FAKE005", "FAKE006"]
@@ -81,7 +80,6 @@ class LedgerReport:
 def fake_ledger(report: Any) -> dict[str, pl.DataFrame]:
     """Ledger tables that reconcile exactly with the report's daily curve."""
     curve = report.daily_creturn().select(pl.col("date").cast(pl.Date), "creturn").sort("date")
-    equity = curve.get_column("creturn").to_list()
     dates = curve.get_column("date").to_list()
     fills: list[dict[str, Any]] = []
     for i, date in enumerate(dates):
