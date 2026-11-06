@@ -59,6 +59,8 @@ pub struct ExecOptions {
     pub rebalance_phase: i32,
     /// Any date (days since epoch) in the week counted as week 0
     pub rebalance_anchor: Option<i32>,
+    /// Collect the daily and per-leg ledger
+    pub ledger: bool,
 }
 
 impl Default for ExecOptions {
@@ -67,6 +69,7 @@ impl Default for ExecOptions {
             rebalance_every: 1,
             rebalance_phase: 0,
             rebalance_anchor: None,
+            ledger: false,
         }
     }
 }
@@ -154,6 +157,7 @@ mod tests {
             rebalance_every: every,
             rebalance_phase: phase,
             rebalance_anchor: anchor,
+            ..Default::default()
         }
     }
 

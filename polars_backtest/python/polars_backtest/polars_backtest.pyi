@@ -64,6 +64,16 @@ class BacktestReport:
         ...
 
     @property
+    def daily(self) -> pl.DataFrame | None:
+        """One row per day: equity, cash, costs, exposure. None without ledger=True."""
+        ...
+
+    @property
+    def fills(self) -> pl.DataFrame | None:
+        """One row per executed leg. None without ledger=True."""
+        ...
+
+    @property
     def fee_ratio(self) -> float:
         """Transaction fee ratio used in backtest."""
         ...

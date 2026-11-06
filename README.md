@@ -232,6 +232,17 @@ metrics = report.get_metrics(sections=["liquidity"])
 
 Metrics return `null` if the required column is not present.
 
+### Ledger
+
+Pass `ledger=True` to record what was actually booked. `creturn` and `trades` do
+not change; both tables below are `None` without it.
+
+```python
+report = df.bt.backtest_with_report(position="weight", ledger=True)
+report.daily      # equity, cash, costs, exposure and turnover per day
+report.fills      # the net leg per symbol, with price and reason
+```
+
 ### Parameters
 
 | Parameter | Default | Description |
@@ -244,6 +255,7 @@ Metrics return `null` if the required column is not present.
 | `rebalance_every` | `1` | Rebalance every k calendar weeks (weekly `resample` only) |
 | `rebalance_phase` | `0` | Which of the k weeks rebalances, in `[0, k)` |
 | `rebalance_anchor` | `None` | A date in week 0; required when `rebalance_every` or `rebalance_phase` is not default |
+| `ledger` | `False` | `backtest_with_report` only: collect `report.daily` and `report.fills` |
 | `fee_ratio` | `0.001425` | Transaction fee |
 | `tax_ratio` | `0.003` | Transaction tax |
 | `stop_loss` | `1.0` | Stop loss threshold (1.0 = disabled) |

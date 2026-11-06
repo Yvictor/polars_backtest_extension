@@ -391,6 +391,7 @@ class BacktestNamespace:
         rebalance_every: int = 1,
         rebalance_phase: int = 0,
         rebalance_anchor: dt.date | None = None,
+        ledger: bool = False,
     ) -> BacktestReport:
         """Run backtest with trade tracking, returning a BacktestReport object.
 
@@ -429,6 +430,7 @@ class BacktestNamespace:
             rebalance_phase: Which of the k weeks rebalances, in [0, k)
             rebalance_anchor: A date in week 0. Required when rebalance_every > 1 or
                 rebalance_phase > 0.
+            ledger: Collect report.daily and report.fills (None otherwise)
 
         Returns:
             BacktestReport object with creturn (list) and trades (DataFrame)
@@ -512,6 +514,7 @@ class BacktestNamespace:
             limit_down,
             trading_value,
             *_schedule_args(rebalance_every, rebalance_phase, rebalance_anchor),
+            ledger,
         )
 
 # =============================================================================
@@ -634,6 +637,7 @@ def backtest_with_report(
     rebalance_every: int = 1,
     rebalance_phase: int = 0,
     rebalance_anchor: dt.date | None = None,
+    ledger: bool = False,
 ) -> BacktestReport:
     """Run backtest with trade tracking on long format DataFrame.
 
@@ -669,6 +673,7 @@ def backtest_with_report(
         rebalance_phase: Which of the k weeks rebalances, in [0, k)
         rebalance_anchor: A date in week 0. Required when rebalance_every > 1 or
             rebalance_phase > 0.
+        ledger: Collect report.daily and report.fills (None otherwise)
 
     Returns:
         BacktestReport object with creturn (list) and trades (DataFrame)
@@ -706,4 +711,5 @@ def backtest_with_report(
         rebalance_every=rebalance_every,
         rebalance_phase=rebalance_phase,
         rebalance_anchor=rebalance_anchor,
+        ledger=ledger,
     )

@@ -77,6 +77,7 @@ class BacktestNamespace:
         rebalance_every: int = 1,
         rebalance_phase: int = 0,
         rebalance_anchor: dt.date | None = None,
+        ledger: bool = False,
     ) -> BacktestReport:
         """Run backtest with trade tracking.
 
@@ -143,6 +144,7 @@ def backtest_with_report(
     rebalance_every: int = 1,
     rebalance_phase: int = 0,
     rebalance_anchor: dt.date | None = None,
+    ledger: bool = False,
 ) -> BacktestReport:
     """Standalone function for backtest with report."""
     ...

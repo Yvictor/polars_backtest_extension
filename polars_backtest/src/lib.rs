@@ -17,6 +17,7 @@
 
 mod expressions;
 mod ffi_convert;
+mod ledger;
 mod report;
 
 pub use report::PyBacktestReport;
@@ -966,7 +967,8 @@ fn backtest(
     trading_value="trading_value",
     rebalance_every=1,
     rebalance_phase=0,
-    rebalance_anchor=None
+    rebalance_anchor=None,
+    ledger=false
 ))]
 fn backtest_with_report(
     df: PyDataFrame,
@@ -989,6 +991,7 @@ fn backtest_with_report(
     rebalance_every: i32,
     rebalance_phase: i32,
     rebalance_anchor: Option<i32>,
+    ledger: bool,
 ) -> PyResult<PyBacktestReport> {
     let n_rows = df.0.height();
     let names = LongColumnNames {
@@ -1010,6 +1013,7 @@ fn backtest_with_report(
         rebalance_phase,
         rebalance_anchor,
     )?;
+    cfg.exec.ledger = ledger;
     let df = validated_long_frame(df.0, &names, cfg.touched_exit, skip_sort)?;
     let arrays = long_arrays(&df, &names, cfg.touched_exit, skip_sort)?;
 
@@ -1111,6 +1115,13 @@ fn backtest_with_report(
         (None, None)
     };
 
+    let ledger_df = result
+        .ledger
+        .as_ref()
+        .map(ledger::ledger_frames)
+        .transpose()
+        .map_err(|e| PyValueError::new_err(format!("Failed to create ledger: {}", e)))?;
+
     Ok(PyBacktestReport::new(
         creturn_df,
         trades_df,
@@ -1121,7 +1132,8 @@ fn backtest_with_report(
         trading_value_df,
         weights_df,
         next_weights_df,
-    ))
+    )
+    .with_ledger(ledger_df))
 }
 
 // =============================================================================
