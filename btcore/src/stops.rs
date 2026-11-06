@@ -370,6 +370,7 @@ mod tests {
             stop_trading_next_period: false,
             finlab_mode: false,
             touched_exit: false,
+            exec: Default::default(),
         }
     }
 

@@ -41,7 +41,15 @@ pub struct BacktestConfig {
     /// - Then check high/low for take_profit/stop_loss
     /// - Exit immediately at touched price (not close price)
     pub touched_exit: bool,
+    /// Long-format execution options, all off by default
+    pub exec: ExecOptions,
 }
+
+/// Long-format execution options
+///
+/// Every field defaults to today's behaviour. The wide engine ignores this struct.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct ExecOptions {}
 
 impl Default for BacktestConfig {
     fn default() -> Self {
@@ -56,6 +64,7 @@ impl Default for BacktestConfig {
             stop_trading_next_period: true,
             finlab_mode: false,          // Use standard calculation by default
             touched_exit: false,         // Use close-based stop detection by default
+            exec: ExecOptions::default(),
         }
     }
 }
