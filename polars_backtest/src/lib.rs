@@ -46,7 +46,7 @@ use pyo3_polars::PyDataFrame;
 use polars::prelude::*;
 
 use btcore::{
-    config::ExecOptions,
+    config::{ExecOptions, TaxSide},
     run_backtest, run_backtest_with_trades, BacktestConfig, WideBacktestResult,
     PriceData, TradeRecord, WideTradeRecord,
     simulation::{
@@ -537,6 +537,17 @@ fn long_config(config: Option<PyBacktestConfig>) -> BacktestConfig {
     })
 }
 
+fn set_fees(cfg: &mut BacktestConfig, short_fee: f64, borrow_fee: f64, tax_side: &str) -> PyResult<()> {
+    cfg.exec.short_sale_fee_ratio = short_fee;
+    cfg.exec.borrow_fee_ratio = borrow_fee;
+    cfg.exec.tax_side = match tax_side {
+        "exit" => TaxSide::Exit,
+        "sell" => TaxSide::Sell,
+        _ => return Err(PyValueError::new_err("tax_side must be 'exit' or 'sell'")),
+    };
+    cfg.exec.validate_fees().map_err(PyValueError::new_err)
+}
+
 /// Put the rebalance schedule on the config, rejecting settings the loop cannot honour
 fn set_schedule(
     cfg: &mut BacktestConfig,
@@ -862,7 +873,10 @@ fn creturn_frame(date: &str, dates: &[i32], creturn: &[f64]) -> PyResult<DataFra
     rebalance_phase=0,
     rebalance_anchor=None,
     mark_price=None,
-    slippage_ratio=0.0
+    slippage_ratio=0.0,
+    short_sale_fee_ratio=0.0,
+    borrow_fee_ratio=0.0,
+    tax_side="exit"
 ))]
 fn backtest(
     df: PyDataFrame,
@@ -883,6 +897,9 @@ fn backtest(
     rebalance_anchor: Option<i32>,
     mark_price: Option<&str>,
     slippage_ratio: f64,
+    short_sale_fee_ratio: f64,
+    borrow_fee_ratio: f64,
+    tax_side: &str,
 ) -> PyResult<PyBacktestResult> {
     use fastant::Instant;
 
@@ -905,6 +922,7 @@ fn backtest(
     let mut cfg = long_config(config);
     cfg.exec.slippage_ratio = slippage_ratio;
     cfg.exec.validate_prices().map_err(PyValueError::new_err)?;
+    set_fees(&mut cfg, short_sale_fee_ratio, borrow_fee_ratio, tax_side)?;
     set_schedule(
         &mut cfg,
         resample_freq,
@@ -988,7 +1006,10 @@ fn backtest(
     rebalance_anchor=None,
     ledger=false,
     mark_price=None,
-    slippage_ratio=0.0
+    slippage_ratio=0.0,
+    short_sale_fee_ratio=0.0,
+    borrow_fee_ratio=0.0,
+    tax_side="exit"
 ))]
 fn backtest_with_report(
     df: PyDataFrame,
@@ -1014,6 +1035,9 @@ fn backtest_with_report(
     ledger: bool,
     mark_price: Option<&str>,
     slippage_ratio: f64,
+    short_sale_fee_ratio: f64,
+    borrow_fee_ratio: f64,
+    tax_side: &str,
 ) -> PyResult<PyBacktestReport> {
     let n_rows = df.0.height();
     let names = LongColumnNames {
@@ -1031,6 +1055,7 @@ fn backtest_with_report(
     let mut cfg = long_config(config);
     cfg.exec.slippage_ratio = slippage_ratio;
     cfg.exec.validate_prices().map_err(PyValueError::new_err)?;
+    set_fees(&mut cfg, short_sale_fee_ratio, borrow_fee_ratio, tax_side)?;
     set_schedule(
         &mut cfg,
         resample_freq,

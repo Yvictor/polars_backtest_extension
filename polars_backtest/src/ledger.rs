@@ -10,6 +10,7 @@ use polars::prelude::*;
 pub(crate) struct LedgerFrames {
     pub daily: DataFrame,
     pub fills: DataFrame,
+    pub cashflows: DataFrame,
 }
 
 fn date_column(dates: Vec<i32>) -> PolarsResult<Column> {
@@ -33,6 +34,8 @@ fn daily_frame(ledger: &Ledger<String, i32>) -> PolarsResult<DataFrame> {
         float_column("commission", rows().map(|r| r.commission)),
         float_column("tax", rows().map(|r| r.tax)),
         float_column("slippage", rows().map(|r| r.slippage)),
+        float_column("surcharge", rows().map(|r| r.surcharge)),
+        float_column("borrow_cost", rows().map(|r| r.borrow_cost)),
         float_column("gross_long", rows().map(|r| r.close.gross_long)),
         float_column("gross_short", rows().map(|r| r.close.gross_short)),
         float_column(
@@ -45,6 +48,18 @@ fn daily_frame(ledger: &Ledger<String, i32>) -> PolarsResult<DataFrame> {
         ),
         float_column("traded_notional", rows().map(|r| r.traded_notional)),
         Series::new("turnover".into(), turnover).into_column(),
+    ])
+}
+
+fn cashflows_frame(ledger: &Ledger<String, i32>) -> PolarsResult<DataFrame> {
+    let rows = || ledger.cashflows.iter();
+    let symbols: Vec<&str> = rows().map(|r| r.key.as_str()).collect();
+    let kinds: Vec<&str> = rows().map(|_| "borrow_fee").collect();
+    DataFrame::new(vec![
+        date_column(rows().map(|r| r.date).collect())?,
+        Series::new("symbol".into(), symbols).into_column(),
+        Series::new("kind".into(), kinds).into_column(),
+        float_column("amount", rows().map(|r| r.amount)),
     ])
 }
 
@@ -67,5 +82,6 @@ pub(crate) fn ledger_frames(ledger: &Ledger<String, i32>) -> PolarsResult<Ledger
     Ok(LedgerFrames {
         daily: daily_frame(ledger)?,
         fills: fills_frame(ledger)?,
+        cashflows: cashflows_frame(ledger)?,
     })
 }

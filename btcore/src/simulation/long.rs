@@ -15,7 +15,7 @@ use std::collections::{BTreeMap, HashMap, VecDeque};
 
 use arrow::array::{Float64Array, Int32Array, StringViewArray};
 
-use crate::config::{BacktestConfig, ExecOptions};
+use crate::config::{BacktestConfig, ExecOptions, TaxSide};
 use crate::ledger::{DayClose, FillReason, LegFill};
 use crate::position::{Position, PositionSnapshot};
 use crate::tracker::{
@@ -581,7 +581,10 @@ where
 
     // Final day
     if let Some(last_date) = current_date {
-        if !today_prices.is_empty() || !today_mark.is_empty() {
+        if !today_prices.is_empty()
+            || !today_mark.is_empty()
+            || (config.exec.borrow_fee_ratio > 0.0 && !session.portfolio.positions.is_empty())
+        {
             run_session_day(
                 &mut session,
                 &today_prices,
@@ -620,6 +623,7 @@ struct SessionState {
     pending_weights: Option<BTreeMap<String, f64>>,
     pending_signal_date: Option<i32>,
     pending_stop_exits: Vec<String>,
+    previous_date: Option<i32>,
 }
 
 impl SessionState {
@@ -630,6 +634,7 @@ impl SessionState {
             pending_weights: None,
             pending_signal_date: None,
             pending_stop_exits: Vec::new(),
+            previous_date: None,
         }
     }
 }
@@ -658,6 +663,18 @@ fn run_session_day<T>(
     T: TradeTracker<Key = String, Date = i32, Record = TradeRecord>,
 {
     let observe_exit = today_mark.is_some() || config.exec.slippage_ratio > 0.0;
+    if let Some(previous) = session.previous_date.replace(date) {
+        if config.exec.borrow_fee_ratio > 0.0 {
+            for (sym, pos) in &session.portfolio.positions {
+                if pos.last_market_value < 0.0 {
+                    let cost = pos.last_market_value.abs() * config.exec.borrow_fee_ratio
+                        * f64::from(date - previous) / 365.0;
+                    session.portfolio.cash -= cost;
+                    tracker.record_borrow(sym, date, cost);
+                }
+            }
+        }
+    }
     // Update positions (cr *= r, maxcr update)
     update_positions(&mut session.portfolio, today_prices, today_mark.is_some());
 
@@ -1981,6 +1998,7 @@ impl<'s> LegContext<'s> {
                     commission: leg.commission,
                     tax: leg.tax,
                     slippage: leg.slippage,
+                    surcharge: leg.surcharge,
                     reason: self.reason,
                 },
             );
@@ -1991,7 +2009,7 @@ impl<'s> LegContext<'s> {
     where
         T: TradeTracker<Key = String, Date = i32, Record = TradeRecord>,
     {
-        let leg = close_leg(value, true, config);
+        let leg = close_leg(value, LegacyTax::Exit, config);
         *cash += leg.cash_delta;
         self.record(&leg, config, tracker);
     }
@@ -2007,10 +2025,17 @@ impl<'s> LegContext<'s> {
     where
         T: TradeTracker<Key = String, Date = i32, Record = TradeRecord>,
     {
-        if config.exec.slippage_ratio > 0.0 && current * target < 0.0 {
-            // Cover/sell the old quantity in full before budgeting the new
-            // entry. Both parts retain the legacy reversal entry tax class.
-            let exit = close_leg(current, false, config);
+        if current * target < 0.0
+            && (config.exec.slippage_ratio > 0.0
+                || config.exec.short_sale_fee_ratio > 0.0
+                || config.exec.tax_side == TaxSide::Sell)
+        {
+            // Fully close before budgeting the opposite entry. A slipped buy
+            // budget can otherwise leave a residual short.
+            // A reversal is entry-classified by the legacy net-leg convention.
+            // Splitting it for surcharge must not turn the closing part taxable.
+            // Sell-side tax independently decides from each leg's signed notional.
+            let exit = close_leg(current, LegacyTax::Entry, config);
             *cash += exit.cash_delta;
             self.record(&exit, config, tracker);
             return self.book_move(cash, 0.0, target, config, tracker);
@@ -2028,6 +2053,7 @@ struct BookedLeg {
     commission: f64,
     tax: f64,
     slippage: f64,
+    surcharge: f64,
     cash_delta: f64,
     new_value: f64,
 }
@@ -2048,9 +2074,19 @@ struct LegCost {
     total: f64,
 }
 
+#[derive(Clone, Copy)]
+enum LegacyTax {
+    Entry,
+    Exit,
+}
+
 impl LegCost {
-    fn of(notional: f64, taxed: bool, config: &BacktestConfig) -> Self {
+    fn of(notional: f64, legacy_tax: LegacyTax, config: &BacktestConfig) -> Self {
         let traded = notional.abs();
+        let taxed = match config.exec.tax_side {
+            TaxSide::Exit => matches!(legacy_tax, LegacyTax::Exit),
+            TaxSide::Sell => notional < 0.0,
+        };
         let (tax, total) = if taxed {
             (
                 traded * config.tax_ratio,
@@ -2068,18 +2104,19 @@ impl LegCost {
 }
 
 /// Full exits use proceeds accounting even for buy-to-cover legs.
-fn close_leg(value: f64, taxed: bool, config: &BacktestConfig) -> BookedLeg {
+fn close_leg(value: f64, legacy_tax: LegacyTax, config: &BacktestConfig) -> BookedLeg {
     let notional = if config.exec.slippage_ratio == 0.0 {
         -value
     } else {
         -value * (1.0 - value.signum() * config.exec.slippage_ratio)
     };
-    let cost = LegCost::of(notional, taxed, config);
+    let cost = LegCost::of(notional, legacy_tax, config);
     BookedLeg {
         notional,
         commission: cost.commission,
         tax: cost.tax,
         slippage: (notional + value).abs(),
+        surcharge: 0.0,
         cash_delta: -notional - cost.total,
         new_value: 0.0,
     }
@@ -2099,7 +2136,13 @@ fn book_leg(current: f64, target: f64, config: &BacktestConfig) -> BookedLeg {
     } else {
         amount * (1.0 - s)
     };
-    let cost = LegCost::of(notional, !is_entry_leg(amount, target), config);
+    let legacy_tax = if is_entry_leg(amount, target) { LegacyTax::Entry } else { LegacyTax::Exit };
+    let cost = LegCost::of(notional, legacy_tax, config);
+    let surcharge = if amount < 0.0 && target < 0.0 {
+        notional.abs() * config.exec.short_sale_fee_ratio
+    } else {
+        0.0
+    };
     let (new_value, cash_delta, slippage) = if amount > 0.0 {
         // Keep the legacy budget fee base at every slippage ratio. Only the
         // post-fee mark value shrinks; the zero branch keeps its exact order.
@@ -2124,7 +2167,8 @@ fn book_leg(current: f64, target: f64, config: &BacktestConfig) -> BookedLeg {
         commission: cost.commission,
         tax: cost.tax,
         slippage,
-        cash_delta,
+        surcharge,
+        cash_delta: if surcharge > 0.0 { cash_delta - surcharge } else { cash_delta },
         new_value,
     }
 }

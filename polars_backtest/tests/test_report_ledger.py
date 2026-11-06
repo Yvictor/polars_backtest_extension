@@ -40,6 +40,8 @@ def test_tables_hold_only_real_columns():
         "commission",
         "tax",
         "slippage",
+        "surcharge",
+        "borrow_cost",
         "gross_long",
         "gross_short",
         "net_exposure",

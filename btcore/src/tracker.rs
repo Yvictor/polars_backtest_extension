@@ -298,6 +298,9 @@ pub trait TradeTracker {
     #[inline]
     fn record_fill(&mut self, _key: &Self::Key, _date: Self::Date, _fill: &LegFill) {}
 
+    #[inline]
+    fn record_borrow(&mut self, _key: &Self::Key, _date: Self::Date, _cost: f64) {}
+
     /// Record the portfolio after the close of a day
     #[inline]
     fn record_day(&mut self, _date: Self::Date, _close: &DayClose) {}
@@ -902,6 +905,12 @@ impl<R: RecordBuilder> TradeTracker for GenericTracker<R> {
     fn record_day(&mut self, date: Self::Date, close: &DayClose) {
         if let Some(ledger) = &mut self.ledger {
             ledger.close_day(date, *close);
+        }
+    }
+
+    fn record_borrow(&mut self, key: &Self::Key, date: Self::Date, cost: f64) {
+        if let Some(ledger) = &mut self.ledger {
+            ledger.add_borrow(key.clone(), date, cost);
         }
     }
 
