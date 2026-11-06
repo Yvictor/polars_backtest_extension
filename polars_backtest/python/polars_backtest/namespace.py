@@ -163,7 +163,8 @@ def _prepare_long(
     resample: str | None,
     resample_offset: str | None,
     touched_exit: bool,
-) -> tuple[pl.DataFrame, _LongColumns]:
+    mark_price: ColumnSpec | None,
+) -> tuple[pl.DataFrame, _LongColumns, str | None]:
     """Resolve and validate columns, and clean values the Rust engine reads."""
     # Resolve column specs (str or Expr) to column names
     df, date_col = _resolve_column(df, date, "_bt_date")
@@ -171,8 +172,14 @@ def _prepare_long(
     df, price_col = _resolve_column(df, trade_at_price, "_bt_price")
     df, position_col = _resolve_column(df, position, "_bt_position")
 
+    mark_col = None
+    if mark_price is not None:
+        df, mark_col = _resolve_column(df, mark_price, "_bt_mark")
+
     # Validate columns exist
     required = [date_col, symbol_col, price_col, position_col]
+    if mark_col is not None:
+        required.append(mark_col)
     missing = [c for c in required if c not in df.columns]
     if missing:
         raise ValueError(f"Missing required columns: {missing}")
@@ -215,7 +222,7 @@ def _prepare_long(
 
     # Nulls must not reach the FFI boundary (validity bitmaps are not checked there)
     _validate_no_nulls(df, (date_col, symbol_col))
-    float_cols: list[str | None] = [price_col, position_col, factor_col]
+    float_cols: list[str | None] = [price_col, position_col, factor_col, mark_col]
     if touched_exit:
         float_cols += [open_col, high_col, low_col]
     df = _floats_with_nan_nulls(df, float_cols)
@@ -223,7 +230,7 @@ def _prepare_long(
     columns = _LongColumns(
         date_col, symbol_col, price_col, position_col, open_col, high_col, low_col, factor_col
     )
-    return df, columns
+    return df, columns, mark_col
 
 
 @pl.api.register_dataframe_namespace("bt")
@@ -285,11 +292,15 @@ class BacktestNamespace:
         rebalance_every: int = 1,
         rebalance_phase: int = 0,
         rebalance_anchor: dt.date | None = None,
+        mark_price: ColumnSpec | None = None,
+        slippage_ratio: float = 0.0,
     ) -> pl.DataFrame:
         """Run backtest on long format DataFrame.
 
         Args:
-            trade_at_price: Price column name or Expr (default: "close")
+            trade_at_price: Next-session execution price column or Expr
+            mark_price: Closing valuation column or Expr; None uses trade_at_price
+            slippage_ratio: Adverse fill price ratio in [0, 1)
             position: Position/weight column name or Expr (default: "weight")
             date: Date column name or Expr (default: "date")
             symbol: Symbol column name or Expr (default: "symbol")
@@ -317,7 +328,7 @@ class BacktestNamespace:
         Returns:
             DataFrame with columns: date, creturn
         """
-        df, columns = _prepare_long(
+        df, columns, mark_col = _prepare_long(
             self._df,
             trade_at_price,
             position,
@@ -330,6 +341,7 @@ class BacktestNamespace:
             resample,
             resample_offset,
             touched_exit,
+            mark_price,
         )
 
         # Create config
@@ -359,6 +371,8 @@ class BacktestNamespace:
             config,
             skip_sort,
             *_schedule_args(rebalance_every, rebalance_phase, rebalance_anchor),
+            mark_col,
+            slippage_ratio,
         )
 
         return result.creturn
@@ -392,6 +406,8 @@ class BacktestNamespace:
         rebalance_phase: int = 0,
         rebalance_anchor: dt.date | None = None,
         ledger: bool = False,
+        mark_price: ColumnSpec | None = None,
+        slippage_ratio: float = 0.0,
     ) -> BacktestReport:
         """Run backtest with trade tracking, returning a BacktestReport object.
 
@@ -399,7 +415,9 @@ class BacktestNamespace:
         When touched_exit=True, falls back to wide format for OHLC support.
 
         Args:
-            trade_at_price: Price column name or Expr (default: "close")
+            trade_at_price: Next-session execution price column or Expr
+            mark_price: Closing valuation column or Expr; None uses trade_at_price
+            slippage_ratio: Adverse fill price ratio in [0, 1)
             position: Position/weight column name or Expr (default: "weight")
             date: Date column name or Expr (default: "date")
             symbol: Symbol column name or Expr (default: "symbol")
@@ -435,7 +453,7 @@ class BacktestNamespace:
         Returns:
             BacktestReport object with creturn (list) and trades (DataFrame)
         """
-        df, columns = _prepare_long(
+        df, columns, mark_col = _prepare_long(
             self._df,
             trade_at_price,
             position,
@@ -448,6 +466,7 @@ class BacktestNamespace:
             resample,
             resample_offset,
             touched_exit,
+            mark_price,
         )
 
         # Build config
@@ -515,6 +534,8 @@ class BacktestNamespace:
             trading_value,
             *_schedule_args(rebalance_every, rebalance_phase, rebalance_anchor),
             ledger,
+            mark_col,
+            slippage_ratio,
         )
 
 # =============================================================================
@@ -546,12 +567,16 @@ def backtest(
     rebalance_every: int = 1,
     rebalance_phase: int = 0,
     rebalance_anchor: dt.date | None = None,
+    mark_price: ColumnSpec | None = None,
+    slippage_ratio: float = 0.0,
 ) -> pl.DataFrame:
     """Run backtest on long format DataFrame.
 
     Args:
         df: Long format DataFrame with date, symbol, price, position columns
-        trade_at_price: Price column name or Expr (default: "close")
+        trade_at_price: Next-session execution price column or Expr
+        mark_price: Closing valuation column or Expr; None uses trade_at_price
+        slippage_ratio: Adverse fill price ratio in [0, 1)
         position: Position/weight column name or Expr (default: "weight")
         date: Date column name or Expr (default: "date")
         symbol: Symbol column name or Expr (default: "symbol")
@@ -606,6 +631,8 @@ def backtest(
         rebalance_every=rebalance_every,
         rebalance_phase=rebalance_phase,
         rebalance_anchor=rebalance_anchor,
+        mark_price=mark_price,
+        slippage_ratio=slippage_ratio,
     )
 
 
@@ -638,6 +665,8 @@ def backtest_with_report(
     rebalance_phase: int = 0,
     rebalance_anchor: dt.date | None = None,
     ledger: bool = False,
+    mark_price: ColumnSpec | None = None,
+    slippage_ratio: float = 0.0,
 ) -> BacktestReport:
     """Run backtest with trade tracking on long format DataFrame.
 
@@ -645,7 +674,9 @@ def backtest_with_report(
 
     Args:
         df: Long format DataFrame with date, symbol, price, position columns
-        trade_at_price: Price column name or Expr (default: "close")
+        trade_at_price: Next-session execution price column or Expr
+        mark_price: Closing valuation column or Expr; None uses trade_at_price
+        slippage_ratio: Adverse fill price ratio in [0, 1)
         position: Position/weight column name or Expr (default: "weight")
         date: Date column name or Expr (default: "date")
         symbol: Symbol column name or Expr (default: "symbol")
@@ -711,5 +742,7 @@ def backtest_with_report(
         rebalance_every=rebalance_every,
         rebalance_phase=rebalance_phase,
         rebalance_anchor=rebalance_anchor,
+        mark_price=mark_price,
+        slippage_ratio=slippage_ratio,
         ledger=ledger,
     )

@@ -61,6 +61,8 @@ pub struct ExecOptions {
     pub rebalance_anchor: Option<i32>,
     /// Collect the daily and per-leg ledger
     pub ledger: bool,
+    /// Adverse proportional slippage on each executed leg
+    pub slippage_ratio: f64,
 }
 
 impl Default for ExecOptions {
@@ -70,11 +72,19 @@ impl Default for ExecOptions {
             rebalance_phase: 0,
             rebalance_anchor: None,
             ledger: false,
+            slippage_ratio: 0.0,
         }
     }
 }
 
 impl ExecOptions {
+    pub fn validate_prices(&self) -> Result<(), String> {
+        if !self.slippage_ratio.is_finite() || !(0.0..1.0).contains(&self.slippage_ratio) {
+            return Err("slippage_ratio must be finite and in [0, 1)".into());
+        }
+        Ok(())
+    }
+
     /// Reject schedule settings the loop cannot honour
     pub fn validate_schedule(&self, weekly_resample: bool) -> Result<(), String> {
         let every = self.rebalance_every;

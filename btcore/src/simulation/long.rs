@@ -74,6 +74,13 @@ pub struct LongFormatArrowInput<'a> {
     /// raw_price = adj_price / factor
     /// Defaults to 1.0 if not provided
     pub factor: Option<&'a Float64Array>,
+    pub exec: ExecInput<'a>,
+}
+
+/// Optional row-aligned execution inputs, shared by all long interfaces
+#[derive(Clone, Copy, Default)]
+pub struct ExecInput<'a> {
+    pub mark_prices: Option<&'a [f64]>,
 }
 
 /// Resample frequency for rebalancing
@@ -235,6 +242,7 @@ fn backtest_impl<'a, FD, FS, FP, FW, FF, T, FO, FH, FL>(
     config: &BacktestConfig,
     tracker: &mut T,
     ohlc: Option<OhlcGetters<FO, FH, FL>>,
+    exec: ExecInput<'_>,
 ) -> (Vec<i32>, Vec<f64>)
 where
     FD: Fn(usize) -> i32,
@@ -251,6 +259,18 @@ where
         return (vec![], vec![]);
     }
 
+    // Equal columns preserve the default stop timing and metric history on
+    // native inputs too. No extra data is read when marks are disabled.
+    let exec = ExecInput {
+        mark_prices: exec.mark_prices.filter(|marks| {
+            assert_eq!(marks.len(), n_rows, "mark prices must be row-aligned");
+            marks.iter().enumerate().any(|(i, mark)| {
+                let price = get_price(i);
+                *mark != price && !(mark.is_nan() && price.is_nan())
+            })
+        }),
+    };
+
     let mut session = SessionState::new();
     let mut dates: Vec<i32> = Vec::new();
     let mut creturn: Vec<f64> = Vec::new();
@@ -259,6 +279,7 @@ where
     let mut position_changed = false;
     let mut current_date: Option<i32> = None;
     let mut today_prices: HashMap<&str, f64> = HashMap::new();
+    let mut today_mark: HashMap<&str, f64> = HashMap::new();
     let mut today_weights: HashMap<&str, f64> = HashMap::new();
     let mut today_factor: HashMap<&str, f64> = HashMap::new();
 
@@ -287,6 +308,7 @@ where
             run_session_day(
                 &mut session,
                 &today_prices,
+                exec.mark_prices.map(|_| &today_mark),
                 &today_factor,
                 touched_exit_enabled.then_some((&today_open, &today_high, &today_low)),
                 config,
@@ -511,6 +533,7 @@ where
             }
 
             today_prices.clear();
+            today_mark.clear();
             today_weights.clear();
             today_factor.clear();
             if touched_exit_enabled {
@@ -523,6 +546,11 @@ where
         current_date = Some(date);
         if is_valid_price(price) {
             today_prices.insert(symbol, price);
+        }
+        if let Some(marks) = exec.mark_prices {
+            if is_valid_price(marks[i]) {
+                today_mark.insert(symbol, marks[i]);
+            }
         }
         if !weight.is_nan() && weight.abs() > FLOAT_EPSILON {
             today_weights.insert(symbol, weight);
@@ -542,10 +570,11 @@ where
 
     // Final day
     if let Some(last_date) = current_date {
-        if !today_prices.is_empty() {
+        if !today_prices.is_empty() || !today_mark.is_empty() {
             run_session_day(
                 &mut session,
                 &today_prices,
+                exec.mark_prices.map(|_| &today_mark),
                 &today_factor,
                 touched_exit_enabled.then_some((&today_open, &today_high, &today_low)),
                 config,
@@ -609,6 +638,7 @@ type DayOhlc<'d, 'a> = (
 fn run_session_day<T>(
     session: &mut SessionState,
     today_prices: &HashMap<&str, f64>,
+    today_mark: Option<&HashMap<&str, f64>>,
     today_factor: &HashMap<&str, f64>,
     ohlc: Option<DayOhlc<'_, '_>>,
     config: &BacktestConfig,
@@ -621,14 +651,16 @@ fn run_session_day<T>(
     update_positions(&mut session.portfolio, today_prices);
 
     // Record prices for MAE/MFE calculation
-    for (sym, _pos) in session.portfolio.positions.iter() {
-        if let Some(&price) = today_prices.get(sym.as_str()) {
-            tracker.record_price(sym, price, price);
+    if today_mark.is_none() {
+        for sym in session.portfolio.positions.keys() {
+            if let Some(&price) = today_prices.get(sym.as_str()) {
+                tracker.record_price(sym, price, price);
+            }
         }
     }
 
     // Stop detection and execution
-    if ohlc.is_some() {
+    if ohlc.is_some() && today_mark.is_none() {
         // touched_exit mode: detect and execute IMMEDIATELY (T+0)
         let stops = detect_stops_unified(&session.portfolio, today_prices, ohlc, config);
         execute_stops_impl(
@@ -668,7 +700,11 @@ fn run_session_day<T>(
         );
 
         // Detect new stops for tomorrow's execution
-        let new_stops = detect_stops_unified(&session.portfolio, today_prices, None, config);
+        let new_stops = if today_mark.is_none() {
+            detect_stops_unified(&session.portfolio, today_prices, None, config)
+        } else {
+            Vec::new()
+        };
         for stop in new_stops {
             session.pending_stop_exits.push(stop.symbol);
         }
@@ -693,6 +729,34 @@ fn run_session_day<T>(
             tracker,
         );
         session.stopped_stocks.clear();
+    }
+
+    if let Some(marks) = today_mark {
+        // Identical prices need no second multiplication (including maxcr).
+        let changed: HashMap<&str, f64> = marks
+            .iter()
+            .filter(|(sym, price)| today_prices.get(**sym) != Some(*price))
+            .map(|(&sym, &price)| (sym, price))
+            .collect();
+        update_positions(&mut session.portfolio, &changed);
+        for sym in session.portfolio.positions.keys() {
+            if let Some(&mark) = marks.get(sym.as_str()) {
+                let trade = today_prices.get(sym.as_str()).copied().unwrap_or(mark);
+                tracker.record_price(sym, mark, trade);
+            }
+        }
+        // Touched ratios are relative to the execution price, before previous_price
+        // advances to the close. Close-only stops remain next-session exits.
+        let stops = detect_stops_unified(&session.portfolio, marks, ohlc, config);
+        if ohlc.is_some() {
+            execute_stops_impl(
+                &mut session.portfolio, stops, &mut session.stopped_stocks,
+                marks, today_factor, config, date, Some(date), tracker,
+            );
+        } else {
+            session.pending_stop_exits.extend(stops.into_iter().map(|s| s.symbol));
+        }
+        update_previous_prices(&mut session.portfolio, marks);
     }
 }
 
@@ -737,6 +801,7 @@ pub fn backtest_with_accessor<'a, FD, FS, FP, FW, FF, FO, FH, FL>(
     resample: ResampleFreq,
     offset: Option<ResampleOffset>,
     config: &BacktestConfig,
+    exec: ExecInput<'_>,
 ) -> BacktestResult
 where
     FD: Fn(usize) -> i32,
@@ -769,6 +834,7 @@ where
             config,
             &mut tracker,
             ohlc,
+            exec,
         )
     } else {
         let ohlc: Option<OhlcGetters<fn(usize) -> f64, fn(usize) -> f64, fn(usize) -> f64>> = None;
@@ -784,6 +850,7 @@ where
             config,
             &mut tracker,
             ohlc,
+            exec,
         )
     };
 
@@ -850,6 +917,7 @@ pub fn backtest_long_arrow(
         resample,
         offset,
         config,
+        input.exec,
     )
 }
 
@@ -902,6 +970,7 @@ pub fn backtest_long_slice(
         resample,
         offset,
         config,
+        ExecInput::default(),
     )
 }
 
@@ -961,6 +1030,7 @@ pub fn backtest_with_report_long_arrow(
             config,
             &mut tracker,
             ohlc,
+            input.exec,
         )
     } else {
         let ohlc: Option<OhlcGetters<fn(usize) -> f64, fn(usize) -> f64, fn(usize) -> f64>> = None;
@@ -976,6 +1046,7 @@ pub fn backtest_with_report_long_arrow(
             config,
             &mut tracker,
             ohlc,
+            input.exec,
         )
     };
 
@@ -1730,7 +1801,7 @@ where
 
             // For touched_exit, adjust exit_price by exit_ratio (touched_price / close_price)
             let close_price = today_prices.get(stop.symbol.as_str()).copied().unwrap_or(pos.previous_price);
-            let exit_price = close_price * stop.exit_ratio;
+            let exit_price = fill_price(close_price * stop.exit_ratio, -exit_value, config);
             let exit_factor = today_factor.get(stop.symbol.as_str()).copied().unwrap_or(1.0);
             tracker.close_trade(
                 &stop.symbol,
@@ -1745,7 +1816,7 @@ where
             let leg = LegContext {
                 symbol: &stop.symbol,
                 date: current_date,
-                price: exit_price,
+                price: close_price * stop.exit_ratio,
                 reason: FillReason::Stop,
             };
             leg.record_exit(exit_value, config, tracker);
@@ -1788,9 +1859,10 @@ impl<'s> LegContext<'s> {
         let cost = LegCost::of(notional, taxed, config);
         let fill = LegFill {
             notional,
-            price: self.price,
+            price: fill_price(self.price, notional, config),
             commission: cost.commission,
             tax: cost.tax,
+            slippage: 0.0,
             reason: self.reason,
         };
         tracker.record_fill(self.symbol, self.date, &fill);
@@ -1801,7 +1873,12 @@ impl<'s> LegContext<'s> {
     where
         T: TradeTracker<Key = String, Date = i32, Record = TradeRecord>,
     {
-        self.record(-value, true, config, tracker);
+        if config.exec.slippage_ratio > 0.0 {
+            let notional = -value * (1.0 - value.signum() * config.exec.slippage_ratio);
+            self.record_slipped(notional, true, (notional + value).abs(), config, tracker);
+        } else {
+            self.record(-value, true, config, tracker);
+        }
     }
 
     /// Report the leg `book_leg` books between the same two values
@@ -1816,8 +1893,43 @@ impl<'s> LegContext<'s> {
     {
         let amount = target_value - current_value;
         let taxed = !is_entry_leg(amount, target_value);
-        self.record(amount, taxed, config, tracker);
+        if config.exec.slippage_ratio > 0.0 {
+            let (_, _, notional, slippage) = slipped_move(current_value, target_value, config);
+            self.record_slipped(notional, taxed, slippage, config, tracker);
+        } else {
+            self.record(amount, taxed, config, tracker);
+        }
     }
+
+    fn record_slipped<T>(
+        &self,
+        notional: f64,
+        taxed: bool,
+        slippage: f64,
+        config: &BacktestConfig,
+        tracker: &mut T,
+    ) where
+        T: TradeTracker<Key = String, Date = i32, Record = TradeRecord>,
+    {
+        if tracker.wants_ledger() && notional != 0.0 {
+            let cost = LegCost::of(notional, taxed, config);
+            tracker.record_fill(self.symbol, self.date, &LegFill {
+                notional,
+                price: fill_price(self.price, notional, config),
+                commission: cost.commission,
+                tax: cost.tax,
+                slippage,
+                reason: self.reason,
+            });
+        }
+    }
+}
+
+fn fill_price(price: f64, amount: f64, config: &BacktestConfig) -> f64 {
+    if config.exec.slippage_ratio == 0.0 || amount == 0.0 {
+        return price;
+    }
+    price * (1.0 + amount.signum() * config.exec.slippage_ratio)
 }
 
 /// What a leg costs, shared by the booking and the ledger
@@ -1850,6 +1962,10 @@ impl LegCost {
 
 /// Cash received for closing a position worth `value`, after fee and tax
 fn exit_proceeds(value: f64, config: &BacktestConfig) -> f64 {
+    if config.exec.slippage_ratio > 0.0 {
+        let filled = value * (1.0 - value.signum() * config.exec.slippage_ratio);
+        return filled - LegCost::of(filled, true, config).total;
+    }
     value - LegCost::of(value, true, config).total
 }
 
@@ -1863,6 +1979,11 @@ fn is_entry_leg(amount: f64, target_value: f64) -> bool {
 /// Moves the traded amount through `cash` and returns the new position value.
 /// A buy pays its cost out of the position, a sell out of the proceeds.
 fn book_leg(cash: &mut f64, current_value: f64, target_value: f64, config: &BacktestConfig) -> f64 {
+    if config.exec.slippage_ratio > 0.0 {
+        let (value, cash_delta, _, _) = slipped_move(current_value, target_value, config);
+        *cash += cash_delta;
+        return value;
+    }
     let amount = target_value - current_value;
     let is_buy = amount > 0.0;
     let cost = LegCost::of(amount, !is_entry_leg(amount, target_value), config).total;
@@ -1874,6 +1995,22 @@ fn book_leg(cash: &mut f64, current_value: f64, target_value: f64, config: &Back
         let sell_amount = amount.abs();
         *cash += sell_amount - cost;
         current_value - sell_amount
+    }
+}
+
+/// Buy budgets include costs; sells receive the slipped notional less costs.
+/// Fees use the actual filled notional. The zero-slippage arithmetic stays above.
+fn slipped_move(current: f64, target: f64, config: &BacktestConfig) -> (f64, f64, f64, f64) {
+    let amount = target - current;
+    let rate = LegCost::of(1.0, !is_entry_leg(amount, target), config).total;
+    let s = config.exec.slippage_ratio;
+    if amount > 0.0 {
+        let notional = amount / (1.0 + rate);
+        let mark_value = notional / (1.0 + s);
+        (current + mark_value, -amount, notional, notional - mark_value)
+    } else {
+        let notional = amount * (1.0 - s);
+        (target, -notional - notional.abs() * rate, notional, (notional - amount).abs())
     }
 }
 
@@ -1906,7 +2043,8 @@ where
     // This matches wide.rs lines 263-279
     let open_positions: Vec<String> = portfolio.positions.keys().cloned().collect();
     for sym in &open_positions {
-        let exit_price = today_prices.get(sym.as_str()).copied().unwrap_or(f64::NAN);
+        let price = today_prices.get(sym.as_str()).copied().unwrap_or(f64::NAN);
+        let exit_price = fill_price(price, -portfolio.positions[sym].last_market_value, config);
         let exit_factor = today_factor.get(sym.as_str()).copied().unwrap_or(1.0);
         tracker.close_trade(
             sym,
@@ -2049,12 +2187,13 @@ where
             // Finlab behavior: Open trade for ALL positions after rebalance
             // (All trades were closed at the start of rebalance)
             let entry_factor = today_factor.get(sym.as_str()).copied().unwrap_or(1.0);
-            tracker.open_trade(sym.clone(), current_date, signal_date, price, target_weight, entry_factor);
+            let entry_price = fill_price(price, target_value - current_value, config);
+            tracker.open_trade(sym.clone(), current_date, signal_date, entry_price, target_weight, entry_factor);
 
             // Determine if this is a continuing same-direction position
             let is_continuing = current_value.abs() > FLOAT_EPSILON && current_value * target_weight > 0.0;
 
-            let new_pos = if config.retain_cost_when_rebalance && is_continuing {
+            let mut new_pos = if config.retain_cost_when_rebalance && is_continuing {
                 // Preserve stop tracking for continuing same-direction positions
                 let snap = snapshot.unwrap(); // Safe: is_continuing implies snapshot exists
                 Position::new_from_snapshot(new_position_value, price, snap)
@@ -2062,6 +2201,13 @@ where
                 // New position or direction change or retain_cost=False: reset all
                 Position::new(new_position_value, price)
             };
+
+            if config.exec.slippage_ratio > 0.0 && !(config.retain_cost_when_rebalance && is_continuing) {
+                new_pos.entry_price = entry_price;
+                new_pos.stop_entry_price = entry_price;
+                new_pos.cr = price / entry_price;
+                new_pos.maxcr = new_pos.cr;
+            }
 
             portfolio.positions.insert(sym.clone(), new_pos);
         }
@@ -2199,7 +2345,24 @@ mod tests {
             high_prices: None,
             low_prices: None,
             factor: None,
+            exec: ExecInput::default(),
         }
+    }
+
+    #[test]
+    fn test_native_equal_marks_preserve_default_bits_and_trades() {
+        let dates = Int32Array::from(vec![0, 1, 2, 3]);
+        let symbols = make_symbols(vec!["A", "A", "A", "A"]);
+        let prices = Float64Array::from(vec![100.0, 100.0, 90.0, 100.0]);
+        let weights = Float64Array::from(vec![1.0; 4]);
+        let mut input = make_input(&dates, &symbols, &prices, &weights);
+        let config = BacktestConfig { stop_loss: 0.05, ..Default::default() };
+        let plain = backtest_with_report_long_arrow(&input, ResampleFreq::Daily, None, &config);
+        input.exec.mark_prices = Some(prices.values());
+        let marked = backtest_with_report_long_arrow(&input, ResampleFreq::Daily, None, &config);
+        assert_eq!(plain.creturn.iter().map(|x| x.to_bits()).collect::<Vec<_>>(),
+            marked.creturn.iter().map(|x| x.to_bits()).collect::<Vec<_>>());
+        assert_eq!(format!("{:?}", plain.trades), format!("{:?}", marked.trades));
     }
 
     #[test]

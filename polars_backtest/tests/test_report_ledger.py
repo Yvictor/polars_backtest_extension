@@ -39,6 +39,7 @@ def test_tables_hold_only_real_columns():
         "cash",
         "commission",
         "tax",
+        "slippage",
         "gross_long",
         "gross_short",
         "net_exposure",

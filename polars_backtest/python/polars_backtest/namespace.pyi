@@ -41,6 +41,8 @@ class BacktestNamespace:
         rebalance_every: int = 1,
         rebalance_phase: int = 0,
         rebalance_anchor: dt.date | None = None,
+        mark_price: ColumnSpec | None = None,
+        slippage_ratio: float = 0.0,
     ) -> pl.DataFrame:
         """Run backtest on long format DataFrame.
 
@@ -78,6 +80,8 @@ class BacktestNamespace:
         rebalance_phase: int = 0,
         rebalance_anchor: dt.date | None = None,
         ledger: bool = False,
+        mark_price: ColumnSpec | None = None,
+        slippage_ratio: float = 0.0,
     ) -> BacktestReport:
         """Run backtest with trade tracking.
 
@@ -111,6 +115,8 @@ def backtest(
     rebalance_every: int = 1,
     rebalance_phase: int = 0,
     rebalance_anchor: dt.date | None = None,
+    mark_price: ColumnSpec | None = None,
+    slippage_ratio: float = 0.0,
 ) -> pl.DataFrame:
     """Standalone function for backtest."""
     ...
@@ -145,6 +151,8 @@ def backtest_with_report(
     rebalance_phase: int = 0,
     rebalance_anchor: dt.date | None = None,
     ledger: bool = False,
+    mark_price: ColumnSpec | None = None,
+    slippage_ratio: float = 0.0,
 ) -> BacktestReport:
     """Standalone function for backtest with report."""
     ...

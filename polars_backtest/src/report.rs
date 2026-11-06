@@ -38,6 +38,7 @@ pub struct PyBacktestReport {
     pub(crate) next_weights_df: Option<DataFrame>,
     /// Ledger tables, when requested with `ledger=True`
     pub(crate) ledger: Option<LedgerFrames>,
+    pub(crate) trade_at: String,
 }
 
 impl PyBacktestReport {
@@ -64,12 +65,18 @@ impl PyBacktestReport {
             weights_df,
             next_weights_df,
             ledger: None,
+            trade_at: "close".into(),
         }
     }
 
     /// Attach the ledger tables
     pub(crate) fn with_ledger(mut self, ledger: Option<LedgerFrames>) -> Self {
         self.ledger = ledger;
+        self
+    }
+
+    pub(crate) fn with_trade_at(mut self, price: &str) -> Self {
+        self.trade_at = price.into();
         self
     }
 }
@@ -142,10 +149,10 @@ impl PyBacktestReport {
         }
     }
 
-    /// Get trade_at setting (always "close" for now)
+    /// Get the execution price column
     #[getter]
     fn trade_at(&self) -> &str {
-        "close"
+        &self.trade_at
     }
 
     /// Get resample setting
