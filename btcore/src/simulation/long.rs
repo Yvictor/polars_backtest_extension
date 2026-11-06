@@ -15,7 +15,7 @@ use std::collections::{BTreeMap, HashMap, VecDeque};
 
 use arrow::array::{Float64Array, Int32Array, StringViewArray};
 
-use crate::config::BacktestConfig;
+use crate::config::{BacktestConfig, ExecOptions};
 use crate::position::{Position, PositionSnapshot};
 use crate::tracker::{BacktestResult, StockOperations, TradeRecord, NoopSymbolTracker, SymbolTracker, TradeTracker};
 use crate::{is_valid_price, FLOAT_EPSILON};
@@ -328,7 +328,10 @@ where
             // STEP 4: Update active weights based on today's signals
             // Check if prev_date is a rebalance boundary
             let is_month_end = is_month_end_i32(prev_date, date);
-            let is_week_end = is_week_end_i32(prev_date, date);
+            // With an offset the schedule filters the boundaries instead (STEP 5):
+            // a selected week can fall inside a gap, after prev_date's week.
+            let week_selected = offset_days > 0 || config.exec.week_selected(prev_date);
+            let is_week_end = is_week_end_i32(prev_date, date) && week_selected;
             let is_quarter_end = is_quarter_end_i32(prev_date, date);
             let is_year_end = is_year_end_i32(prev_date, date);
 
@@ -342,7 +345,7 @@ where
             let at_boundary = match resample {
                 ResampleFreq::Monthly | ResampleFreq::MonthStart => is_month_end,
                 ResampleFreq::Weekly => is_week_end,
-                ResampleFreq::WeeklyOn(weekday) => prev_weekday == weekday,
+                ResampleFreq::WeeklyOn(weekday) => prev_weekday == weekday && week_selected,
                 ResampleFreq::Quarterly | ResampleFreq::QuarterStart => is_quarter_end,
                 ResampleFreq::Yearly => is_year_end,
                 ResampleFreq::Daily | ResampleFreq::PositionChange => true,
@@ -381,7 +384,7 @@ where
                 }
                 ResampleFreq::WeeklyOn(weekday) => {
                     // Rebalance on specific weekday (0=Mon, ..., 6=Sun)
-                    if prev_weekday == weekday {
+                    if prev_weekday == weekday && week_selected {
                         active_weights = normalized.clone();
                         if has_signals && set_first_signal_at_boundary {
                             has_first_signal = true;
@@ -442,9 +445,11 @@ where
                     // We need to queue a delayed rebalance for EACH period boundary in the gap.
                     let boundaries = get_all_period_boundaries(prev_date, date, resample);
                     for boundary in boundaries {
-                        delayed_rebalances.push_back(DelayedRebalance {
-                            target_date: boundary + offset_days,
-                        });
+                        if config.exec.week_selected(boundary) {
+                            delayed_rebalances.push_back(DelayedRebalance {
+                                target_date: boundary + offset_days,
+                            });
+                        }
                     }
                 } else if has_first_signal {
                     // No offset: set pending_weights for next day (T+1)
@@ -548,7 +553,9 @@ where
 
             // Handle single-date case: if we have weights but no first signal yet,
             // record the signal day with creturn=1.0 (matching Wide format behavior)
-            if !has_first_signal && !today_weights.is_empty() {
+            // A delayed signal belongs to the week its date falls in before the offset
+            let week_selected = config.exec.week_selected(last_date - offset_days);
+            if !has_first_signal && !today_weights.is_empty() && week_selected {
                 has_first_signal = true;
             }
 
@@ -952,7 +959,8 @@ pub fn backtest_with_report_long_arrow(
 
     // Calculate stock_operations (actions, weights, next_weights)
     // This matches Finlab's behavior where actions are computed at the end of backtest
-    let stock_operations = calculate_stock_operations(input, &trades, &dates, resample, offset);
+    let stock_operations =
+        calculate_stock_operations(input, &trades, &dates, resample, offset, &config.exec);
 
     // Post-process trades based on stock_operations (Finlab compatible)
     // 1. For "exit" actions: set exit_sig_date on open trades
@@ -1017,6 +1025,8 @@ fn calculate_next_signal_date(
     base_date: i32,
     resample: ResampleFreq,
     offset: Option<ResampleOffset>,
+    exec: &ExecOptions,
+    reporting_date: i32,
 ) -> i32 {
     let offset_days = offset.map(|o| o.days).unwrap_or(0);
 
@@ -1044,9 +1054,20 @@ fn calculate_next_signal_date(
             }
         }
         ResampleFreq::Weekly | ResampleFreq::WeeklyOn(_) => {
-            // Weekly signal repeats every 7 days
-            // The offset is already reflected in the base_date (which is a signal date)
-            base_date + 7
+            if exec.rebalance_every == 1 {
+                // Weekly signal repeats every 7 days
+                // The offset is already reflected in the base_date (which is a signal date)
+                return base_date + 7;
+            }
+            // A scheduled week can be weeks away, and base_date may have been moved by
+            // a holiday, so work from the calendar: the Sunday boundary plus the offset,
+            // or the usual signal day of the week without one
+            let boundary = match resample {
+                _ if offset_days > 0 => 6 + offset_days,
+                ResampleFreq::WeeklyOn(weekday) => i32::from(weekday),
+                _ => 4,
+            };
+            exec.next_selected_date(reporting_date, boundary)
         }
         ResampleFreq::Quarterly => {
             // Get current quarter and move to next
@@ -1104,6 +1125,7 @@ fn calculate_stock_operations(
     dates: &[i32],
     resample: ResampleFreq,
     offset: Option<ResampleOffset>,
+    exec: &ExecOptions,
 ) -> StockOperations {
     use std::collections::HashSet;
 
@@ -1239,10 +1261,22 @@ fn calculate_stock_operations(
         Some(future_date)
     } else if let Some(w_date) = weight_date {
         // Calculate from weight_date (the actual last rebalance date from trades)
-        Some(calculate_next_signal_date(w_date, resample, offset))
+        Some(calculate_next_signal_date(
+            w_date,
+            resample,
+            offset,
+            exec,
+            last_price_date,
+        ))
     } else if let Some(current_date) = current_signal_date {
         // Fallback to current_signal_date from input
-        Some(calculate_next_signal_date(current_date, resample, offset))
+        Some(calculate_next_signal_date(
+            current_date,
+            resample,
+            offset,
+            exec,
+            last_price_date,
+        ))
     } else {
         None
     };

@@ -45,6 +45,9 @@ Long format. Every parameter, with exact defaults:
 |---|---|---|
 | `resample` | `"D"` | One of `None`, `"D"`, `"W"`, `"W-MON"`…`"W-SUN"`, `"M"`, `"ME"`, `"MS"`, `"Q"`, `"QE"`, `"QS"`, `"Y"`, `"YE"`, `"A"`. Anything else raises `ValueError`. `None` = rebalance only when the position column changes. |
 | `resample_offset` | `None` | Calendar-day delay of rebalance dates. Formats parsed by the Rust core: `"1d"`, `"2d"`, `"1D"`, `"1W"`, `"2W"` (weeks × 7 days). **Positive offsets only; unparseable strings are silently treated as no offset** (`ResampleOffset::from_str` returns `None`). |
+| `rebalance_every` | `1` | Rebalance every k calendar weeks, at most 5200. Long format, weekly `resample` only. |
+| `rebalance_phase` | `0` | Which of the k weeks rebalances, in `[0, k)`. |
+| `rebalance_anchor` | `None` | A `date` (not a `datetime`) in week 0, required for any non-default schedule. Weeks count from the Monday of that week. |
 
 ### Costs
 

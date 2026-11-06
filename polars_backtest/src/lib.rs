@@ -531,6 +531,23 @@ fn long_config(config: Option<PyBacktestConfig>) -> BacktestConfig {
     })
 }
 
+/// Put the rebalance schedule on the config, rejecting settings the loop cannot honour
+fn set_schedule(
+    cfg: &mut BacktestConfig,
+    resample: ResampleFreq,
+    rebalance_every: i32,
+    rebalance_phase: i32,
+    rebalance_anchor: Option<i32>,
+) -> PyResult<()> {
+    let weekly = matches!(resample, ResampleFreq::Weekly | ResampleFreq::WeeklyOn(_));
+    cfg.exec.rebalance_every = rebalance_every;
+    cfg.exec.rebalance_phase = rebalance_phase;
+    cfg.exec.rebalance_anchor = rebalance_anchor;
+    cfg.exec
+        .validate_schedule(weekly)
+        .map_err(PyValueError::new_err)
+}
+
 /// Check that the required columns exist, then sort by date unless told not to
 fn validated_long_frame(
     df: DataFrame,
@@ -829,7 +846,10 @@ fn creturn_frame(date: &str, dates: &[i32], creturn: &[f64]) -> PyResult<DataFra
     resample=None,
     resample_offset=None,
     config=None,
-    skip_sort=false
+    skip_sort=false,
+    rebalance_every=1,
+    rebalance_phase=0,
+    rebalance_anchor=None
 ))]
 fn backtest(
     df: PyDataFrame,
@@ -845,6 +865,9 @@ fn backtest(
     resample_offset: Option<&str>,
     config: Option<PyBacktestConfig>,
     skip_sort: bool,
+    rebalance_every: i32,
+    rebalance_phase: i32,
+    rebalance_anchor: Option<i32>,
 ) -> PyResult<PyBacktestResult> {
     use fastant::Instant;
 
@@ -862,7 +885,15 @@ fn backtest(
         low,
         factor,
     };
-    let cfg = long_config(config);
+    let resample_freq = ResampleFreq::from_str(resample);
+    let mut cfg = long_config(config);
+    set_schedule(
+        &mut cfg,
+        resample_freq,
+        rebalance_every,
+        rebalance_phase,
+        rebalance_anchor,
+    )?;
     let df = validated_long_frame(df.0, &names, cfg.touched_exit, skip_sort)?;
 
     profile!(
@@ -877,7 +908,6 @@ fn backtest(
     profile!("[PROFILE] Columns to arrow-rs: {:?}", step_start.elapsed());
     step_start = Instant::now();
 
-    let resample_freq = ResampleFreq::from_str(resample);
     let offset = parse_resample_offset(resample_offset)?;
 
     // Run backtest using btcore with arrow-rs arrays
@@ -933,7 +963,10 @@ fn backtest(
     benchmark=None,
     limit_up="limit_up",
     limit_down="limit_down",
-    trading_value="trading_value"
+    trading_value="trading_value",
+    rebalance_every=1,
+    rebalance_phase=0,
+    rebalance_anchor=None
 ))]
 fn backtest_with_report(
     df: PyDataFrame,
@@ -953,6 +986,9 @@ fn backtest_with_report(
     limit_up: &str,
     limit_down: &str,
     trading_value: &str,
+    rebalance_every: i32,
+    rebalance_phase: i32,
+    rebalance_anchor: Option<i32>,
 ) -> PyResult<PyBacktestReport> {
     let n_rows = df.0.height();
     let names = LongColumnNames {
@@ -965,11 +1001,18 @@ fn backtest_with_report(
         low,
         factor,
     };
-    let cfg = long_config(config);
+    let resample_freq = ResampleFreq::from_str(resample);
+    let mut cfg = long_config(config);
+    set_schedule(
+        &mut cfg,
+        resample_freq,
+        rebalance_every,
+        rebalance_phase,
+        rebalance_anchor,
+    )?;
     let df = validated_long_frame(df.0, &names, cfg.touched_exit, skip_sort)?;
     let arrays = long_arrays(&df, &names, cfg.touched_exit, skip_sort)?;
 
-    let resample_freq = ResampleFreq::from_str(resample);
     let offset = parse_resample_offset(resample_offset)?;
 
     // Run backtest with report using btcore
