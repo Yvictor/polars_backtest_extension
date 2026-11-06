@@ -26,11 +26,18 @@ Closed trade rows retain a hypothetical full-position slipped exit even for a
 partial rebalance; the fills ledger charges only the actual net traded amount.
 
 With separate marks, close-based stops are detected after closing valuation and
-execute at the next session's execution price. `touched_exit=True` still uses
-the supplied OHLC range for same-session stops. With no separate mark, the
-existing stop order is preserved, including detection before rebalancing.
-Trade metrics include the execution observation at exit and exclude the later
-closing mark. Touched exits observe their touched fill instead of that close.
+execute at the next session's execution price. With `touched_exit=True`, carried
+opening gaps are checked before a rebalance resets their stop basis. Remaining
+positions and new opening fills then use open, high, low order: an opening stop
+uses only the peak known at the open, a high can trigger take-profit or tighten
+a long trailing stop, and the low is checked last. OHLC bars cannot reveal the
+actual path, so this ordering is deterministic. Only surviving positions receive
+the closing mark; a closing stop signal executes next session. Changing that
+close or future rows cannot change an earlier touched fill.
+With no separate mark, the existing stop order is preserved, including detection
+before rebalancing. Separate marks or positive slippage enable final execution
+observations in trade metrics, including stop exits. With separate marks, touched
+exits observe their touched fill and exclude the later closing mark.
 
 `ledger=True` adds the actual slippage cost to `report.daily.slippage`.
 `report.fills.price` is the slipped price. Signed `notional` keeps the legacy

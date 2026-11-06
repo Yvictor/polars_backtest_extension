@@ -643,9 +643,8 @@ type DayOhlc<'d, 'a> = (
 
 /// Process one trading day up to the signal step
 ///
-/// Marks positions, runs stops, then executes the pending rebalance. The loop
-/// body and the final day both go through here; only the signal step differs,
-/// because it needs the next date.
+/// Advances execution, stops, rebalancing and closing marks in session order.
+/// The loop body and final day both go through here; only signals need a next date.
 fn run_session_day<T>(
     session: &mut SessionState,
     today_prices: &HashMap<&str, f64>,
@@ -658,6 +657,7 @@ fn run_session_day<T>(
 ) where
     T: TradeTracker<Key = String, Date = i32, Record = TradeRecord>,
 {
+    let observe_exit = today_mark.is_some() || config.exec.slippage_ratio > 0.0;
     // Update positions (cr *= r, maxcr update)
     update_positions(&mut session.portfolio, today_prices);
 
@@ -683,7 +683,7 @@ fn run_session_day<T>(
             config,
             date,
             Some(date), // exit_sig_date = current date (same day)
-            false,
+            observe_exit,
             tracker,
         );
         // Clear pending stops (not used in touched_exit mode)
@@ -708,7 +708,7 @@ fn run_session_day<T>(
             config,
             date,
             None, // No exit_sig_date for regular stops
-            today_mark.is_some(),
+            observe_exit,
             tracker,
         );
 
@@ -720,6 +720,32 @@ fn run_session_day<T>(
         };
         for stop in new_stops {
             session.pending_stop_exits.push(stop.symbol);
+        }
+    }
+
+    if today_mark.is_some() {
+        if let Some((open, _, _)) = ohlc {
+            // Carried gaps must use the old stop basis, before a scheduled
+            // rebalance can reset it. No high, low or closing mark is known yet.
+            let gaps = detect_stops_unified(
+                &session.portfolio,
+                today_prices,
+                Some((open, open, open)),
+                config,
+                true,
+            );
+            execute_stops_impl(
+                &mut session.portfolio,
+                gaps,
+                &mut session.stopped_stocks,
+                today_prices,
+                today_factor,
+                config,
+                date,
+                Some(date),
+                true,
+                tracker,
+            );
         }
     }
 
@@ -739,29 +765,22 @@ fn run_session_day<T>(
             config,
             date,
             sig_date,
-            today_mark.is_some(),
+            observe_exit,
             tracker,
         );
         session.stopped_stocks.clear();
     }
 
     if let Some(marks) = today_mark {
-        // Identical prices need no second multiplication (including maxcr).
-        let changed: HashMap<&str, f64> = marks
-            .iter()
-            .filter(|(sym, price)| today_prices.get(**sym) != Some(*price))
-            .map(|(&sym, &price)| (sym, price))
-            .collect();
-        update_positions(&mut session.portfolio, &changed);
-        // Touched ratios are relative to the execution price, before previous_price
-        // advances to the close. Close-only stops remain next-session exits.
-        let stops = detect_stops_unified(&session.portfolio, marks, ohlc, config, true);
-        if ohlc.is_some() {
+        if let Some((_, high, _)) = ohlc {
+            // Positions are still valued at execution. Check new opening fills,
+            // then high/low touches before observing any closing prices.
+            let stops = detect_stops_unified(&session.portfolio, today_prices, ohlc, config, true);
             execute_stops_impl(
                 &mut session.portfolio,
                 stops,
                 &mut session.stopped_stocks,
-                marks,
+                today_prices,
                 today_factor,
                 config,
                 date,
@@ -769,11 +788,27 @@ fn run_session_day<T>(
                 true,
                 tracker,
             );
-        } else {
-            session
-                .pending_stop_exits
-                .extend(stops.into_iter().map(|s| s.symbol));
+            for (sym, pos) in &mut session.portfolio.positions {
+                if let Some(&price) = high.get(sym.as_str()) {
+                    if is_valid_price(price) && pos.previous_price > 0.0 {
+                        pos.maxcr = pos.maxcr.max(pos.cr * (price / pos.previous_price));
+                        pos.max_price = pos.max_price.max(price);
+                    }
+                }
+            }
         }
+        // Identical prices need no second multiplication (including maxcr).
+        let changed: HashMap<&str, f64> = marks
+            .iter()
+            .filter(|(sym, price)| today_prices.get(**sym) != Some(*price))
+            .map(|(&sym, &price)| (sym, price))
+            .collect();
+        update_positions(&mut session.portfolio, &changed);
+        // A close can only signal a subsequent fill, never an earlier touch.
+        let stops = detect_stops_unified(&session.portfolio, marks, None, config, true);
+        session
+            .pending_stop_exits
+            .extend(stops.into_iter().map(|s| s.symbol));
         for sym in session.portfolio.positions.keys() {
             if let Some(&mark) = marks.get(sym.as_str()) {
                 let trade = today_prices.get(sym.as_str()).copied().unwrap_or(mark);
@@ -1758,11 +1793,20 @@ fn detect_stops_unified(
             let high_r = cr / r * (high_price / prev_price);
             let low_r = cr / r * (low_price / prev_price);
 
+            // Separate marks use open -> high -> low ordering. The opening
+            // check uses only its existing peak; a later high may tighten a
+            // long trailing stop for the low check, never retroactively at open.
+            let low_threshold = if separate_mark && is_long && config.trail_stop.is_finite() {
+                min_r.max(maxcr.max(high_r) - config.trail_stop)
+            } else {
+                min_r
+            };
+
             // Check touch conditions (Finlab lines 348-350)
             // NOTE: Uses <= for min_r (not <) to match Finlab's behavior
             let touch_open = open_r >= max_r || open_r <= min_r;
             let touch_high = high_r >= max_r;
-            let touch_low = low_r <= min_r;
+            let touch_low = low_r <= low_threshold;
 
             // Priority: open > high > low (Finlab lines 354-380)
             // Exit ratio adjusts pos[sid] to touched price level
@@ -1770,7 +1814,7 @@ fn detect_stops_unified(
                 // Finlab: pos[sid] *= open_r / r
                 results.push(StopResult {
                     symbol: sym.clone(),
-                    exit_ratio: if separate_mark {
+                    exit_ratio: if separate_mark || config.exec.slippage_ratio > 0.0 {
                         open_price / close_price
                     } else {
                         open_r / r
@@ -1786,7 +1830,7 @@ fn detect_stops_unified(
                 // Finlab: pos[sid] = entry_pos * min_r = pos / cr * min_r
                 results.push(StopResult {
                     symbol: sym.clone(),
-                    exit_ratio: min_r / cr,
+                    exit_ratio: low_threshold / cr,
                 });
             }
         } else {
@@ -2413,6 +2457,121 @@ mod tests {
             low_prices: None,
             factor: None,
             exec: ExecInput::default(),
+        }
+    }
+
+    #[test]
+    fn test_touched_trail_uses_open_then_high_then_low_before_close() {
+        for close in [100.0, 120.0] {
+            let mut session = SessionState::new();
+            session.pending_weights = Some(BTreeMap::from([("A".into(), 1.0)]));
+            let mut tracker = SymbolTracker::new();
+            let config = BacktestConfig {
+                fee_ratio: 0.0,
+                tax_ratio: 0.0,
+                touched_exit: true,
+                trail_stop: 0.1,
+                ..Default::default()
+            };
+            let open = HashMap::from([("A", 100.0)]);
+            let high = HashMap::from([("A", 125.0)]);
+            let low = HashMap::from([("A", 99.0)]);
+            run_session_day(
+                &mut session,
+                &open,
+                Some(&HashMap::from([("A", close)])),
+                &HashMap::new(),
+                Some((&open, &high, &low)),
+                &config,
+                1,
+                &mut tracker,
+            );
+            let trades = tracker.finalize(0.0, 0.0);
+            assert_eq!(trades.len(), 1);
+            assert!((trades[0].exit_price.unwrap() - 115.0).abs() < 1e-12);
+            assert!(session.portfolio.positions.is_empty());
+            assert!((session.portfolio.balance() - 1.15).abs() < 1e-12);
+        }
+    }
+
+    #[test]
+    fn test_carried_gap_is_checked_before_resetting_rebalance_basis() {
+        for rebalance in [false, true] {
+            let mut session = SessionState::new();
+            session.portfolio.cash = 0.0;
+            session
+                .portfolio
+                .positions
+                .insert("A".into(), Position::new(1.0, 100.0));
+            if rebalance {
+                session.pending_weights = Some(BTreeMap::from([("A".into(), 1.0)]));
+            }
+            let mut tracker = SymbolTracker::new();
+            tracker.open_trade("A".into(), 0, 0, 100.0, 1.0, 1.0);
+            let config = BacktestConfig {
+                fee_ratio: 0.0,
+                tax_ratio: 0.0,
+                touched_exit: true,
+                stop_loss: 0.1,
+                ..Default::default()
+            };
+            let open = HashMap::from([("A", 80.0)]);
+            let high = HashMap::from([("A", 95.0)]);
+            let low = HashMap::from([("A", 79.0)]);
+            run_session_day(
+                &mut session,
+                &open,
+                Some(&HashMap::from([("A", 90.0)])),
+                &HashMap::new(),
+                Some((&open, &high, &low)),
+                &config,
+                1,
+                &mut tracker,
+            );
+            let trades = tracker.finalize(0.0, 0.0);
+            assert_eq!(trades[0].exit_price, Some(80.0));
+            assert!(session.portfolio.positions.is_empty());
+            assert!((session.portfolio.balance() - 0.8).abs() < 1e-12);
+        }
+    }
+
+    #[test]
+    fn test_slippage_observes_final_fill_for_rebalance_and_stop() {
+        for stop in [false, true] {
+            let mut session = SessionState::new();
+            session.portfolio.cash = 0.0;
+            session
+                .portfolio
+                .positions
+                .insert("A".into(), Position::new(1.0, 100.0));
+            if stop {
+                session.pending_stop_exits.push("A".into());
+            } else {
+                session.pending_weights = Some(BTreeMap::new());
+            }
+            let mut tracker = SymbolTracker::new();
+            tracker.open_trade("A".into(), 0, 0, 110.0, 1.0, 1.0);
+            let mut config = BacktestConfig {
+                fee_ratio: 0.0,
+                tax_ratio: 0.0,
+                ..Default::default()
+            };
+            config.exec.slippage_ratio = 0.1;
+            run_session_day(
+                &mut session,
+                &HashMap::from([("A", 100.0)]),
+                None,
+                &HashMap::new(),
+                None,
+                &config,
+                1,
+                &mut tracker,
+            );
+            let trade = &tracker.finalize(0.0, 0.0)[0];
+            let expected = 90.0 / 110.0 - 1.0;
+            assert_eq!(trade.exit_price, Some(90.0));
+            assert!((trade.mae.unwrap() - expected).abs() < 1e-12);
+            assert!((trade.mdd.unwrap() - expected).abs() < 1e-12);
         }
     }
 

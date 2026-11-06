@@ -277,3 +277,168 @@ def test_net_leg_costs_reconcile_with_flat_equity(weights):
     assert report.daily["traded_notional"].sum() == pytest.approx(
         report.fills["notional"].abs().sum()
     )
+
+
+@pytest.mark.parametrize("resample", [None, "D", "W"])
+@pytest.mark.parametrize("slippage", [0.0, 0.01])
+@pytest.mark.parametrize(
+    "stop_options",
+    [
+        {"trail_stop": 0.1},
+        {"trail_stop": 0.1, "stop_loss": 0.2, "take_profit": 0.3},
+        {"trail_stop": 0.1, "stop_loss": 0.1, "take_profit": 0.2},
+    ],
+)
+def test_intraday_fills_ignore_same_day_close_and_future_rows(resample, slippage, stop_options):
+    # Friday signals enter on Monday, so weekly and daily rebalances share the open.
+    df = prices(weights=(1.0,) * 4, opens=(100.0,) * 4, closes=(100.0,) * 4).with_columns(
+        pl.Series("date", [dt.date(2024, 1, d) for d in (5, 8, 9, 10)]),
+        pl.Series("high", [100.0, 125.0, 100.0, 100.0]),
+        pl.Series("low", [100.0, 99.0, 100.0, 100.0]),
+    )
+    options = dict(
+        trade_at_price="open",
+        mark_price="close",
+        touched_exit=True,
+        resample=resample,
+        slippage_ratio=slippage,
+        fee_ratio=0.0,
+        tax_ratio=0.0,
+        ledger=True,
+        **stop_options,
+    )
+    original = bt.backtest_with_report(df, **options)
+    variants = [df.head(2)]
+    for close in (100.0, 120.0):
+        variants.append(
+            df.with_columns(
+                pl.Series("close", [100.0, close, 1000.0, 1.0]),
+                pl.Series("open", [100.0, 100.0, 500.0, 2.0]),
+                pl.Series("high", [100.0, 125.0, 1500.0, 10.0]),
+                pl.Series("low", [100.0, 99.0, 400.0, 0.5]),
+                pl.Series("weight", [1.0, 1.0, -1.0, 0.0]),
+            )
+        )
+    cutoff = dt.date(2024, 1, 8)
+    fills = original.fills.filter(pl.col("date") <= cutoff)
+    # High then low: the high raises the trail, then the low crosses it.
+    expected = (125.0 - 0.1 * (100.0 * (1.0 + slippage))) * (1.0 - slippage)
+    if stop_options.get("take_profit") == 0.2:
+        expected = 100.0 * (1.0 + slippage) * 1.2 * (1.0 - slippage)
+    assert fills.filter(pl.col("reason") == "stop")["price"].to_list() == pytest.approx([expected])
+    for variant in variants:
+        report = bt.backtest_with_report(variant, **options)
+        assert_frame_equal(fills, report.fills.filter(pl.col("date") <= cutoff), check_exact=True)
+        assert_frame_equal(original.daily.head(2), report.daily.head(2), check_exact=True)
+        completed = pl.col("exit_date") <= cutoff
+        assert_frame_equal(
+            original.trades.filter(completed), report.trades.filter(completed), check_exact=True
+        )
+        assert_frame_equal(
+            bt.backtest(variant, **{k: v for k, v in options.items() if k != "ledger"}),
+            report.creturn,
+            check_exact=True,
+        )
+
+
+@pytest.mark.parametrize("resample", [None, "D", "W"])
+@pytest.mark.parametrize("retain", [False, True])
+@pytest.mark.parametrize("slippage", [0.0, 0.01])
+@pytest.mark.parametrize(
+    "stop_options,gap,expected",
+    [
+        ({"stop_loss": 0.1}, 80.0, 80.0),
+        ({"trail_stop": 0.1}, 80.0, 80.0),
+        ({"take_profit": 0.1}, 120.0, 120.0),
+        ({"stop_loss": 0.1, "trail_stop": 0.1, "take_profit": 0.1}, 80.0, 80.0),
+    ],
+)
+def test_carried_opening_gap_precedes_rebalance(
+    resample, retain, slippage, stop_options, gap, expected
+):
+    df = prices(
+        weights=(1.0,) * 4,
+        opens=(100.0, 100.0, gap, 100.0),
+        closes=(100.0, 100.0, 90.0 if gap < 100.0 else 110.0, 100.0),
+    )
+    df = df.with_columns(
+        pl.Series("date", [dt.date(2024, 1, d) for d in (5, 8, 15, 16)]),
+        (pl.max_horizontal("open", "close") + 1.0).alias("high"),
+        (pl.min_horizontal("open", "close") - 1.0).alias("low"),
+    )
+    report = bt.backtest_with_report(
+        df,
+        trade_at_price="open",
+        mark_price="close",
+        touched_exit=True,
+        resample=resample,
+        retain_cost_when_rebalance=retain,
+        slippage_ratio=slippage,
+        fee_ratio=0.0,
+        tax_ratio=0.0,
+        ledger=True,
+        **stop_options,
+    )
+    stops = report.fills.filter(pl.col("reason") == "stop")
+    assert stops["date"].to_list() == [dt.date(2024, 1, 15)]
+    assert stops["price"].to_list() == pytest.approx([expected * (1.0 - slippage)])
+    assert report.daily.filter(pl.col("date") == dt.date(2024, 1, 15))["gross_long"][0] == 0.0
+
+
+@pytest.mark.parametrize("separate_marks", [False, True])
+@pytest.mark.parametrize("exit_kind", ["rebalance", "close_stop", "touched_stop"])
+def test_slipped_final_fill_is_observed_without_separate_marks(separate_marks, exit_kind):
+    df = prices(weights=(1.0, 0.0, 0.0, 0.0), opens=(100.0,) * 4, closes=(100.0,) * 4)
+    options = dict(slippage_ratio=0.1)
+    if separate_marks:
+        options.update(trade_at_price="open", mark_price="close")
+    if exit_kind != "rebalance":
+        options["stop_loss"] = 0.05
+    if exit_kind == "touched_stop":
+        options["touched_exit"] = True
+        df = df.with_columns(pl.lit(100.0).alias("high"), pl.lit(100.0).alias("low"))
+    report = run(df, **options)
+    trade = report.trades.filter(pl.col("exit_date").is_not_null()).row(0, named=True)
+    assert trade["entry_price"] == pytest.approx(110.0)
+    assert trade["exit_price"] == pytest.approx(90.0)
+    expected = 90.0 / 110.0 - 1.0
+    assert trade["return"] == pytest.approx(expected)
+    assert trade["mae"] == pytest.approx(expected)
+    assert trade["mdd"] == pytest.approx(expected)
+
+
+@pytest.mark.parametrize("touched", [False, True])
+@pytest.mark.parametrize("separate_marks", [False, True])
+@pytest.mark.parametrize("resample", ["D", "W"])
+@pytest.mark.parametrize("slippage", [0.0, 0.01])
+def test_combined_stops_marks_and_slippage_reconcile(touched, separate_marks, resample, slippage):
+    df = prices(weights=(1.0, 0.0, 0.0, 0.0), opens=(100.0,) * 4, closes=(100.0,) * 4)
+    df = df.with_columns(
+        pl.Series("date", [dt.date(2024, 1, d) for d in (5, 8, 15, 16)]),
+        pl.lit(104.0).alias("high"),
+        pl.lit(96.0).alias("low"),
+    )
+    options = dict(
+        trade_at_price="open",
+        mark_price="close" if separate_marks else None,
+        touched_exit=touched,
+        resample=resample,
+        slippage_ratio=slippage,
+        stop_loss=0.2,
+        take_profit=0.3,
+        trail_stop=0.1,
+        fee_ratio=0.0,
+        tax_ratio=0.0,
+    )
+    report = bt.backtest_with_report(df, ledger=True, **options)
+    plain = bt.backtest_with_report(df, **options)
+    expected = (1.0 - slippage) / (1.0 + slippage)
+    assert report.creturn["creturn"][-1] == pytest.approx(expected)
+    assert report.fills["price"].to_list() == pytest.approx(
+        [100.0 * (1.0 + slippage), 100.0 * (1.0 - slippage)]
+    )
+    assert report.fills.filter(pl.col("reason") == "stop").is_empty()
+    assert report.daily["slippage"].sum() == pytest.approx(1.0 - expected)
+    assert_frame_equal(report.creturn, bt.backtest(df, **options), check_exact=True)
+    assert_frame_equal(report.creturn, plain.creturn, check_exact=True)
+    assert_frame_equal(report.trades, plain.trades, check_exact=True)
