@@ -54,3 +54,28 @@ budget base for buys and uses filled value for sells. Equity already includes
 these costs; do not subtract them again.
 Trade rows retain their existing per-rebalance grouping; the fills table records
 only the net legs that actually executed.
+
+Short costs are opt-in: `short_sale_fee_ratio=0.0`, `borrow_fee_ratio=0.0`, and
+`tax_side="exit"` preserve the existing calculations. Ratios must be finite and
+nonnegative. A short-sale surcharge applies only to newly added short notional.
+`tax_side="sell"` taxes sells, including new short sales, and exempts covers.
+When surcharge or sell-side taxation is enabled, a direction reversal books the
+closing leg before the new opening leg. Same-direction changes charge only the
+net traded value.
+Under `tax_side="exit"`, each split reversal leg keeps the legacy net-leg tax
+classification: a reversal is entry-classified, so adding a short-sale surcharge
+does not introduce closing-leg tax. `tax_side="sell"` decides separately from
+each leg's sell or buy direction, including partial reductions with slippage.
+For both `tax_side` and `short_sale_fee_ratio`, `trades.return` keeps the legacy
+convention and can differ from daily equity returns.
+
+Borrowing costs `abs(previous_mark_value) * borrow_fee_ratio * calendar_days / 365`
+at the start of a session, before updating prices or closing positions. Friday
+to Monday counts three days, including on a Monday cover; entry day has no
+borrow charge. Borrowing costs debit cash and affect subsequent sizing.
+
+With `ledger=True`, `daily.surcharge` and `daily.borrow_cost` report those actual
+costs. `cashflows` contains signed borrow debits with date, symbol, kind and amount;
+it is empty when no borrow cost accrued and `None` when the ledger is disabled.
+The existing per-rebalance trade return convention is retained; surcharge and
+borrow charges are reported through daily equity and the ledger.

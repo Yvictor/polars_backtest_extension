@@ -299,6 +299,9 @@ class BacktestNamespace:
         rebalance_anchor: dt.date | None = None,
         mark_price: ColumnSpec | None = None,
         slippage_ratio: float = 0.0,
+        short_sale_fee_ratio: float = 0.0,
+        borrow_fee_ratio: float = 0.0,
+        tax_side: str = "exit",
     ) -> pl.DataFrame:
         """Run backtest on long format DataFrame.
 
@@ -308,6 +311,11 @@ class BacktestNamespace:
             slippage_ratio: Adverse fill price ratio in [0, 1). Buy fees retain the
                 legacy budget base; only the traded fraction slips. Continuing
                 trade segments use an unslipped entry basis.
+            short_sale_fee_ratio: Additional fee on new short-sale notional
+                trades.return keeps the legacy convention and can differ from daily.
+            borrow_fee_ratio: Annual carrying rate, using calendar days / 365
+            tax_side: "exit" (default) or "sell" for tax on all sells
+                trades.return keeps the legacy convention and can differ from daily.
             position: Position/weight column name or Expr (default: "weight")
             date: Date column name or Expr (default: "date")
             symbol: Symbol column name or Expr (default: "symbol")
@@ -380,6 +388,9 @@ class BacktestNamespace:
             *_schedule_args(rebalance_every, rebalance_phase, rebalance_anchor),
             mark_col,
             slippage_ratio,
+            short_sale_fee_ratio,
+            borrow_fee_ratio,
+            tax_side,
         )
 
         return result.creturn
@@ -415,6 +426,9 @@ class BacktestNamespace:
         ledger: bool = False,
         mark_price: ColumnSpec | None = None,
         slippage_ratio: float = 0.0,
+        short_sale_fee_ratio: float = 0.0,
+        borrow_fee_ratio: float = 0.0,
+        tax_side: str = "exit",
     ) -> BacktestReport:
         """Run backtest with trade tracking, returning a BacktestReport object.
 
@@ -427,6 +441,11 @@ class BacktestNamespace:
             slippage_ratio: Adverse fill price ratio in [0, 1). Buy fees retain the
                 legacy budget base; only the traded fraction slips. Continuing
                 trade segments use an unslipped entry basis.
+            short_sale_fee_ratio: Additional fee on new short-sale notional
+                trades.return keeps the legacy convention and can differ from daily.
+            borrow_fee_ratio: Annual carrying rate, using calendar days / 365
+            tax_side: "exit" (default) or "sell" for tax on all sells
+                trades.return keeps the legacy convention and can differ from daily.
             position: Position/weight column name or Expr (default: "weight")
             date: Date column name or Expr (default: "date")
             symbol: Symbol column name or Expr (default: "symbol")
@@ -545,6 +564,9 @@ class BacktestNamespace:
             ledger,
             mark_col,
             slippage_ratio,
+            short_sale_fee_ratio,
+            borrow_fee_ratio,
+            tax_side,
         )
 
 # =============================================================================
@@ -578,6 +600,9 @@ def backtest(
     rebalance_anchor: dt.date | None = None,
     mark_price: ColumnSpec | None = None,
     slippage_ratio: float = 0.0,
+    short_sale_fee_ratio: float = 0.0,
+    borrow_fee_ratio: float = 0.0,
+    tax_side: str = "exit",
 ) -> pl.DataFrame:
     """Run backtest on long format DataFrame.
 
@@ -588,6 +613,11 @@ def backtest(
         slippage_ratio: Adverse fill price ratio in [0, 1). Buy fees retain the
                 legacy budget base; only the traded fraction slips. Continuing
                 trade segments use an unslipped entry basis.
+        short_sale_fee_ratio: Additional fee on new short-sale notional
+            trades.return keeps the legacy convention and can differ from daily.
+        borrow_fee_ratio: Annual carrying rate, using calendar days / 365
+        tax_side: "exit" (default) or "sell" for tax on all sells
+            trades.return keeps the legacy convention and can differ from daily.
         position: Position/weight column name or Expr (default: "weight")
         date: Date column name or Expr (default: "date")
         symbol: Symbol column name or Expr (default: "symbol")
@@ -644,6 +674,9 @@ def backtest(
         rebalance_anchor=rebalance_anchor,
         mark_price=mark_price,
         slippage_ratio=slippage_ratio,
+        short_sale_fee_ratio=short_sale_fee_ratio,
+        borrow_fee_ratio=borrow_fee_ratio,
+        tax_side=tax_side,
     )
 
 
@@ -678,6 +711,9 @@ def backtest_with_report(
     ledger: bool = False,
     mark_price: ColumnSpec | None = None,
     slippage_ratio: float = 0.0,
+    short_sale_fee_ratio: float = 0.0,
+    borrow_fee_ratio: float = 0.0,
+    tax_side: str = "exit",
 ) -> BacktestReport:
     """Run backtest with trade tracking on long format DataFrame.
 
@@ -690,6 +726,11 @@ def backtest_with_report(
         slippage_ratio: Adverse fill price ratio in [0, 1). Buy fees retain the
                 legacy budget base; only the traded fraction slips. Continuing
                 trade segments use an unslipped entry basis.
+        short_sale_fee_ratio: Additional fee on new short-sale notional
+            trades.return keeps the legacy convention and can differ from daily.
+        borrow_fee_ratio: Annual carrying rate, using calendar days / 365
+        tax_side: "exit" (default) or "sell" for tax on all sells
+            trades.return keeps the legacy convention and can differ from daily.
         position: Position/weight column name or Expr (default: "weight")
         date: Date column name or Expr (default: "date")
         symbol: Symbol column name or Expr (default: "symbol")
@@ -757,5 +798,8 @@ def backtest_with_report(
         rebalance_anchor=rebalance_anchor,
         mark_price=mark_price,
         slippage_ratio=slippage_ratio,
+        short_sale_fee_ratio=short_sale_fee_ratio,
+        borrow_fee_ratio=borrow_fee_ratio,
+        tax_side=tax_side,
         ledger=ledger,
     )

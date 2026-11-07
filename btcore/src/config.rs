@@ -48,6 +48,14 @@ pub struct BacktestConfig {
 /// Largest `rebalance_every`, about a century of weeks
 pub const MAX_REBALANCE_EVERY: i32 = 5200;
 
+/// Which side of a transaction pays tax
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum TaxSide {
+    #[default]
+    Exit,
+    Sell,
+}
+
 /// Long-format execution options
 ///
 /// Every field defaults to today's behaviour. The wide engine ignores this struct.
@@ -63,6 +71,12 @@ pub struct ExecOptions {
     pub ledger: bool,
     /// Adverse proportional slippage on each executed leg
     pub slippage_ratio: f64,
+    /// Additional cost on newly established short notional
+    pub short_sale_fee_ratio: f64,
+    /// Annual rate charged over calendar days using the previous closing value
+    pub borrow_fee_ratio: f64,
+    /// Legacy exit-side tax or tax on every sell
+    pub tax_side: TaxSide,
 }
 
 impl Default for ExecOptions {
@@ -73,6 +87,9 @@ impl Default for ExecOptions {
             rebalance_anchor: None,
             ledger: false,
             slippage_ratio: 0.0,
+            short_sale_fee_ratio: 0.0,
+            borrow_fee_ratio: 0.0,
+            tax_side: TaxSide::Exit,
         }
     }
 }
@@ -81,6 +98,18 @@ impl ExecOptions {
     pub fn validate_prices(&self) -> Result<(), String> {
         if !self.slippage_ratio.is_finite() || !(0.0..1.0).contains(&self.slippage_ratio) {
             return Err("slippage_ratio must be finite and in [0, 1)".into());
+        }
+        Ok(())
+    }
+
+    pub fn validate_fees(&self) -> Result<(), String> {
+        for (name, ratio) in [
+            ("short_sale_fee_ratio", self.short_sale_fee_ratio),
+            ("borrow_fee_ratio", self.borrow_fee_ratio),
+        ] {
+            if !ratio.is_finite() || ratio < 0.0 {
+                return Err(format!("{name} must be finite and nonnegative"));
+            }
         }
         Ok(())
     }

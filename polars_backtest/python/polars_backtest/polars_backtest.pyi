@@ -74,6 +74,11 @@ class BacktestReport:
         ...
 
     @property
+    def cashflows(self) -> pl.DataFrame | None:
+        """Calendar-day borrow fee debits; None without ledger=True."""
+        ...
+
+    @property
     def fee_ratio(self) -> float:
         """Transaction fee ratio used in backtest."""
         ...

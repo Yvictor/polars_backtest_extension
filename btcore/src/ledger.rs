@@ -28,9 +28,10 @@ pub struct LegFill {
     /// Execution price; NaN for a leg booked without a valid price
     pub price: f64,
     pub commission: f64,
-    /// Exit-side tax: charged on any leg that reduces a position, buy-to-cover included
+    /// Tax charged on the configured side of this leg
     pub tax: f64,
     pub slippage: f64,
+    pub surcharge: f64,
     pub reason: FillReason,
 }
 
@@ -59,9 +60,19 @@ pub struct DailyRecord<D> {
     pub commission: f64,
     pub tax: f64,
     pub slippage: f64,
+    pub surcharge: f64,
+    pub borrow_cost: f64,
     pub traded_notional: f64,
     /// `traded_notional` over the previous day's equity; None if that was not positive
     pub turnover: Option<f64>,
+}
+
+/// Cash paid for borrowing a position over the previous calendar interval
+#[derive(Debug, Clone)]
+pub struct BorrowRecord<K, D> {
+    pub date: D,
+    pub key: K,
+    pub amount: f64,
 }
 
 /// Ledger collected during a simulation
@@ -69,9 +80,12 @@ pub struct DailyRecord<D> {
 pub struct Ledger<K, D> {
     pub fills: Vec<FillRecord<K, D>>,
     pub daily: Vec<DailyRecord<D>>,
+    pub cashflows: Vec<BorrowRecord<K, D>>,
     commission: f64,
     tax: f64,
     slippage: f64,
+    surcharge: f64,
+    borrow_cost: f64,
     traded_notional: f64,
     previous_equity: f64,
 }
@@ -82,9 +96,12 @@ impl<K, D> Ledger<K, D> {
         Self {
             fills: Vec::new(),
             daily: Vec::new(),
+            cashflows: Vec::new(),
             commission: 0.0,
             tax: 0.0,
             slippage: 0.0,
+            surcharge: 0.0,
+            borrow_cost: 0.0,
             traded_notional: 0.0,
             previous_equity: initial_equity,
         }
@@ -95,8 +112,18 @@ impl<K, D> Ledger<K, D> {
         self.commission += fill.commission;
         self.tax += fill.tax;
         self.slippage += fill.slippage;
+        self.surcharge += fill.surcharge;
         self.traded_notional += fill.notional.abs();
         self.fills.push(FillRecord { date, key, fill });
+    }
+
+    pub fn add_borrow(&mut self, key: K, date: D, cost: f64) {
+        self.borrow_cost += cost;
+        self.cashflows.push(BorrowRecord {
+            date,
+            key,
+            amount: -cost,
+        });
     }
 
     /// Write the current day's row and start the next day from zero
@@ -109,6 +136,8 @@ impl<K, D> Ledger<K, D> {
             commission: std::mem::take(&mut self.commission),
             tax: std::mem::take(&mut self.tax),
             slippage: std::mem::take(&mut self.slippage),
+            surcharge: std::mem::take(&mut self.surcharge),
+            borrow_cost: std::mem::take(&mut self.borrow_cost),
             traded_notional: std::mem::take(&mut self.traded_notional),
             turnover,
         });
@@ -127,6 +156,7 @@ mod tests {
             commission: 0.01,
             tax: 0.02,
             slippage: 0.0,
+            surcharge: 0.0,
             reason: FillReason::Rebalance,
         }
     }

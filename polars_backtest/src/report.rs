@@ -95,6 +95,12 @@ impl PyBacktestReport {
         self.ledger.as_ref().map(|l| PyDataFrame(l.fills.clone()))
     }
 
+    /// Cash debits for calendar-day borrowing; None without `ledger=True`
+    #[getter]
+    fn cashflows(&self) -> Option<PyDataFrame> {
+        self.ledger.as_ref().map(|l| PyDataFrame(l.cashflows.clone()))
+    }
+
     /// Get cumulative returns as a Polars DataFrame with date column
     #[getter]
     fn creturn(&self) -> PyDataFrame {
