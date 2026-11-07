@@ -1,0 +1,840 @@
+{
+  "schema_version": "1.0",
+  "states": [
+    "present",
+    "partial",
+    "absent",
+    "empty",
+    "not_applicable"
+  ],
+  "tables": {
+    "curve": {
+      "file": "curve.parquet",
+      "required": true,
+      "sort": [
+        "date"
+      ],
+      "expected": [],
+      "columns": [
+        {
+          "name": "date",
+          "type": "date",
+          "optional": false
+        },
+        {
+          "name": "creturn",
+          "type": "float",
+          "optional": false
+        },
+        {
+          "name": "ret",
+          "type": "float",
+          "optional": false
+        },
+        {
+          "name": "drawdown",
+          "type": "float",
+          "optional": false
+        },
+        {
+          "name": "bench_creturn",
+          "type": "float",
+          "optional": true
+        },
+        {
+          "name": "bench_drawdown",
+          "type": "float",
+          "optional": true
+        },
+        {
+          "name": "gross_creturn",
+          "type": "float",
+          "optional": true
+        }
+      ]
+    },
+    "metrics": {
+      "file": "metrics.parquet",
+      "required": true,
+      "sort": [
+        "section",
+        "key"
+      ],
+      "expected": [],
+      "columns": [
+        {
+          "name": "section",
+          "type": "str",
+          "optional": false
+        },
+        {
+          "name": "key",
+          "type": "str",
+          "optional": false
+        },
+        {
+          "name": "value",
+          "type": "float",
+          "optional": false
+        },
+        {
+          "name": "unit",
+          "type": "str",
+          "optional": false
+        },
+        {
+          "name": "source",
+          "type": "str",
+          "optional": false
+        }
+      ]
+    },
+    "monthly": {
+      "file": "monthly.parquet",
+      "required": true,
+      "sort": [
+        "year",
+        "month"
+      ],
+      "expected": [],
+      "columns": [
+        {
+          "name": "year",
+          "type": "int",
+          "optional": false
+        },
+        {
+          "name": "month",
+          "type": "int",
+          "optional": false
+        },
+        {
+          "name": "ret",
+          "type": "float",
+          "optional": false
+        },
+        {
+          "name": "bench_ret",
+          "type": "float",
+          "optional": true
+        }
+      ]
+    },
+    "yearly": {
+      "file": "yearly.parquet",
+      "required": true,
+      "sort": [
+        "year"
+      ],
+      "expected": [],
+      "columns": [
+        {
+          "name": "year",
+          "type": "int",
+          "optional": false
+        },
+        {
+          "name": "ret",
+          "type": "float",
+          "optional": false
+        },
+        {
+          "name": "bench_ret",
+          "type": "float",
+          "optional": true
+        },
+        {
+          "name": "mdd",
+          "type": "float",
+          "optional": false
+        }
+      ]
+    },
+    "drawdowns": {
+      "file": "drawdowns.parquet",
+      "required": true,
+      "sort": [
+        "depth"
+      ],
+      "expected": [],
+      "columns": [
+        {
+          "name": "rank",
+          "type": "int",
+          "optional": false
+        },
+        {
+          "name": "start",
+          "type": "date",
+          "optional": false
+        },
+        {
+          "name": "trough",
+          "type": "date",
+          "optional": false
+        },
+        {
+          "name": "end",
+          "type": "date",
+          "optional": false
+        },
+        {
+          "name": "depth",
+          "type": "float",
+          "optional": false
+        },
+        {
+          "name": "days",
+          "type": "int",
+          "optional": false
+        },
+        {
+          "name": "recovery_days",
+          "type": "int",
+          "optional": true
+        },
+        {
+          "name": "series",
+          "type": "str",
+          "optional": false
+        }
+      ]
+    },
+    "day_index": {
+      "file": "day_index.parquet",
+      "required": true,
+      "sort": [
+        "date"
+      ],
+      "expected": [],
+      "columns": [
+        {
+          "name": "date",
+          "type": "date",
+          "optional": false
+        },
+        {
+          "name": "ret",
+          "type": "float",
+          "optional": false
+        },
+        {
+          "name": "n_entries",
+          "type": "int",
+          "optional": false
+        },
+        {
+          "name": "n_exits",
+          "type": "int",
+          "optional": false
+        },
+        {
+          "name": "n_fills",
+          "type": "int",
+          "optional": true
+        },
+        {
+          "name": "n_blocks",
+          "type": "int",
+          "optional": true
+        },
+        {
+          "name": "n_cashflows",
+          "type": "int",
+          "optional": true
+        },
+        {
+          "name": "traded_notional",
+          "type": "float",
+          "optional": true
+        },
+        {
+          "name": "cost_total",
+          "type": "float",
+          "optional": true
+        }
+      ]
+    },
+    "trades": {
+      "file": "trades.parquet",
+      "required": false,
+      "sort": [
+        "entry_date",
+        "symbol"
+      ],
+      "expected": [],
+      "columns": [
+        {
+          "name": "trade_id",
+          "type": "int",
+          "optional": false
+        },
+        {
+          "name": "symbol",
+          "type": "str",
+          "optional": false
+        },
+        {
+          "name": "side",
+          "type": "str",
+          "optional": false
+        },
+        {
+          "name": "status",
+          "type": "str",
+          "optional": false
+        },
+        {
+          "name": "entry_signal_date",
+          "type": "date",
+          "optional": true
+        },
+        {
+          "name": "entry_date",
+          "type": "date",
+          "optional": false
+        },
+        {
+          "name": "exit_signal_date",
+          "type": "date",
+          "optional": true
+        },
+        {
+          "name": "exit_date",
+          "type": "date",
+          "optional": false
+        },
+        {
+          "name": "ret",
+          "type": "float",
+          "optional": false
+        },
+        {
+          "name": "weight",
+          "type": "float",
+          "optional": false
+        },
+        {
+          "name": "pdays",
+          "type": "int",
+          "optional": true
+        },
+        {
+          "name": "entry_price",
+          "type": "float",
+          "optional": true
+        },
+        {
+          "name": "exit_price",
+          "type": "float",
+          "optional": true
+        },
+        {
+          "name": "mae",
+          "type": "float",
+          "optional": true
+        },
+        {
+          "name": "gmfe",
+          "type": "float",
+          "optional": true
+        },
+        {
+          "name": "bmfe",
+          "type": "float",
+          "optional": true
+        },
+        {
+          "name": "mdd",
+          "type": "float",
+          "optional": true
+        },
+        {
+          "name": "limit_entry",
+          "type": "bool",
+          "optional": true
+        },
+        {
+          "name": "limit_exit",
+          "type": "bool",
+          "optional": true
+        },
+        {
+          "name": "entry_kind",
+          "type": "str",
+          "optional": true
+        },
+        {
+          "name": "exit_kind",
+          "type": "str",
+          "optional": true
+        },
+        {
+          "name": "n_segments",
+          "type": "int",
+          "optional": false
+        }
+      ]
+    },
+    "trade_segments": {
+      "file": "trade_segments.parquet",
+      "required": false,
+      "sort": [
+        "entry_date",
+        "symbol"
+      ],
+      "expected": [],
+      "columns": [
+        {
+          "name": "symbol",
+          "type": "str",
+          "optional": false
+        },
+        {
+          "name": "side",
+          "type": "str",
+          "optional": false
+        },
+        {
+          "name": "status",
+          "type": "str",
+          "optional": false
+        },
+        {
+          "name": "entry_signal_date",
+          "type": "date",
+          "optional": true
+        },
+        {
+          "name": "entry_date",
+          "type": "date",
+          "optional": false
+        },
+        {
+          "name": "exit_signal_date",
+          "type": "date",
+          "optional": true
+        },
+        {
+          "name": "exit_date",
+          "type": "date",
+          "optional": false
+        },
+        {
+          "name": "ret",
+          "type": "float",
+          "optional": false
+        },
+        {
+          "name": "weight",
+          "type": "float",
+          "optional": false
+        },
+        {
+          "name": "pdays",
+          "type": "int",
+          "optional": true
+        },
+        {
+          "name": "entry_price",
+          "type": "float",
+          "optional": true
+        },
+        {
+          "name": "exit_price",
+          "type": "float",
+          "optional": true
+        },
+        {
+          "name": "mae",
+          "type": "float",
+          "optional": true
+        },
+        {
+          "name": "gmfe",
+          "type": "float",
+          "optional": true
+        },
+        {
+          "name": "bmfe",
+          "type": "float",
+          "optional": true
+        },
+        {
+          "name": "mdd",
+          "type": "float",
+          "optional": true
+        }
+      ]
+    },
+    "symbol_index": {
+      "file": "symbol_index.parquet",
+      "required": false,
+      "sort": [
+        "contrib_proxy"
+      ],
+      "expected": [],
+      "columns": [
+        {
+          "name": "symbol",
+          "type": "str",
+          "optional": false
+        },
+        {
+          "name": "name",
+          "type": "str",
+          "optional": true
+        },
+        {
+          "name": "n_trades",
+          "type": "int",
+          "optional": false
+        },
+        {
+          "name": "win_rate",
+          "type": "float",
+          "optional": false
+        },
+        {
+          "name": "contrib_proxy",
+          "type": "float",
+          "optional": false
+        },
+        {
+          "name": "n_fills",
+          "type": "int",
+          "optional": true
+        },
+        {
+          "name": "n_blocks",
+          "type": "int",
+          "optional": true
+        },
+        {
+          "name": "traded_notional",
+          "type": "float",
+          "optional": true
+        },
+        {
+          "name": "cost_total",
+          "type": "float",
+          "optional": true
+        }
+      ]
+    },
+    "symbols": {
+      "file": "symbols.parquet",
+      "required": false,
+      "sort": [
+        "symbol"
+      ],
+      "expected": [],
+      "columns": [
+        {
+          "name": "symbol",
+          "type": "str",
+          "optional": false
+        },
+        {
+          "name": "name",
+          "type": "str",
+          "optional": false
+        }
+      ]
+    },
+    "fill_scenarios": {
+      "file": "fill_scenarios.parquet",
+      "required": false,
+      "sort": [
+        "name"
+      ],
+      "expected": [],
+      "columns": [
+        {
+          "name": "name",
+          "type": "str",
+          "optional": false
+        },
+        {
+          "name": "cagr",
+          "type": "float",
+          "optional": true
+        },
+        {
+          "name": "total_return",
+          "type": "float",
+          "optional": true
+        },
+        {
+          "name": "max_drawdown",
+          "type": "float",
+          "optional": true
+        },
+        {
+          "name": "daily_sharpe",
+          "type": "float",
+          "optional": true
+        },
+        {
+          "name": "calmar",
+          "type": "float",
+          "optional": true
+        },
+        {
+          "name": "blocked_n",
+          "type": "int",
+          "optional": true
+        }
+      ]
+    },
+    "ledger_daily": {
+      "file": "ledger_daily.parquet",
+      "required": false,
+      "sort": [
+        "date"
+      ],
+      "expected": [
+        "equity",
+        "cash",
+        "commission",
+        "tax",
+        "gross_long",
+        "gross_short",
+        "net_exposure",
+        "gross_exposure",
+        "traded_notional",
+        "turnover"
+      ],
+      "columns": [
+        {
+          "name": "date",
+          "type": "date",
+          "optional": false
+        },
+        {
+          "name": "equity",
+          "type": "float",
+          "optional": true
+        },
+        {
+          "name": "cash",
+          "type": "float",
+          "optional": true
+        },
+        {
+          "name": "commission",
+          "type": "float",
+          "optional": true
+        },
+        {
+          "name": "tax",
+          "type": "float",
+          "optional": true
+        },
+        {
+          "name": "surcharge",
+          "type": "float",
+          "optional": true
+        },
+        {
+          "name": "borrow_cost",
+          "type": "float",
+          "optional": true
+        },
+        {
+          "name": "hedge_cost",
+          "type": "float",
+          "optional": true
+        },
+        {
+          "name": "gross_long",
+          "type": "float",
+          "optional": true
+        },
+        {
+          "name": "gross_short",
+          "type": "float",
+          "optional": true
+        },
+        {
+          "name": "net_exposure",
+          "type": "float",
+          "optional": true
+        },
+        {
+          "name": "gross_exposure",
+          "type": "float",
+          "optional": true
+        },
+        {
+          "name": "traded_notional",
+          "type": "float",
+          "optional": true
+        },
+        {
+          "name": "turnover",
+          "type": "float",
+          "optional": true
+        },
+        {
+          "name": "pnl",
+          "type": "float",
+          "optional": true
+        }
+      ]
+    },
+    "fills": {
+      "file": "fills.parquet",
+      "required": false,
+      "sort": [
+        "date",
+        "symbol"
+      ],
+      "expected": [
+        "notional",
+        "price",
+        "reason"
+      ],
+      "columns": [
+        {
+          "name": "date",
+          "type": "date",
+          "optional": false
+        },
+        {
+          "name": "symbol",
+          "type": "str",
+          "optional": false
+        },
+        {
+          "name": "notional",
+          "type": "float",
+          "optional": true
+        },
+        {
+          "name": "price",
+          "type": "float",
+          "optional": true
+        },
+        {
+          "name": "reason",
+          "type": "str",
+          "optional": true
+        },
+        {
+          "name": "qty",
+          "type": "float",
+          "optional": true
+        },
+        {
+          "name": "cost",
+          "type": "float",
+          "optional": true
+        },
+        {
+          "name": "side",
+          "type": "str",
+          "optional": true
+        }
+      ]
+    },
+    "blocks": {
+      "file": "blocks.parquet",
+      "required": false,
+      "sort": [
+        "date",
+        "symbol"
+      ],
+      "expected": [],
+      "columns": [
+        {
+          "name": "date",
+          "type": "date",
+          "optional": false
+        },
+        {
+          "name": "symbol",
+          "type": "str",
+          "optional": false
+        },
+        {
+          "name": "reason",
+          "type": "str",
+          "optional": false
+        },
+        {
+          "name": "side",
+          "type": "str",
+          "optional": true
+        },
+        {
+          "name": "notional",
+          "type": "float",
+          "optional": true
+        }
+      ]
+    },
+    "cashflows": {
+      "file": "cashflows.parquet",
+      "required": false,
+      "sort": [
+        "date",
+        "symbol"
+      ],
+      "expected": [],
+      "columns": [
+        {
+          "name": "date",
+          "type": "date",
+          "optional": false
+        },
+        {
+          "name": "symbol",
+          "type": "str",
+          "optional": false
+        },
+        {
+          "name": "kind",
+          "type": "str",
+          "optional": true
+        },
+        {
+          "name": "amount",
+          "type": "float",
+          "optional": true
+        }
+      ]
+    },
+    "orders": {
+      "file": "orders.parquet",
+      "required": false,
+      "sort": [
+        "date",
+        "symbol"
+      ],
+      "expected": [],
+      "columns": [
+        {
+          "name": "date",
+          "type": "date",
+          "optional": false
+        },
+        {
+          "name": "symbol",
+          "type": "str",
+          "optional": false
+        },
+        {
+          "name": "status",
+          "type": "str",
+          "optional": true
+        },
+        {
+          "name": "notional",
+          "type": "float",
+          "optional": true
+        }
+      ]
+    }
+  }
+}

@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
-from typing import Literal
+from pathlib import Path
+from typing import Any, Literal
 
 import polars as pl
 
 from polars_backtest.namespace import BacktestNamespace
+from polars_backtest.report import ReportBundle
 
 MetricsSection = Literal["backtest", "profitability", "risk", "ratio", "winrate", "liquidity"]
 CapacityMethod = Literal["finlab", "min_leg", "adv"]
@@ -61,6 +63,23 @@ class BacktestReport:
     @property
     def trades(self) -> pl.DataFrame:
         """Trade records DataFrame with MAE/MFE metrics."""
+        ...
+
+    def to_bundle(
+        self,
+        path: str | Path | None = None,
+        *,
+        title: str | None = None,
+        input_df: pl.DataFrame | None = None,
+        symbol_names: dict[str, str] | None = None,
+        fill_scenarios: list[dict[str, Any]] | None = None,
+        strict: bool = False,
+    ) -> ReportBundle:
+        """Build the report bundle; written to `path` when one is given."""
+        ...
+
+    def summary(self, format: str = "dict", **bundle_kwargs: Any) -> dict[str, Any] | str:
+        """The bundle summary: a dict, or Markdown with format="md"."""
         ...
 
     @property

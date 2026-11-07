@@ -36,6 +36,10 @@ build:
 build-debug:
     cd polars_backtest && uv run maturin develop
 
+# Regenerate the report bundle contract from the registry
+report-schema:
+    cd polars_backtest && uv run python -m polars_backtest.report.schema > ../specs/report_bundle.schema.json
+
 # Run fast tests (default)
 test:
     cd polars_backtest && uv run pytest tests/ -v

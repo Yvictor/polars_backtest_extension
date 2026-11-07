@@ -64,6 +64,23 @@ Includes equity curve (benchmark overlay, log scale, range presets), drawdown,
 monthly return heatmap, trade return distribution, MAE scatter, and full stats.
 Light/dark mode follows the system.
 
+### Report bundle
+
+The same results as files an agent or a script can read without opening a page:
+
+```python
+db = report.to_bundle("my_run", title="demo")  # Parquet tables, summary.json, SUMMARY.md
+db = pl_bt.open_bundle("my_run")
+db.summary()["performance"]["max_drawdown"]
+db.sql("select symbol, ret from trades order by ret", limit=5)
+db.day("2024-03-15")
+```
+
+```
+python -m polars_backtest.report summary my_run --md
+python -m polars_backtest.report sql my_run "select * from trades" --limit 50
+```
+
 ```python
 report.get_stats()  # or report.stats
 ```
