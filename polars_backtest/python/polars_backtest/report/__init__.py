@@ -26,7 +26,10 @@ __all__ = [
     "SchemaError",
     "attach",
     "open_bundle",
+    "show",
+    "summary",
     "to_bundle",
+    "to_html",
 ]
 
 
@@ -55,6 +58,37 @@ def summary(report: Any, format: str = "dict", **kwargs: Any) -> dict[str, Any] 
     return to_bundle(report, **kwargs).summary(format)
 
 
+def to_html(
+    report: Any,
+    path: str | Path | None = None,
+    *,
+    detail: str = "full",
+    max_mb: float = 20,
+    capital: float | None = None,
+    **kwargs: Any,
+) -> str | Path:
+    """The report's dashboard as one offline file. See ``ReportBundle.to_html``."""
+    return to_bundle(report, **kwargs).to_html(
+        path, detail=detail, max_mb=max_mb, capital=capital
+    )
+
+
+def show(
+    report: Any,
+    *,
+    height: int = 900,
+    inline: bool | None = None,
+    day: str | None = None,
+    detail: str = "full",
+    capital: float | None = None,
+    **kwargs: Any,
+) -> None:
+    """Open the report's dashboard. See ``ReportBundle.show``."""
+    to_bundle(report, **kwargs).show(
+        height=height, inline=inline, day=day, detail=detail, capital=capital
+    )
+
+
 def attach(*classes: type) -> None:
     """Add the bundle methods to report classes.
 
@@ -64,3 +98,5 @@ def attach(*classes: type) -> None:
     for cls in classes:
         cls.to_bundle = to_bundle
         cls.summary = summary
+        cls.to_html = to_html
+        cls.show = show

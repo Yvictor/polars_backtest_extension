@@ -37,4 +37,4 @@ def test_title_containing_placeholder_stays_literal():
     report = _tiny_report("AAA")
     html = viz.report_html(report, title="__PAYLOAD__")
 
-    assert html.count('"schema":3') == 1  # payload substituted exactly once
+    assert html.count('"schema":"1.0"') == 1  # payload substituted exactly once
