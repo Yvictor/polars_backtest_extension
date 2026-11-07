@@ -197,7 +197,11 @@ def _day_index(
                 .agg(pl.len().cast(pl.Int64).alias(name))
             )
         index = index.join(per_day, on="date", how="left").with_columns(pl.col(name).fill_null(0))
-    for table, name in (("fills", "n_fills"), ("blocks", "n_blocks")):
+    for table, name in (
+        ("fills", "n_fills"),
+        ("blocks", "n_blocks"),
+        ("cashflows", "n_cashflows"),
+    ):
         if table in ledger:
             per_day = ledger[table].group_by("date").agg(pl.len().cast(pl.Int64).alias(name))
             index = index.join(per_day, on="date", how="left").with_columns(
@@ -223,7 +227,7 @@ def _symbol_index(
 ) -> pl.DataFrame | None:
     if trades is None:
         return None
-    closed = trades.filter(pl.col("status") == "closed")
+    closed = M.closed_trades(trades)
     index = (
         trades.select("symbol")
         .unique()
@@ -344,7 +348,9 @@ def build_bundle(
     trades, segments, granularity = _trades(report, input_df)
     stats = viz._stats_row(report)
     metrics = viz._metrics_row(report)
-    _, trade_summary = viz._trades_payload(report, input_df, symbol_names)
+    trade_summary = M.trade_structure(
+        trades, getattr(report, "fee_ratio", None), getattr(report, "tax_ratio", None)
+    )
     if metrics.get("buyHigh") is None and "buy_high_ratio" in trade_summary:
         metrics["buyHigh"] = trade_summary["buy_high_ratio"]
     if metrics.get("sellLow") is None and "sell_low_ratio" in trade_summary:

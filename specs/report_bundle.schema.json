@@ -239,6 +239,11 @@
           "optional": true
         },
         {
+          "name": "n_cashflows",
+          "type": "int",
+          "optional": true
+        },
+        {
           "name": "traded_notional",
           "type": "float",
           "optional": true

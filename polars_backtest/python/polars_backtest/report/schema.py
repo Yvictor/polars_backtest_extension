@@ -126,7 +126,7 @@ TABLES: dict[str, Table] = {
             ("date",),
             _cols(
                 "date:date ret:float n_entries:int n_exits:int n_fills?:int n_blocks?:int "
-                "traded_notional?:float cost_total?:float"
+                "n_cashflows?:int traded_notional?:float cost_total?:float"
             ),
             required=True,
         ),

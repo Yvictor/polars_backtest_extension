@@ -212,6 +212,23 @@ class TestAbsentMatrix:
         assert summary["exposure"] == {"source": "absent"}
         assert summary["costs"]["source"] == "ledger"
 
+    def test_zero_row_ledger_with_a_schema_builds(self, plain, ledger):
+        report = LedgerReport(plain, daily=ledger["daily"].clear())
+        db = pl_bt.report.to_bundle(report)
+        summary = db.summary()
+        assert db.coverage["ledger_daily"] == "empty"
+        assert summary["costs"]["source"] == "estimate"
+        assert summary["exposure"] == {"source": "absent"}
+        assert summary["turnover"]["source"] == "estimate"
+        assert summary["net_of_costs"] is None
+        assert "gross_creturn" not in db.table("curve").collect_schema().names()
+
+    def test_ledger_without_positive_equity_builds(self, plain, ledger):
+        daily = ledger["daily"].with_columns(pl.lit(0.0).alias("equity"))
+        summary = pl_bt.report.to_bundle(LedgerReport(plain, daily=daily)).summary()
+        assert summary["costs"]["source"] == "estimate"
+        assert summary["exposure"] == {"source": "absent"}
+
     def test_zero_row_table_is_empty(self, plain, ledger):
         db = pl_bt.report.to_bundle(LedgerReport(plain, blocks=ledger["blocks"].clear()))
         assert db.coverage["blocks"] == "empty"
@@ -328,6 +345,47 @@ class TestSummary:
         structure = full.summary()["structure"]
         assert structure["sides"]["long"]["n"] > 0
         assert "top10_contrib_ratio" in structure
+
+    def test_structure_counts_the_trades_table(self, full):
+        closed = full.table("trades").filter(pl.col("status") == "closed").collect()
+        sides = full.summary()["structure"]["sides"]
+        assert sum(side["n"] for side in sides.values()) == closed.height
+
+    def test_open_marks_stay_out_of_flags_and_structure(self, plain):
+        """A huge open mark must not move figures that describe closed round trips."""
+        marked = plain.trades.with_columns(
+            pl.when(pl.col("exit_date").is_null() & pl.col("entry_date").is_not_null())
+            .then(pl.lit(50.0))
+            .otherwise(pl.col("return"))
+            .alias("return")
+        )
+        base = pl_bt.report.to_bundle(plain).summary()
+        changed = pl_bt.report.to_bundle(LedgerReport(plain, trades=marked)).summary()
+        assert changed["structure"] == base["structure"]
+
+    def test_episode_trades_are_not_merged_behind_the_summary(self, plain):
+        """With the engine's own episodes, summary figures still follow the trades table."""
+        db = pl_bt.report.to_bundle(LedgerReport(plain, execution_model="episode"))
+        trades = db.table("trades").collect()
+        assert db.manifest["trade_granularity"] == "episode"
+        assert trades["n_segments"].sum() == trades.height
+        closed = trades.filter(pl.col("status") == "closed")
+        sides = db.summary()["structure"]["sides"]
+        assert sum(side["n"] for side in sides.values()) == closed.height
+        assert closed.height > pl_bt.report.to_bundle(plain).summary()["trades"]["n_closed"]
+
+    def test_non_finite_returns_stay_out(self):
+        trades = pl.DataFrame(
+            {
+                "status": ["closed", "closed"],
+                "side": ["long", "long"],
+                "ret": [0.1, float("nan")],
+                "weight": [1.0, 1.0],
+                "entry_date": [dt.date(2024, 1, 1)] * 2,
+                "exit_date": [dt.date(2024, 2, 1)] * 2,
+            }
+        )
+        assert M.trade_structure(trades, None, None)["sides"]["long"]["contrib"] == 0.1
 
     def test_ledger_costs_replace_the_estimate(self, full, ledger):
         costs = full.summary()["costs"]

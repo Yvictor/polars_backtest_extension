@@ -159,7 +159,12 @@ def with_gross_curve(curve: pl.DataFrame, ledger: pl.DataFrame | None) -> pl.Dat
 
     Slippage is already inside fill prices, so only booked costs come back.
     """
-    if ledger is None or "equity" not in ledger.columns or not _ledger_costs(ledger):
+    if (
+        ledger is None
+        or ledger.is_empty()
+        or "equity" not in ledger.columns
+        or not _ledger_costs(ledger)
+    ):
         return curve
     costs = ledger.select(
         "date",
@@ -178,14 +183,16 @@ def costs(
 ) -> dict[str, Any]:
     """Annual cost drag: booked from the ledger when it can be, else estimated from trades."""
     years = _span_years(curve)
-    if ledger is not None and _ledger_costs(ledger) and "equity" in ledger.columns and years > 0:
-        in_range = ledger.filter(pl.col("date") >= curve["date"][0])
-        avg_equity = in_range["equity"].mean()
-        share = {
-            c: (in_range[c].sum() or 0.0) / avg_equity / years for c in _ledger_costs(ledger)
-        }
-        return {"source": "ledger", "annual_drag": sum(share.values()), **share}
-    return {"source": "estimate", "annual_drag": trade_summary.get("cost_drag_annual")}
+    estimate = {"source": "estimate", "annual_drag": trade_summary.get("cost_drag_annual")}
+    if ledger is None or not _ledger_costs(ledger) or "equity" not in ledger.columns:
+        return estimate
+    in_range = ledger.filter(pl.col("date") >= curve["date"][0])
+    avg_equity = in_range["equity"].mean()
+    # A ledger with no rows, or no positive equity, has booked nothing to divide.
+    if avg_equity is None or avg_equity <= 0 or years <= 0:
+        return estimate
+    share = {c: (in_range[c].sum() or 0.0) / avg_equity / years for c in _ledger_costs(ledger)}
+    return {"source": "ledger", "annual_drag": sum(share.values()), **share}
 
 
 def net_of_costs(curve: pl.DataFrame) -> dict[str, Any] | None:
@@ -206,6 +213,8 @@ def exposure(ledger: pl.DataFrame | None) -> dict[str, Any]:
     if ledger is None or not needed <= set(ledger.columns):
         return {"source": "absent"}
     equity = pl.col("equity")
+    if ledger.filter(equity > 0).is_empty():
+        return {"source": "absent"}
     row = ledger.filter(equity > 0).select(
         (pl.col("gross_exposure") / equity).mean().alias("avg_gross"),
         (pl.col("net_exposure") / equity).mean().alias("avg_net"),
@@ -215,13 +224,91 @@ def exposure(ledger: pl.DataFrame | None) -> dict[str, Any]:
 
 
 def turnover(ledger: pl.DataFrame | None, trade_summary: dict[str, Any]) -> dict[str, Any]:
+    mean = None
     if ledger is not None and "turnover" in ledger.columns:
         mean = ledger["turnover"].mean()
-        return {
-            "source": "ledger",
-            "annual_two_sided": mean * NPERIODS if mean is not None else None,
-        }
+    if mean is not None:
+        return {"source": "ledger", "annual_two_sided": mean * NPERIODS}
     return {"source": "estimate", "annual_entry_weight": trade_summary.get("annual_turnover")}
+
+
+def closed_trades(trades: pl.DataFrame) -> pl.DataFrame:
+    """The round trips every trade figure counts: closed, with a finite return."""
+    return trades.filter((pl.col("status") == "closed") & pl.col("ret").is_finite())
+
+
+def _side_figures(frame: pl.DataFrame) -> dict[str, Any]:
+    rets = frame["ret"]
+    return {
+        "n": frame.height,
+        "win_rate": (rets > 0).sum() / frame.height,
+        "avg_ret": rets.mean(),
+        "contrib": frame["_c"].sum(),
+    }
+
+
+def _limit_structure(trades: pl.DataFrame, closed: pl.DataFrame) -> dict[str, Any]:
+    """Limit-price counts and contribution, from the bundle's own trades table."""
+    out: dict[str, Any] = {}
+    entered = trades.filter(pl.col("status") != "pending")
+    exited = trades.filter(pl.col("exit_date").is_not_null())
+    legs = (("limit_entry", entered, "buy_high"), ("limit_exit", exited, "sell_low"))
+    for column, frame, name in legs:
+        known = frame[column].drop_nulls() if column in frame.columns else None
+        if known is not None and known.len():
+            out[f"{name}_n"] = int(known.sum() or 0)
+            out[f"{name}_ratio"] = (known.sum() or 0) / known.len()
+    total = closed["_c"].sum() or 0.0
+    if "limit_entry" in closed.columns and closed["limit_entry"].drop_nulls().len():
+        at_limit = closed.filter(pl.col("limit_entry").fill_null(False))["_c"].sum() or 0.0
+        if abs(total) > 0:
+            out["buy_high_contrib"] = at_limit
+            out["buy_high_contrib_ratio"] = at_limit / total
+    if "entry_kind" in trades.columns:
+        out["entry_locked_n"] = entered.filter(pl.col("entry_kind") == "locked").height
+        out["entry_touched_n"] = entered.filter(pl.col("entry_kind") == "touched").height
+        locked = closed.filter(pl.col("entry_kind") == "locked")
+        if locked.height and abs(total) > 0:
+            out["entry_locked_contrib_ratio"] = (locked["_c"].sum() or 0.0) / total
+    if "exit_kind" in trades.columns:
+        out["exit_locked_n"] = exited.filter(pl.col("exit_kind") == "locked").height
+        out["exit_touched_n"] = exited.filter(pl.col("exit_kind") == "touched").height
+    return out
+
+
+def trade_structure(
+    trades: pl.DataFrame | None, fee_ratio: float | None, tax_ratio: float | None
+) -> dict[str, Any]:
+    """Where the return came from, measured on the bundle's own trades table.
+
+    Flags and the summary read this, so they describe the same round trips as the
+    ``trades`` table. Contribution is ``ret × |weight|``, closed round trips only.
+    """
+    if trades is None:
+        return {}
+    closed = closed_trades(trades).with_columns(
+        (pl.col("ret") * pl.col("weight").abs()).alias("_c")
+    )
+    out: dict[str, Any] = {}
+    if closed.height:
+        sides = {}
+        for side in ("long", "short"):
+            frame = closed.filter(pl.col("side") == side)
+            if frame.height:
+                sides[side] = _side_figures(frame)
+        out["sides"] = sides
+        total = closed["_c"].sum() or 0.0
+        if abs(total) > 0:
+            out["top10_contrib_ratio"] = closed["_c"].sort(descending=True).head(10).sum() / total
+            out["total_contrib"] = total
+        entered = trades.filter(pl.col("status") != "pending")
+        first = entered["entry_date"].min()
+        last = trades["exit_date"].max() or entered["entry_date"].max()
+        years = max(((last - first).days or 1) / 365.25, 1 / 365.25)
+        out["annual_turnover"] = (entered["weight"].abs().sum() or 0.0) / years
+        if fee_ratio is not None and tax_ratio is not None:
+            out["cost_drag_annual"] = out["annual_turnover"] * (2 * fee_ratio + tax_ratio)
+    return {**out, **_limit_structure(trades, closed)}
 
 
 def limit_fills(trades: pl.DataFrame | None) -> dict[str, Any] | None:
@@ -232,7 +319,7 @@ def limit_fills(trades: pl.DataFrame | None) -> dict[str, Any] | None:
     if trades is None or not {"limit_entry", "limit_exit"} & set(trades.columns):
         return None
     flags = [c for c in ("limit_entry", "limit_exit") if c in trades.columns]
-    closed = trades.filter(pl.col("status") == "closed")
+    closed = closed_trades(trades)
     if not closed.height:
         return None
     frame = closed.select(
@@ -256,8 +343,8 @@ def trade_stats(trades: pl.DataFrame | None, segment_win_rate: float | None) -> 
     if trades is None:
         return out
     entered = trades.filter(pl.col("status") != "pending")
-    closed = trades.filter(pl.col("status") == "closed")
-    rets = closed["ret"].drop_nulls().drop_nans()
+    closed = closed_trades(trades)
+    rets = closed["ret"]
     wins = rets.filter(rets > 0)
     losses = rets.filter(rets < 0)
     loss_sum = abs(losses.sum() or 0.0)
@@ -429,7 +516,7 @@ def checks(
 ) -> list[dict[str, Any]]:
     """Reconcile ledger tables against each other. A check runs only if its tables exist."""
     out: list[dict[str, Any]] = []
-    if ledger is None:
+    if ledger is None or ledger.is_empty():
         return out
     if "equity" in ledger.columns:
         joined = curve.select("date", "creturn").join(
