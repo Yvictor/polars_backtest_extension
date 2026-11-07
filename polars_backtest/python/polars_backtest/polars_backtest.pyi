@@ -82,6 +82,31 @@ class BacktestReport:
         """The bundle summary: a dict, or Markdown with format="md"."""
         ...
 
+    def to_html(
+        self,
+        path: str | Path | None = None,
+        *,
+        detail: str = "full",
+        max_mb: float = 20,
+        capital: float | None = None,
+        **bundle_kwargs: Any,
+    ) -> str | Path:
+        """The dashboard as one offline file, or its text without a path."""
+        ...
+
+    def show(
+        self,
+        *,
+        height: int = 900,
+        inline: bool | None = None,
+        day: str | None = None,
+        detail: str = "full",
+        capital: float | None = None,
+        **bundle_kwargs: Any,
+    ) -> None:
+        """Open the dashboard: a notebook iframe if there is one, else a browser tab."""
+        ...
+
     @property
     def fee_ratio(self) -> float:
         """Transaction fee ratio used in backtest."""

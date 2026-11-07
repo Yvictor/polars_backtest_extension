@@ -221,6 +221,11 @@ purpose: `symbol` for `stock_id`, `ret` for `return`, `weight` for `position`.
 | `limit_fills.share_return` | Share of summed `contrib_proxy` from limit-price fills, needs `input_df` |
 | `yearly.mdd` | Worst fall counted from highs inside the year |
 
+`report.to_html(path, detail="full", max_mb=20, capital=None)` and `report.show()` render
+the same bundle as one offline page, and `db.to_html()` does it without the engine.
+`detail="summary"` leaves out trades, fills and symbols. An agent should read the bundle,
+not the page.
+
 `summary["flags"]` holds the whole-period judgement: `capacity`, `limit_dependence`,
 `cost_sensitivity`, `alpha_decay`, and `long_short_balance` when there are shorts. Each
 has a `level` of `green`, `amber`, `red` or `na`, its `value`, `rule` and bounds.

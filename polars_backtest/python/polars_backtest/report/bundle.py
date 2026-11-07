@@ -166,6 +166,46 @@ class ReportBundle:
                 out[key] = self._rows(name, same)
         return out
 
+    def to_html(
+        self,
+        path: str | Path | None = None,
+        *,
+        detail: str = "full",
+        max_mb: float = 20,
+        capital: float | None = None,
+    ) -> str | Path:
+        """Render the dashboard as one offline file; the page text without a ``path``.
+
+        Args:
+            detail: ``"full"`` holds as many trades and fills as fit, and the page states
+                how many from its own counts. ``"summary"`` leaves out trades, fills and
+                symbols.
+            max_mb: size limit of the output. Row limits halve until it fits.
+            capital: show amounts in money instead of shares of starting capital.
+        """
+        from polars_backtest.report.page import build_html
+
+        page = build_html(self, detail=detail, max_mb=max_mb, capital=capital)
+        if path is None:
+            return page
+        out = Path(path)
+        out.write_text(page, encoding="utf-8")
+        return out
+
+    def show(
+        self,
+        *,
+        height: int = 900,
+        inline: bool | None = None,
+        day: str | None = None,
+        detail: str = "full",
+        capital: float | None = None,
+    ) -> None:
+        """Open the dashboard: a notebook iframe when there is one, else a browser tab."""
+        from polars_backtest.report.page import show
+
+        show(self, height=height, inline=inline, day=day, detail=detail, capital=capital)
+
     def write(self, path: str | Path) -> Path:
         """Write the bundle as a folder of Parquet tables, JSON and Markdown."""
         out = Path(path)

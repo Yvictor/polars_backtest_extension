@@ -60,9 +60,17 @@ pl_bt.viz.save_html(report, "report.html")  # standalone shareable file
 pl_bt.viz.report_data(report)               # JSON-safe payload for custom dashboards
 ```
 
-Includes equity curve (benchmark overlay, log scale, range presets), drawdown,
-monthly return heatmap, trade return distribution, MAE scatter, and full stats.
-Light/dark mode follows the system.
+The same page is on the report: `report.show()` and `report.to_html("report.html")`.
+It reads return and maximum drawdown side by side, at any date on the chart, and
+below them shows what a headline figure can hide: the outcome of any start date,
+the return without the best months, the share lost to costs, and fills at limit
+prices. Sections that need a ledger say so and name what is missing. English by
+default, with Traditional Chinese one click away.
+
+`detail="full"` is the default and holds as many trades and fills as fit under
+`max_mb`. The page states how many it holds, counted from the file itself; use
+`detail="summary"` before sharing one. Whole days of detail are dropped first, and
+daily returns and totals are always complete.
 
 ### Report bundle
 

@@ -1,8 +1,9 @@
 """Interactive HTML report for backtest results — zero extra dependencies.
 
-Renders a self-contained HTML dashboard (inline SVG + vanilla JS, no external
-assets or CDN) from a :class:`BacktestReport` (long format) or the wide-format
-``Report``. The file works offline, in a browser tab, or inside a notebook.
+The public entry points of the report: ``report_data`` is the stable JSON contract,
+and the HTML functions render the dashboard in ``polars_backtest.report`` from a
+:class:`BacktestReport` (long format) or the wide-format ``Report``. The file works
+offline, in a browser tab, or inside a notebook.
 
 Example:
     >>> import polars_backtest as pl_bt
@@ -14,16 +15,11 @@ Example:
 from __future__ import annotations
 
 import datetime as _dt
-import json
 import math
-import tempfile
-import webbrowser
 from pathlib import Path
 from typing import Any
 
 import polars as pl
-
-from polars_backtest._viz_template import TEMPLATE
 
 __all__ = ["report_data", "report_html", "save_html", "show"]
 
@@ -727,6 +723,24 @@ def report_data(
     return _clean(payload)
 
 
+def _bundle(
+    report: Any,
+    title: str,
+    input_df: pl.DataFrame | None,
+    symbol_names: dict[str, str] | None,
+    fill_scenarios: list[dict[str, Any]] | None,
+) -> Any:
+    from polars_backtest.report import to_bundle
+
+    return to_bundle(
+        report,
+        title=title,
+        input_df=input_df,
+        symbol_names=symbol_names,
+        fill_scenarios=fill_scenarios,
+    )
+
+
 def report_html(
     report: Any,
     *,
@@ -736,26 +750,7 @@ def report_html(
     fill_scenarios: list[dict[str, Any]] | None = None,
 ) -> str:
     """Render a report to a self-contained HTML string."""
-    from polars_backtest._polars_backtest import __version__
-
-    payload = report_data(
-        report,
-        title=title,
-        input_df=input_df,
-        symbol_names=symbol_names,
-        fill_scenarios=fill_scenarios,
-    )
-    # "<" must not appear raw inside the <script> block: "</script>" in any
-    # payload string (title, symbol names, ...) would terminate the element at
-    # HTML-parse time. \u003c is the JSON-native escape; ensure_ascii already
-    # covers U+2028/U+2029.
-    payload_json = json.dumps(payload, separators=(",", ":")).replace("<", "\\u003c")
-    # Each placeholder occurs once in the template and, in template order,
-    # before any user-controlled substitution — replace with count=1 so user
-    # strings containing a placeholder name are never re-substituted.
-    html = TEMPLATE.replace("__TITLE__", _escape(title), 1)
-    html = html.replace("__VERSION__", str(__version__), 1)
-    return html.replace("__PAYLOAD__", payload_json, 1)
+    return _bundle(report, title, input_df, symbol_names, fill_scenarios).to_html()
 
 
 def save_html(
@@ -768,51 +763,17 @@ def save_html(
     fill_scenarios: list[dict[str, Any]] | None = None,
 ) -> Path:
     """Render a report and write it to ``path``. Returns the written path."""
-    out = Path(path)
-    out.write_text(
-        report_html(
-            report,
-            title=title,
-            input_df=input_df,
-            symbol_names=symbol_names,
-            fill_scenarios=fill_scenarios,
-        ),
-        encoding="utf-8",
-    )
-    return out
+    return _bundle(report, title, input_df, symbol_names, fill_scenarios).to_html(path)
 
 
 def show(
     report: Any,
     *,
     title: str = "Backtest Report",
-    height: int = 1400,
+    height: int = 900,
     input_df: pl.DataFrame | None = None,
     symbol_names: dict[str, str] | None = None,
+    fill_scenarios: list[dict[str, Any]] | None = None,
 ) -> None:
     """Display the report: inline iframe in notebooks, browser tab otherwise."""
-    html = report_html(report, title=title, input_df=input_df, symbol_names=symbol_names)
-    try:  # notebook path
-        import IPython
-        from IPython.display import HTML, display
-
-        if IPython.get_ipython() is not None:
-            escaped = html.replace("&", "&amp;").replace('"', "&quot;")
-            display(
-                HTML(
-                    f'<iframe srcdoc="{escaped}" style="width:100%;height:{height}px;'
-                    'border:none;border-radius:8px;"></iframe>'
-                )
-            )
-            return
-    except ImportError:
-        pass
-    with tempfile.NamedTemporaryFile(
-        "w", suffix=".html", prefix="polars_backtest_", delete=False, encoding="utf-8"
-    ) as f:
-        f.write(html)
-    webbrowser.open(f"file://{f.name}")
-
-
-def _escape(text: str) -> str:
-    return text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+    _bundle(report, title, input_df, symbol_names, fill_scenarios).show(height=height)
