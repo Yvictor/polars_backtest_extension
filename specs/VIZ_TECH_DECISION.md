@@ -1,5 +1,10 @@
 # Visualization Tech Decision — 2026-07-04
 
+Update 2026-11: the report moved to `polars_backtest/report/dashboard/`. Tripwire 3 fired,
+and the escape hatch below was not taken: the page draws its main chart and scatter on a
+hand-written canvas, because the hero's scrub, drawdown band and to-date markers were
+custom either way. There is no plotting dependency. The rest of this record stands.
+
 Supersedes the "use Plotly" line in REPORT_IMPLEMENTATION_PLAN.md Stage 3.
 Based on a candidate survey (uPlot, ECharts 6, lightweight-charts 5, Observable
 Plot, vega-lite, plotly.js, Chart.js, LightningChart, hand-rolled SVG) against:
