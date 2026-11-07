@@ -77,6 +77,24 @@ class LedgerReport:
         return getattr(self.__dict__["_report"], name)
 
 
+def huge_fills_report(report: Any, rows: int = 5_000_000) -> LedgerReport:
+    """A report with millions of fills spread over its real calendar."""
+    days = report.daily_creturn()["date"].cast(pl.Date)
+    fills = (
+        pl.DataFrame({"date": days, "n": [rows // days.len()] * days.len()})
+        .select(pl.col("date").repeat_by("n").explode())
+        .with_row_index("i")
+        .with_columns(
+            pl.format("FAKE{}", pl.col("i") % 977).alias("symbol"),
+            ((pl.col("i") % 7).cast(pl.Float64) - 3.5).alias("notional"),
+            (50.0 + (pl.col("i") % 11)).alias("price"),
+            pl.lit("rebalance").alias("reason"),
+        )
+        .drop("i")
+    )
+    return LedgerReport(report, fills=fills)
+
+
 def fake_ledger(report: Any) -> dict[str, pl.DataFrame]:
     """Ledger tables that reconcile exactly with the report's daily curve."""
     curve = report.daily_creturn().select(pl.col("date").cast(pl.Date), "creturn").sort("date")
