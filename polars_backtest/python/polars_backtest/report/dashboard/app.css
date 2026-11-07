@@ -194,6 +194,8 @@ td{padding:9px 0 9px 14px;text-align:right;border-top:1px solid var(--line);whit
 /* page parts that are not in the hero */
 .flagrow{display:flex;flex-wrap:wrap;gap:6px;padding-inline:4px}
 .fpill{display:inline-flex;align-items:center;gap:6px;min-height:28px;padding:2px 10px;border:1px solid var(--line);border-radius:999px;font-size:12px;color:var(--ink2)}
+.chips{align-items:center;flex-wrap:wrap;justify-content:flex-end}
+.dateinp{height:30px;width:132px;padding:0 8px;border:1px solid var(--line2);border-radius:var(--r-ctl);background:var(--raise);font-size:12px;color:var(--ink2)}
 .flaglab{align-self:center;font-size:12px;color:var(--muted)}
 .scope{font-size:13px;line-height:20px;color:var(--amber);padding-inline:4px}
 .fpill b{font-weight:400;color:var(--ink)}
@@ -340,6 +342,8 @@ button.fill:hover .nm2{color:var(--accent)}
   .hint{font-size:11px;max-width:calc(100% - 150px);overflow:hidden;left:20px;transform:none}
   .logchip{right:76px}
   .hhead{flex-wrap:wrap}
+  .chips{flex:1 1 100%;justify-content:flex-start}
+  .dateinp{flex:1 1 40%;min-width:0;font-size:16px}
   .rank{grid-template-columns:78px minmax(0,1fr) auto;gap:8px}
   .panel{width:100%;border-left:0}
   .dsec{grid-template-columns:1fr}

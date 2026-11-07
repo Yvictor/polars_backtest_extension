@@ -20,6 +20,7 @@ from polars_backtest.report.schema import SCHEMA_VERSION
 
 SIGNIFICANT = 8
 HIST_BINS = 60
+STOPS = (0.05, 0.10, 0.20)
 MAX_SYMBOLS = 5_000
 SYMBOL_TAIL = 2_000
 TRADE_TAIL = 1_000
@@ -160,6 +161,50 @@ def _histogram(trades: pl.DataFrame) -> dict[str, Any] | None:
     return {"low": low, "width": width, "counts": counts, "mean": rets.mean(), "n": rets.len()}
 
 
+def _trade_days(trades: pl.DataFrame) -> pl.DataFrame:
+    """Closed trades summed per exit day and side, from every trade.
+
+    Trimming keeps extremes on purpose, so rows in a page are a biased sample. Window
+    figures add these up instead: win rate, averages and stop replays stay exact for
+    any date range, whatever the page's row limits.
+    """
+    ret, mae = pl.col("ret"), pl.col("mae")
+    aggs = [
+        pl.len().cast(pl.Int64).alias("n"),
+        (ret > 0).sum().cast(pl.Int64).alias("wins"),
+        ret.sum().alias("sum_ret"),
+        (ret * pl.col("weight").abs()).sum().alias("contrib"),
+    ]
+    if "mae" in trades.columns:
+        known = mae.is_not_null()
+        aggs.append(known.sum().cast(pl.Int64).alias("n_mae"))
+        for i, stop in enumerate(STOPS):
+            hit = (mae <= -stop).fill_null(False)
+            clipped = pl.when(hit).then(pl.lit(-stop)).otherwise(ret)
+            aggs += [
+                hit.sum().cast(pl.Int64).alias(f"hit_{i}"),
+                ((clipped > 0) & known).sum().cast(pl.Int64).alias(f"win_{i}"),
+                clipped.filter(known).sum().alias(f"sum_{i}"),
+            ]
+    return (
+        closed_trades(trades)
+        .group_by(pl.col("exit_date").alias("date"), "side")
+        .agg(aggs)
+        .sort("date", "side")
+    )
+
+
+def _hist_days(trades: pl.DataFrame, hist: dict[str, Any]) -> pl.DataFrame:
+    """The histogram's bins per exit day, so a date range can sum its own distribution."""
+    bins = ((pl.col("ret") - hist["low"]) / hist["width"]).floor().clip(0, HIST_BINS - 1)
+    return (
+        closed_trades(trades)
+        .group_by(pl.col("exit_date").alias("date"), bins.cast(pl.Int64).alias("bin"))
+        .agg(pl.len().cast(pl.Int64).alias("n"))
+        .sort("date", "bin")
+    )
+
+
 def _metrics(bundle: ReportBundle) -> dict[str, dict[str, float]]:
     frame = bundle.table("metrics").collect()
     out: dict[str, dict[str, float]] = {"engine": {}, "stats": {}}
@@ -231,6 +276,7 @@ def build_payload(
     metrics = _metrics(bundle)
     manifest = bundle.manifest
     trades = bundle.table("trades").collect() if bundle.has("trades") else None
+    hist = _histogram(trades) if trades is not None else None
     payload: dict[str, Any] = {
         "schema": SCHEMA_VERSION,
         "library_version": manifest["library_version"],
@@ -250,10 +296,15 @@ def build_payload(
         "yearly": _columns(bundle.table("yearly").collect(), exact=True),
         "drawdowns": _columns(bundle.table("drawdowns").collect()),
         "day_index": _columns(bundle.table("day_index").collect()),
-        "hist": _histogram(trades) if trades is not None else None,
+        "hist": hist,
+        "stops": list(STOPS),
         "embed": _embed_notes(bundle, frames, detail),
         "tables": {name: _columns(frame) for name, frame in frames.items()},
     }
+    if trades is not None:
+        payload["trade_days"] = _columns(_trade_days(trades), exact=True)
+    if hist is not None:
+        payload["hist_days"] = _columns(_hist_days(trades, hist))
     if bundle.has("ledger_daily"):
         payload["ledger_daily"] = _columns(bundle.table("ledger_daily").collect())
     if bundle.has("fill_scenarios"):

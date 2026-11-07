@@ -9,7 +9,6 @@ const BT = (() => {
   const dayDiff = (a, b) => Math.round((utc(b) - utc(a)) / 864e5);
   const annualise = (growth, years) => (years > 0 && growth > 0 ? Math.pow(growth, 1 / years) - 1 : null);
   const mean = (x) => (x.length ? x.reduce((a, b) => a + b, 0) / x.length : null);
-  const clamp = (x, lo, hi) => Math.min(hi, Math.max(lo, x));
 
   function std(x) {
     if (x.length < 2) return null;
@@ -133,13 +132,51 @@ const BT = (() => {
     return [...keep].sort((p, q) => p - q);
   }
 
-  /* Equal-width bins, for a trade distribution of the rows in a date window. */
-  function histogram(values, bins) {
-    if (!values.length) return null;
-    const low = Math.min(...values), high = Math.max(...values), width = (high - low) / bins || 1e-9;
-    const counts = new Array(bins).fill(0);
-    for (const v of values) counts[clamp(Math.floor((v - low) / width), 0, bins - 1)]++;
-    return { low, width, counts, mean: mean(values), n: values.length };
+  /* Trade figures for a date range, summed from the per-exit-day aggregates of every trade.
+     Rows in the page are a trimmed sample, so they are never used for these. */
+  function windowTrades(days, from, to, stops) {
+    const blank = () => ({ n: 0, wins: 0, sum_ret: 0, contrib: 0 });
+    const sides = { long: blank(), short: blank() };
+    const stopSums = stops.map(() => ({ hit: 0, win: 0, sum: 0 }));
+    let nMae = 0;
+    for (const r of days) {
+      if (r.date < from || r.date > to) continue;
+      const s = sides[r.side];
+      s.n += r.n; s.wins += r.wins; s.sum_ret += r.sum_ret; s.contrib += r.contrib;
+      nMae += r.n_mae ?? 0;
+      stopSums.forEach((x, i) => {
+        x.hit += r[`hit_${i}`] ?? 0; x.win += r[`win_${i}`] ?? 0; x.sum += r[`sum_${i}`] ?? 0;
+      });
+    }
+    const n = sides.long.n + sides.short.n, sumRet = sides.long.sum_ret + sides.short.sum_ret;
+    const side = (s) => (s.n ? { n: s.n, win_rate: s.wins / s.n, avg_ret: s.sum_ret / s.n, contrib: s.contrib } : null);
+    return {
+      n,
+      wins: sides.long.wins + sides.short.wins,
+      mean: n ? sumRet / n : null,
+      long: side(sides.long),
+      short: side(sides.short),
+      stops: nMae ? stopSums.map((x) => ({ hit: x.hit, win: x.win / nMae, avg: x.sum / nMae })) : [],
+    };
+  }
+
+  /* The whole-period histogram's bins, counted over a date range. */
+  function windowHist(hist, days, from, to) {
+    const counts = new Array(hist.counts.length).fill(0);
+    let n = 0;
+    for (const r of days) {
+      if (r.date < from || r.date > to) continue;
+      counts[r.bin] += r.n;
+      n += r.n;
+    }
+    return { low: hist.low, width: hist.width, counts, n };
+  }
+
+  /* The periods overlapping [first, last], clipped to it, so a total never counts days
+     outside the range. Periods carry their own day indexes a and b. */
+  function periodsIn(periods, first, last) {
+    return periods.filter((p) => p.b >= first && p.a <= last)
+      .map((p) => ({ ...p, a: Math.max(p.a, first), b: Math.min(p.b, last) }));
   }
 
   /* What a page holds against its bundle, read from the counts the payload carries. */
@@ -150,20 +187,9 @@ const BT = (() => {
     return { complete: parts.every((p) => p.embedded === p.total), parts };
   }
 
-  /* What a fixed stop would have done, using each trade's worst open loss. */
-  function stopReplay(rets, maes, stop) {
-    const hit = rets.filter((_, i) => maes[i] != null && maes[i] <= -stop).length;
-    const clipped = rets.map((r, i) => (maes[i] != null && maes[i] <= -stop ? -stop : r));
-    return {
-      hit,
-      win: clipped.filter((v) => v > 0).length / clipped.length,
-      avg: mean(clipped),
-    };
-  }
-
   return {
-    NPERIODS, annualise, dayDiff, dayIndex, drawIndices, embedStatus, flatBest, histogram, mean,
-    median, rangeKpi, rollHold, rolling, std, stopReplay, track,
+    NPERIODS, annualise, dayDiff, dayIndex, drawIndices, embedStatus, flatBest, mean, median,
+    periodsIn, rangeKpi, rollHold, rolling, std, track, windowHist, windowTrades,
   };
 })();
 if (typeof module !== "undefined") module.exports = BT;

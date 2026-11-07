@@ -56,6 +56,7 @@ const TRADES = rowsOf(TABLES.trades).map((t, id) => ({
 }));
 const CLOSED = TRADES.filter((t) => t.status === "closed").sort((a, b) => b.x - a.x || b.id - a.id);
 const OPEN = TRADES.filter((t) => t.status === "open");
+const TRADE_DAYS = rowsOf(P.trade_days), HIST_DAYS = rowsOf(P.hist_days);
 const HAS_TRADES = !!TABLES.trades;
 
 const SYMBOL_ROWS = rowsOf(TABLES.symbol_index);
@@ -465,9 +466,11 @@ function renderHero() {
   const fig = (lab, big, cls, vs, note) => `<div class="fig"><div class="lab" id="${lab}"></div><div class="big ${cls}" id="${big}"></div>${BENCH ? `<div class="vs num"><b>---</b><span id="${vs}"></span></div>` : ""}<div class="note num" id="${note}"></div></div>`;
   const presets = [["all", t("all")], ["3y", "3Y"], ["1y", "1Y"], ["ytd", t("ytd")], ["6m", "6M"]];
   const cur = S.win ? S.win.preset || "" : "all", fixed = S.win && S.win.kind !== "preset";
-  const chip = fixed
-    ? `<button class="chip num" id="chipWin" aria-label="${esc(t("clearWin", winLabel(S.win)))}">${esc(S.win.kind === "range" ? t("all") : winLabel(S.win))} ${ICON.x}</button>`
-    : `<div class="seg sm" id="presets">${presets.map((p) => `<button data-p="${p[0]}" aria-pressed="${cur === p[0]}">${esc(p[1])}</button>`).join("")}</div>`;
+  const named = S.win?.kind === "year" || S.win?.kind === "month";
+  const clearChip = fixed ? `<button class="chip num" id="chipWin" aria-label="${esc(t("clearWin", winLabel(S.win)))}">${esc(named ? winLabel(S.win) : t("clearShort"))} ${ICON.x}</button>` : "";
+  const dateBox = (id, label, value) => `<input class="dateinp num" type="date" id="${id}" aria-label="${t(label)}" min="${DAYS[0]}" max="${DAYS[LAST]}" value="${value}">`;
+  const chip = `${clearChip}<div class="seg sm" id="presets">${presets.map((p) => `<button data-p="${p[0]}" aria-pressed="${cur === p[0]}">${esc(p[1])}</button>`).join("")}</div>
+   ${dateBox("winFrom", "dateFrom", DAYS[S.win ? S.win.first : 0])}${dateBox("winTo", "dateTo", DAYS[S.win ? S.win.b : LAST])}`;
   $("heroSlot").innerHTML = `<section class="hero" aria-label="${t("annual")}, ${t("maxdd")}">
    <span class="glow rise lit" id="gR"></span><span class="glow fall" id="gF"></span><span class="glow side"></span>
    <div class="hhead"><div class="eyebrow num" id="win"></div><div class="chips">${chip}</div></div>
@@ -521,6 +524,8 @@ function bindHero() {
     btn.onclick = () => toggleYear(y);
   });
   if ($("chipWin")) $("chipWin").onclick = () => setWindow(null);
+  $("winFrom").onchange = setDates;
+  $("winTo").onchange = setDates;
   document.querySelectorAll("#presets button").forEach((b) => {
     b.onclick = () => setWindow(b.dataset.p === "all" ? null : presetWindow(b.dataset.p));
   });
@@ -536,6 +541,21 @@ function setWindow(win) {
   geom();
   setRange(a, b);
   renderBehind(); renderHealth(); renderMonthly(); renderTrades();
+}
+/* Any two dates: the first trading day on or after one, the last on or before the other.
+   A pair that holds no range puts the boxes back rather than guessing. */
+function setDates() {
+  const from = $("winFrom").value, to = $("winTo").value;
+  const first = from ? dayOf(from) : 0;
+  let last = to ? dayOf(to) : LAST;
+  if (to && DAYS[last] > to) last--;
+  const win = makeWin(first, last, { kind: "custom" });
+  if (last < first || win.b <= win.a) {
+    $("winFrom").value = DAYS[S.win ? S.win.first : 0];
+    $("winTo").value = DAYS[S.win ? S.win.b : LAST];
+    return;
+  }
+  setWindow(first === 0 && last === LAST ? null : win);
 }
 function toggleYear(year) {
   if (S.win?.year === year) { setWindow(null); return; }
@@ -865,13 +885,15 @@ function renderHealth() {
   });
   gs.forEach((g) => { if (S.open.has(g.k)) g.draw($("sub-" + g.k)); });
 }
+const wholeTag = () => (S.win ? `<span class="r">${t("wholePeriod")}</span>` : "");
 function drawYears(el) {
-  const f = F(), ys = YEAR_ROWS, hasB = !!BENCH, sel = ys.length - 1;
+  const [first, last] = S.win ? [S.win.first, S.win.b] : [0, LAST];
+  const f = F(), ys = YEAR_ROWS.filter((y) => y.b >= first && y.a <= last), hasB = !!BENCH, sel = ys.length - 1;
   const cap = (i) => `<span class="num">${ys[i].y}&nbsp;&nbsp;<span style="color:var(${ys[i].r < 0 ? "--fall" : "--rise"})">${t("strategy")} ${f.spct(ys[i].r, 1)}</span>${hasB ? `&nbsp;&nbsp;${t("bench")} ${f.spct(ys[i].bench, 1)}` : ""}</span>`;
   const beat = ys.filter((y) => y.bench != null && y.r > y.bench).length;
   const lg = [{ n: t("strategy"), c: "var(--rise)" }];
   if (hasB) lg.push({ n: t("bench"), c: "var(--faint)" });
-  el.innerHTML = `<div class="subhead"><h3>${t("yearVs")}</h3>${hasB ? `<span class="r num">${t("yearVsSide", beat, ys.length)}</span>` : ""}</div><div class="caption" id="yCap">${cap(sel)}</div><div class="chart" id="yCh"></div>${legend(lg)}`;
+  el.innerHTML = `<div class="subhead"><h3>${t("yearVs")}</h3>${hasB ? `<span class="r num">${t("yearVsSide", beat, ys.length)}</span>` : ""}</div><div class="caption" id="yCap">${cap(sel)}</div><div class="chart" id="yCh"></div>${legend(lg)}${S.win ? `<p class="dsrc">${t("wholeYears")}</p>` : ""}`;
   const series = [{ n: t("strategy"), c: (v) => (v < 0 ? "var(--fall)" : "var(--rise)"), v: ys.map((y) => y.r) }];
   if (hasB) series.push({ n: t("bench"), c: "var(--faint)", v: ys.map((y) => y.bench) });
   barChart($("yCh"), { mode: "group", cats: ys.map((y) => String(y.y).slice(2)), tipTitle: (i) => String(ys[i].y), label: t("yearVs"), fmt: (v) => f.spct(v, 0), sel, onHover: (i) => { $("yCap").innerHTML = cap(i); }, series });
@@ -891,7 +913,7 @@ function drawDrawdown(el) {
   el.innerHTML = `<div class="subhead"><div><h3 class="num">${esc(ym(e.trough))}</h3><span class="r num">${esc(f.date(e.start))} – ${e.end ? esc(f.date(e.end)) : "…"}</span></div><div class="rightcol"><div class="pfig dn big28">${esc(f.pct(e.depth, 1))}</div><span class="r num">${esc(t("ddDepth", f.days(e.days)))}</span></div></div>
   ${HAS_TRADES ? `<div><button class="link" id="ddList">${t("listTrades")} &darr;</button></div>` : ""}
   <div class="chart" id="ddCh"></div>${legend(lg)}
-  <div class="subhead"><h3>${t("ddRanks")}</h3></div><div class="ranks">${EPISODES.slice(0, 5).map((x, i) => {
+  <div class="subhead"><h3>${t("ddRanks")}</h3>${wholeTag()}</div><div class="ranks">${EPISODES.slice(0, 5).map((x, i) => {
     const bd = bDepth(x);
     return `<button class="rank" data-i="${i}" aria-pressed="${x === e}"><span class="num">${esc(ym(x.trough))}</span><span class="tr"><b style="width:${Math.abs(x.depth) / maxD * 100}%;background:var(--fall)"></b>${bd != null ? `<b style="width:${Math.min(100, Math.abs(bd) / maxD * 100)}%;background:var(--faint)"></b>` : ""}</span><span class="val"><span style="font-size:13px;color:var(--fall)">${esc(f.pct(x.depth, 1))}</span><span>${esc(f.days(x.days))}</span></span></button>`;
   }).join("")}</div>`;
@@ -910,34 +932,24 @@ function drawRisk(el) {
   bindSub(el, () => drawRisk(el));
 }
 function drawWin(el) {
-  const f = F(), ST = SUM.structure, parts = [], inRange = windowClosed();
-  const rets = inRange.map((x) => x.ret).filter((v) => v != null);
-  const H2 = S.win ? BT.histogram(rets, 40) : P.hist;
+  const f = F(), ST = SUM.structure, parts = [], W = windowFigures();
+  const H2 = P.hist && W.n ? BT.windowHist(P.hist, HIST_DAYS, ...dateRange()) : null;
   const sideRow = (name, s) => (s ? [name, f.int(s.n), f.pct(s.win_rate, 1), f.spct(s.avg_ret, 2), f.spct(s.contrib, 1)] : null);
-  const windowSide = (side) => {
-    const l = inRange.filter((x) => x.side === side && x.ret != null);
-    return l.length ? {
-      n: l.length, win_rate: l.filter((x) => x.ret > 0).length / l.length, avg_ret: BT.mean(l.map((x) => x.ret)),
-      contrib: l.reduce((sum, x) => sum + x.ret * Math.abs(x.weight ?? 0), 0),
-    } : null;
-  };
   if (H2) {
-    parts.push(`<div class="subhead"><h3>${t("dist")}</h3><span class="r num">${t("distSide", f.spct(H2.mean, 1))}</span></div><div class="chart" id="wCh"></div>`);
+    parts.push(`<div class="subhead"><h3>${t("dist")}</h3><span class="r num">${t("distSide", f.spct(W.mean, 1))}</span></div><div class="chart" id="wCh"></div>`);
   }
-  const longSide = S.win ? windowSide("long") : ST.sides?.long, shortSide = S.win ? windowSide("short") : ST.sides?.short;
-  if (shortSide) {
-    const rows = [sideRow(t("long"), longSide), sideRow(t("short"), shortSide)].filter(Boolean);
+  if (W.short) {
+    const rows = [sideRow(t("long"), W.long), sideRow(t("short"), W.short)].filter(Boolean);
     parts.push(`<div class="subhead"><h3>${t("sides")}</h3></div>${table([t("side"), t("nTrades"), t("winCol"), t("avgCol"), t("contribCol")], rows)}`);
   }
   if (!S.win && ST.top10_contrib_ratio != null) parts.push(`<p class="caption">${esc(t("top10", f.pct(ST.top10_contrib_ratio, 0)))}</p>`);
-  const points = inRange.filter((x) => x.mae != null && x.ret != null);
+  const points = windowClosed().filter((x) => x.mae != null && x.ret != null);
   if (points.length) {
-    parts.push(`<div class="subhead"><h3>${t("scatter")}</h3></div><p class="caption">${t("scatterD")}</p><div class="chart" id="scCh"></div>`);
-    const replay = [0.05, 0.1, 0.2].map((stop) => {
-      const r = BT.stopReplay(points.map((x) => x.ret), points.map((x) => x.mae), stop);
-      return [f.pct(stop, 0), f.int(r.hit), f.pct(r.win, 1), f.spct(r.avg, 2)];
-    });
-    parts.push(`<div class="subhead"><h3>${t("stops")}</h3></div>${table([t("stopCol"), t("stopHit"), t("stopWin"), t("stopAvg")], replay)}<p class="dsrc">${t("stopsD")}${sampledNote("trades")}</p>`);
+    parts.push(`<div class="subhead"><h3>${t("scatter")}</h3></div><p class="caption">${t("scatterD")}${esc(sampledNote("trades"))}</p><div class="chart" id="scCh"></div>`);
+  }
+  if (W.stops.length) {
+    const replay = W.stops.map((r, i) => [f.pct(P.stops[i], 0), f.int(r.hit), f.pct(r.win, 1), f.spct(r.avg, 2)]);
+    parts.push(`<div class="subhead"><h3>${t("stops")}</h3></div>${table([t("stopCol"), t("stopHit"), t("stopWin"), t("stopAvg")], replay)}<p class="dsrc">${t("stopsD")}</p>`);
   }
   el.innerHTML = parts.join("");
   if ($("wCh")) {
@@ -966,10 +978,19 @@ function drawExposure(el) {
   } else held();
   bindSub(el, () => drawExposure(el));
 }
-function yearlySum(fn) {
-  return YEAR_ROWS.map((y) => {
+/* Periods for totals inside the range: calendar years, or months under two years. */
+function chartPeriods() {
+  const first = S.win ? S.win.first : 0, last = S.win ? S.win.b : LAST, f = F();
+  const short = BT.dayDiff(DAYS[first], DAYS[last]) < 730;
+  const periods = short
+    ? MONTH_ROWS.map((m) => ({ a: m.a, b: m.b, cat: `${String(m.y).slice(2)}/${m.m}`, title: f.month(m.y, m.m) }))
+    : YEAR_ROWS.map((y) => ({ a: y.a, b: y.b, cat: String(y.y).slice(2), title: String(y.y) }));
+  return BT.periodsIn(periods, first, last);
+}
+function periodSum(periods, fn) {
+  return periods.map((p) => {
     let total = 0;
-    for (let i = y.a; i <= y.b; i++) { const r = LEDGER.get(DAYS[i]); if (r) total += fn(r) ?? 0; }
+    for (let i = p.a; i <= p.b; i++) { const r = LEDGER.get(DAYS[i]); if (r) total += fn(r) ?? 0; }
     return total;
   });
 }
@@ -979,15 +1000,15 @@ function drawCost(el) {
     el.innerHTML = `${needsHtml("needsLedger", "msCost", true)}<p class="dsrc">${t("estNote")}</p>`;
     return;
   }
-  const tab = S.sub.cost || "cost", cats = YEAR_ROWS.map((y) => String(y.y).slice(2)), title = (i) => String(YEAR_ROWS[i].y);
+  const tab = S.sub.cost || "cost", periods = chartPeriods(), cats = periods.map((p) => p.cat), title = (i) => periods[i].title;
   el.innerHTML = `<div class="subhead">${subTabs("cost", [["cost", t("costTab")], ["turn", t("turnTab")]], "cost")}<span class="r">${t(tab === "cost" ? "costNote" : "turnNote")}</span></div><div class="chart" id="cCh"></div><div id="cLg"></div>`;
   if (tab === "cost") {
     const colors = ["--c1", "--c2", "--c3", "--c4", "--compare"];
-    const parts = COST_KEYS.map((k, i) => ({ n: t("cost_" + k), c: `var(${colors[i]})`, v: yearlySum((r) => (r.equity > 0 ? r[k] / r.equity : 0)) }));
+    const parts = COST_KEYS.map((k, i) => ({ n: t("cost_" + k), c: `var(${colors[i]})`, v: periodSum(periods, (r) => (r.equity > 0 ? r[k] / r.equity : 0)) }));
     barChart($("cCh"), { mode: "stack", h: 200, cats, tipTitle: title, fmt: (v) => f.pct(v, 1), label: t("costTab"), series: parts });
     $("cLg").innerHTML = legend(parts);
   } else {
-    barChart($("cCh"), { mode: "stack", h: 200, cats, tipTitle: title, fmt: (v) => f.times(v), label: t("turnTab"), series: [{ n: t("turnover"), c: "var(--c1)", v: yearlySum((r) => r.turnover) }] });
+    barChart($("cCh"), { mode: "stack", h: 200, cats, tipTitle: title, fmt: (v) => f.times(v), label: t("turnTab"), series: [{ n: t("turnover"), c: "var(--c1)", v: periodSum(periods, (r) => r.turnover) }] });
   }
   bindSub(el, () => drawCost(el));
 }
@@ -997,7 +1018,7 @@ function drawLiquidity(el) {
   if (SC) {
     const order = { baseline: 0, locked: 1, at_limit: 2 };
     const rows = [...SC].sort((a, b) => (order[a.name] ?? 9) - (order[b.name] ?? 9)).map((s) => [I18N[S.lang]["sc_" + s.name] || s.name, f.spct(s.cagr, 1), f.pct(s.max_drawdown, 1), f.ratio(s.daily_sharpe), f.int(s.blocked_n)]);
-    parts.push(`<div class="subhead"><h3>${t("fillTitle")}</h3></div>${table([t("scenario"), t("scCagr"), t("scMdd"), t("scSharpe"), t("scBlocked")], rows)}<p class="dsrc">${t("fillD")}</p>`);
+    parts.push(`<div class="subhead"><h3>${t("fillTitle")}</h3>${wholeTag()}</div>${table([t("scenario"), t("scCagr"), t("scMdd"), t("scSharpe"), t("scBlocked")], rows)}<p class="dsrc">${t("fillD")}</p>`);
   }
   if (!has("blocks")) {
     parts.push(needsHtml("needsLedger", "msBlocks", true));
@@ -1053,7 +1074,7 @@ function monthNote() {
   const o = MONTH_ROWS.find((m) => m.k === k);
   e.className = "hnote on";
   e.style.setProperty("--tone", `var(${o.r < 0 ? "--fall" : "--rise"})`);
-  const n = windowClosed().length;
+  const n = windowFigures().n;
   e.innerHTML = `<span>${esc(f.month(o.y, o.m))} ${esc(f.spct(o.r, 1))}</span>` + (S.win?.month === k && HAS_TRADES ?`<button class="link" id="toTrades">${t("seeTrades", n)} &darr;</button>` : "");
   if ($("toTrades")) $("toTrades").onclick = () => $("tradesSec").scrollIntoView({ behavior: reduced() ? "auto" : "smooth", block: "start" });
 }
@@ -1061,6 +1082,9 @@ function monthNote() {
 /* ---------- trades ---------- */
 /* A trade belongs to the window its exit falls in. */
 const windowClosed = () => (S.win ? CLOSED.filter((x) => inWindow(x.x)) : CLOSED);
+const dateRange = () => (S.win ? [DAYS[S.win.first], DAYS[S.win.b]] : [DAYS[0], DAYS[LAST]]);
+/* Complete figures for the range, from every trade, whatever rows this file holds. */
+const windowFigures = () => BT.windowTrades(TRADE_DAYS, ...dateRange(), P.stops);
 function tradeList() {
   let l = windowClosed();
   if (S.limitOnly) l = l.filter((x) => x.limit_entry || x.limit_exit);
@@ -1085,7 +1109,7 @@ function renderTrades() {
   let prev = -1;
   const pg = nums.map((i) => { const gap = i - prev > 1 ? "<span>…</span>" : ""; prev = i; return `${gap}<button data-p="${i}" ${i === S.page ? 'aria-current="page"' : ""}>${i + 1}</button>`; }).join("");
   const empty = t(HAS_TRADES ? "noTrades" : "noTradesFile");
-  $("tradesSlot").innerHTML = `<section class="sec" id="tradesSec" style="scroll-margin-top:56px"><div class="shead"><div class="ttl"><h2>${t("tradeTitle")}</h2><span class="side num">${t("tradeTotal", l.length)}</span></div><div class="seg sm" id="sortSeg">${[["recent", "sortRecent"], ["win", "sortWin"], ["lose", "sortLose"]].map((o) => `<button data-s="${o[0]}" aria-pressed="${S.sort === o[0]}">${t(o[1])}</button>`).join("")}</div></div>
+  $("tradesSlot").innerHTML = `<section class="sec" id="tradesSec" style="scroll-margin-top:56px"><div class="shead"><div class="ttl"><h2>${t("tradeTitle")}</h2><span class="side num">${t("tradeTotal", S.limitOnly ? l.length : windowFigures().n)}</span></div><div class="seg sm" id="sortSeg">${[["recent", "sortRecent"], ["win", "sortWin"], ["lose", "sortLose"]].map((o) => `<button data-s="${o[0]}" aria-pressed="${S.sort === o[0]}">${t(o[1])}</button>`).join("")}</div></div>
   ${S.win || S.limitOnly ? `<div class="chiprow">${S.win ? `<button class="fchip num" id="fchipWin" aria-label="${t("clear")}">${esc(winLabel(S.win))} ${ICON.x}</button>` : ""}${S.limitOnly ? `<button class="fchip" id="fchipLim" aria-label="${t("clear")}">${t("limitChip")} ${ICON.x}</button>` : ""}</div>` : ""}
   <div class="card">${items.length ? items.map(tradeRow).join("") : `<div class="empty" style="padding:20px">${empty}</div>`}
   <div class="tfoot num"><span>${t("closedOnly")}${esc(sampledNote("trades"))}</span><span>${l.length ? t("range", a + 1, Math.min(a + per, l.length), l.length) : ""}</span></div>

@@ -172,3 +172,13 @@ class TestTrimming:
         hist = embed.build_payload(full)["hist"]
         closed = full.table("trades").filter(pl.col("status") == "closed").collect()
         assert sum(hist["counts"]) == closed.height == hist["n"]
+
+    def test_daily_trade_figures_survive_any_row_limit(self, full):
+        small = embed.build_payload(full, limits=dict(embed.PAGE_LIMITS, trades=2))
+        assert small["trade_days"] == embed.build_payload(full)["trade_days"]
+        assert small["hist_days"] == embed.build_payload(full)["hist_days"]
+
+    def test_summary_detail_carries_no_symbols_in_daily_figures(self, full):
+        data = embed.build_payload(full, detail="summary")
+        assert set(data["trade_days"]) >= {"date", "side", "n", "wins", "sum_ret", "contrib"}
+        assert "symbol" not in data["trade_days"]

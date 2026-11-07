@@ -15,8 +15,8 @@ import polars as pl
 import polars_backtest as pl_bt
 import pytest
 from polars_backtest import viz
+from polars_backtest.report import embed, open_bundle, page
 from polars_backtest.report import metrics as M
-from polars_backtest.report import open_bundle, page
 from report_fixtures import (
     NAMES,
     LedgerReport,
@@ -49,6 +49,13 @@ def run_node(tmp_path: Path, script: str) -> dict:
     path.write_text(script, encoding="utf-8")
     done = subprocess.run([NODE, str(path)], check=True, capture_output=True, text=True)
     return json.loads(done.stdout)
+
+
+def decoded(column: object) -> list:
+    """A payload column as a list, the same step the page takes when it reads one."""
+    if isinstance(column, dict):
+        return [None if i is None else column["d"][i] for i in column["i"]]
+    return column
 
 
 def payload_of(html: str) -> dict:
@@ -281,13 +288,71 @@ console.log(JSON.stringify(run({self.series(curve)})));
         got = self.call(tmp_path, "BT.drawIndices([[null,null,null,null,2,null]], 0, 5, 1)")
         assert 4 in got
 
-    def test_histogram_counts_every_value(self, tmp_path):
-        got = self.call(tmp_path, "BT.histogram([-0.1, 0, 0.1, 0.3], 4)")
-        assert sum(got["counts"]) == 4
-        assert got["mean"] == pytest.approx(0.075)
+    @staticmethod
+    def biased(plain) -> tuple:
+        """A bundle whose page rows are nothing like its trades: tails only, kept extreme."""
+        db = pl_bt.report.to_bundle(plain)
+        limits = dict(embed.PAGE_LIMITS, trades=12)
+        return db, embed.build_payload(db, limits=limits)
 
-    def test_empty_histogram_is_null(self, tmp_path):
-        assert self.call(tmp_path, "BT.histogram([], 4)") is None
+    @staticmethod
+    def rows(table: dict) -> str:
+        names = list(table)
+        columns = [decoded(table[n]) for n in names]
+        return json.dumps([dict(zip(names, row)) for row in zip(*columns)])
+
+    def window(self, tmp_path, data: dict, start: str, end: str) -> dict:
+        args = f"{self.rows(data['trade_days'])}, {start!r}, {end!r}, {data['stops']}"
+        return self.call(tmp_path, f"BT.windowTrades({args})")
+
+    @pytest.mark.parametrize(
+        ("start", "end"), [("2021-01-01", "2030-01-01"), ("2021-06-01", "2022-03-31")]
+    )
+    def test_window_figures_ignore_trimming(self, plain, tmp_path, monkeypatch, start, end):
+        """Win rate and mean come from every trade, however few rows the page holds."""
+        monkeypatch.setattr(embed, "TRADE_TAIL", 3)
+        db, data = self.biased(plain)
+        assert data["embed"]["trades"]["rows_embedded"] < data["embed"]["trades"]["rows_total"]
+        got = self.window(tmp_path, data, start, end)
+        closed = M.closed_trades(db.table("trades").collect()).filter(
+            pl.col("exit_date").is_between(dt.date.fromisoformat(start), dt.date.fromisoformat(end))
+        )
+        assert got["n"] == closed.height
+        assert got["wins"] == (closed["ret"] > 0).sum()
+        assert got["mean"] == pytest.approx(closed["ret"].mean(), abs=1e-12)
+
+    def test_side_figures_match_the_summary(self, full, tmp_path):
+        data = embed.build_payload(full)
+        got = self.window(tmp_path, data, "2000-01-01", "2100-01-01")
+        for side, value in full.summary()["structure"]["sides"].items():
+            for key in ("n", "win_rate", "avg_ret", "contrib"):
+                assert got[side][key] == pytest.approx(value[key], abs=1e-9), key
+
+    @pytest.mark.parametrize("i", [0, 1, 2])
+    def test_stop_replay_uses_every_trade(self, full, tmp_path, i):
+        data = embed.build_payload(full)
+        stop = data["stops"][i]
+        got = self.window(tmp_path, data, "2000-01-01", "2100-01-01")["stops"][i]
+        closed = M.closed_trades(full.table("trades").collect()).drop_nulls("mae")
+        hit = closed["mae"] <= -stop
+        clipped = closed.with_columns(
+            pl.when(pl.col("mae") <= -stop).then(pl.lit(-stop)).otherwise(pl.col("ret")).alias("r")
+        )["r"]
+        assert got["hit"] == hit.sum()
+        assert got["win"] == pytest.approx((clipped > 0).mean(), abs=1e-12)
+        assert got["avg"] == pytest.approx(clipped.mean(), abs=1e-9)
+
+    def test_window_histogram_over_all_days_is_the_whole_histogram(self, full, tmp_path):
+        data = embed.build_payload(full)
+        args = f"{json.dumps(data['hist'])}, {self.rows(data['hist_days'])}"
+        got = self.call(tmp_path, f"BT.windowHist({args}, '2000-01-01', '2100-01-01')")
+        assert got["counts"] == data["hist"]["counts"]
+        assert got["n"] == data["hist"]["n"]
+
+    def test_periods_are_clipped_to_the_range(self, tmp_path):
+        periods = json.dumps([{"a": 0, "b": 9}, {"a": 10, "b": 19}, {"a": 20, "b": 29}])
+        got = self.call(tmp_path, f"BT.periodsIn({periods}, 5, 12)")
+        assert got == [{"a": 5, "b": 9}, {"a": 10, "b": 12}]
 
     @pytest.mark.parametrize(
         ("embedded", "complete"), [(100, True), (99, False)]
