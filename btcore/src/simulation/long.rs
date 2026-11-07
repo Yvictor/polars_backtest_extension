@@ -18,7 +18,9 @@ use arrow::array::{Float64Array, Int32Array, StringViewArray};
 use crate::config::{BacktestConfig, ExecOptions};
 use crate::ledger::{DayClose, FillReason, LegFill};
 use crate::position::{Position, PositionSnapshot};
-use crate::tracker::{BacktestResult, StockOperations, TradeRecord, NoopSymbolTracker, SymbolTracker, TradeTracker};
+use crate::tracker::{
+    BacktestResult, NoopSymbolTracker, StockOperations, SymbolTracker, TradeRecord, TradeTracker,
+};
 use crate::{is_valid_price, FLOAT_EPSILON};
 
 /// Portfolio with string symbol keys (for zero-copy backtest)
@@ -74,6 +76,34 @@ pub struct LongFormatArrowInput<'a> {
     /// raw_price = adj_price / factor
     /// Defaults to 1.0 if not provided
     pub factor: Option<&'a Float64Array>,
+    pub exec: ExecInput<'a>,
+}
+
+/// Optional row-aligned execution inputs, shared by all long interfaces
+#[derive(Clone, Copy, Default)]
+pub struct ExecInput<'a> {
+    pub mark_prices: Option<&'a [f64]>,
+}
+
+#[derive(Debug, thiserror::Error)]
+#[error("mark prices must be row-aligned: expected {expected}, got {actual}")]
+pub struct LongInputError {
+    pub expected: usize,
+    pub actual: usize,
+}
+
+impl ExecInput<'_> {
+    fn validate(&self, n_rows: usize) -> Result<(), LongInputError> {
+        if let Some(marks) = self.mark_prices {
+            if marks.len() != n_rows {
+                return Err(LongInputError {
+                    expected: n_rows,
+                    actual: marks.len(),
+                });
+            }
+        }
+        Ok(())
+    }
 }
 
 /// Resample frequency for rebalancing
@@ -235,6 +265,7 @@ fn backtest_impl<'a, FD, FS, FP, FW, FF, T, FO, FH, FL>(
     config: &BacktestConfig,
     tracker: &mut T,
     ohlc: Option<OhlcGetters<FO, FH, FL>>,
+    exec: ExecInput<'_>,
 ) -> (Vec<i32>, Vec<f64>)
 where
     FD: Fn(usize) -> i32,
@@ -259,6 +290,7 @@ where
     let mut position_changed = false;
     let mut current_date: Option<i32> = None;
     let mut today_prices: HashMap<&str, f64> = HashMap::new();
+    let mut today_mark: HashMap<&str, f64> = HashMap::new();
     let mut today_weights: HashMap<&str, f64> = HashMap::new();
     let mut today_factor: HashMap<&str, f64> = HashMap::new();
 
@@ -287,6 +319,7 @@ where
             run_session_day(
                 &mut session,
                 &today_prices,
+                exec.mark_prices.map(|_| &today_mark),
                 &today_factor,
                 touched_exit_enabled.then_some((&today_open, &today_high, &today_low)),
                 config,
@@ -511,6 +544,7 @@ where
             }
 
             today_prices.clear();
+            today_mark.clear();
             today_weights.clear();
             today_factor.clear();
             if touched_exit_enabled {
@@ -523,6 +557,11 @@ where
         current_date = Some(date);
         if is_valid_price(price) {
             today_prices.insert(symbol, price);
+        }
+        if let Some(marks) = exec.mark_prices {
+            if is_valid_price(marks[i]) {
+                today_mark.insert(symbol, marks[i]);
+            }
         }
         if !weight.is_nan() && weight.abs() > FLOAT_EPSILON {
             today_weights.insert(symbol, weight);
@@ -542,10 +581,11 @@ where
 
     // Final day
     if let Some(last_date) = current_date {
-        if !today_prices.is_empty() {
+        if !today_prices.is_empty() || !today_mark.is_empty() {
             run_session_day(
                 &mut session,
                 &today_prices,
+                exec.mark_prices.map(|_| &today_mark),
                 &today_factor,
                 touched_exit_enabled.then_some((&today_open, &today_high, &today_low)),
                 config,
@@ -603,12 +643,12 @@ type DayOhlc<'d, 'a> = (
 
 /// Process one trading day up to the signal step
 ///
-/// Marks positions, runs stops, then executes the pending rebalance. The loop
-/// body and the final day both go through here; only the signal step differs,
-/// because it needs the next date.
+/// Advances execution, stops, rebalancing and closing marks in session order.
+/// The loop body and final day both go through here; only signals need a next date.
 fn run_session_day<T>(
     session: &mut SessionState,
     today_prices: &HashMap<&str, f64>,
+    today_mark: Option<&HashMap<&str, f64>>,
     today_factor: &HashMap<&str, f64>,
     ohlc: Option<DayOhlc<'_, '_>>,
     config: &BacktestConfig,
@@ -617,20 +657,23 @@ fn run_session_day<T>(
 ) where
     T: TradeTracker<Key = String, Date = i32, Record = TradeRecord>,
 {
+    let observe_exit = today_mark.is_some() || config.exec.slippage_ratio > 0.0;
     // Update positions (cr *= r, maxcr update)
-    update_positions(&mut session.portfolio, today_prices);
+    update_positions(&mut session.portfolio, today_prices, today_mark.is_some());
 
     // Record prices for MAE/MFE calculation
-    for (sym, _pos) in session.portfolio.positions.iter() {
-        if let Some(&price) = today_prices.get(sym.as_str()) {
-            tracker.record_price(sym, price, price);
+    if today_mark.is_none() {
+        for sym in session.portfolio.positions.keys() {
+            if let Some(&price) = today_prices.get(sym.as_str()) {
+                tracker.record_price(sym, price, price);
+            }
         }
     }
 
     // Stop detection and execution
-    if ohlc.is_some() {
+    if ohlc.is_some() && today_mark.is_none() {
         // touched_exit mode: detect and execute IMMEDIATELY (T+0)
-        let stops = detect_stops_unified(&session.portfolio, today_prices, ohlc, config);
+        let stops = detect_stops_unified(&session.portfolio, today_prices, ohlc, config, false);
         execute_stops_impl(
             &mut session.portfolio,
             stops,
@@ -640,6 +683,7 @@ fn run_session_day<T>(
             config,
             date,
             Some(date), // exit_sig_date = current date (same day)
+            observe_exit,
             tracker,
         );
         // Clear pending stops (not used in touched_exit mode)
@@ -664,13 +708,44 @@ fn run_session_day<T>(
             config,
             date,
             None, // No exit_sig_date for regular stops
+            observe_exit,
             tracker,
         );
 
         // Detect new stops for tomorrow's execution
-        let new_stops = detect_stops_unified(&session.portfolio, today_prices, None, config);
+        let new_stops = if today_mark.is_none() {
+            detect_stops_unified(&session.portfolio, today_prices, None, config, false)
+        } else {
+            Vec::new()
+        };
         for stop in new_stops {
             session.pending_stop_exits.push(stop.symbol);
+        }
+    }
+
+    if today_mark.is_some() {
+        if let Some((open, _, _)) = ohlc {
+            // Carried gaps must use the old stop basis, before a scheduled
+            // rebalance can reset it. No high, low or closing mark is known yet.
+            let gaps = detect_stops_unified(
+                &session.portfolio,
+                today_prices,
+                Some((open, open, open)),
+                config,
+                true,
+            );
+            execute_stops_impl(
+                &mut session.portfolio,
+                gaps,
+                &mut session.stopped_stocks,
+                today_prices,
+                today_factor,
+                config,
+                date,
+                Some(date),
+                true,
+                tracker,
+            );
         }
     }
 
@@ -690,9 +765,65 @@ fn run_session_day<T>(
             config,
             date,
             sig_date,
+            observe_exit,
             tracker,
         );
         session.stopped_stocks.clear();
+    }
+
+    if let Some(marks) = today_mark {
+        if let Some((_, high, low)) = ohlc {
+            // Positions are still valued at execution. Check new opening fills,
+            // then high/low touches before observing any closing prices.
+            let stops = detect_stops_unified(&session.portfolio, today_prices, ohlc, config, true);
+            execute_stops_impl(
+                &mut session.portfolio,
+                stops,
+                &mut session.stopped_stocks,
+                today_prices,
+                today_factor,
+                config,
+                date,
+                Some(date),
+                true,
+                tracker,
+            );
+            for (sym, pos) in &mut session.portfolio.positions {
+                let is_long = pos.is_long();
+                let favorable = if is_long { high } else { low };
+                if let Some(&price) = favorable.get(sym.as_str()) {
+                    if is_valid_price(price) && pos.previous_price > 0.0 {
+                        let cr = pos.cr * (price / pos.previous_price);
+                        if is_long {
+                            pos.maxcr = pos.maxcr.max(cr);
+                            pos.max_price = pos.max_price.max(price);
+                        } else {
+                            pos.maxcr = pos.maxcr.min(cr);
+                            pos.max_price = pos.max_price.min(price);
+                        }
+                    }
+                }
+            }
+        }
+        // Identical prices need no second multiplication (including maxcr).
+        let changed: HashMap<&str, f64> = marks
+            .iter()
+            .filter(|(sym, price)| today_prices.get(**sym) != Some(*price))
+            .map(|(&sym, &price)| (sym, price))
+            .collect();
+        update_positions(&mut session.portfolio, &changed, true);
+        // A close can only signal a subsequent fill, never an earlier touch.
+        let stops = detect_stops_unified(&session.portfolio, marks, None, config, true);
+        session
+            .pending_stop_exits
+            .extend(stops.into_iter().map(|s| s.symbol));
+        for sym in session.portfolio.positions.keys() {
+            if let Some(&mark) = marks.get(sym.as_str()) {
+                let trade = today_prices.get(sym.as_str()).copied().unwrap_or(mark);
+                tracker.record_price(sym, mark, trade);
+            }
+        }
+        update_previous_prices(&mut session.portfolio, marks);
     }
 }
 
@@ -737,7 +868,8 @@ pub fn backtest_with_accessor<'a, FD, FS, FP, FW, FF, FO, FH, FL>(
     resample: ResampleFreq,
     offset: Option<ResampleOffset>,
     config: &BacktestConfig,
-) -> BacktestResult
+    exec: ExecInput<'_>,
+) -> Result<BacktestResult, LongInputError>
 where
     FD: Fn(usize) -> i32,
     FS: Fn(usize) -> &'a str,
@@ -748,6 +880,7 @@ where
     FH: Fn(usize) -> f64,
     FL: Fn(usize) -> f64,
 {
+    exec.validate(n_rows)?;
     let mut tracker = NoopSymbolTracker::default();
 
     let (dates, creturn) = if config.touched_exit && ohlc_accessors.is_some() {
@@ -769,6 +902,7 @@ where
             config,
             &mut tracker,
             ohlc,
+            exec,
         )
     } else {
         let ohlc: Option<OhlcGetters<fn(usize) -> f64, fn(usize) -> f64, fn(usize) -> f64>> = None;
@@ -784,16 +918,17 @@ where
             config,
             &mut tracker,
             ohlc,
+            exec,
         )
     };
 
-    BacktestResult {
+    Ok(BacktestResult {
         dates,
         creturn,
         trades: vec![],
         stock_operations: None,
         ledger: None,
-    }
+    })
 }
 
 /// Run backtest on Arrow arrays with zero-copy access
@@ -814,7 +949,7 @@ pub fn backtest_long_arrow(
     resample: ResampleFreq,
     offset: Option<ResampleOffset>,
     config: &BacktestConfig,
-) -> BacktestResult {
+) -> Result<BacktestResult, LongInputError> {
     // Build OHLC accessors if data is available
     let ohlc_accessors = if input.open_prices.is_some()
         && input.high_prices.is_some()
@@ -850,6 +985,7 @@ pub fn backtest_long_arrow(
         resample,
         offset,
         config,
+        input.exec,
     )
 }
 
@@ -902,7 +1038,9 @@ pub fn backtest_long_slice(
         resample,
         offset,
         config,
+        ExecInput::default(),
     )
+    .expect("default execution input has no marks")
 }
 
 
@@ -920,7 +1058,8 @@ pub fn backtest_with_report_long_arrow(
     resample: ResampleFreq,
     offset: Option<ResampleOffset>,
     config: &BacktestConfig,
-) -> BacktestResult {
+) -> Result<BacktestResult, LongInputError> {
+    input.exec.validate(input.dates.len())?;
     let mut tracker = SymbolTracker::new();
     if config.exec.ledger {
         tracker.enable_ledger(Portfolio::new().balance());
@@ -961,6 +1100,7 @@ pub fn backtest_with_report_long_arrow(
             config,
             &mut tracker,
             ohlc,
+            input.exec,
         )
     } else {
         let ohlc: Option<OhlcGetters<fn(usize) -> f64, fn(usize) -> f64, fn(usize) -> f64>> = None;
@@ -976,6 +1116,7 @@ pub fn backtest_with_report_long_arrow(
             config,
             &mut tracker,
             ohlc,
+            input.exec,
         )
     };
 
@@ -1032,13 +1173,13 @@ pub fn backtest_with_report_long_arrow(
         }
     }
 
-    BacktestResult {
+    Ok(BacktestResult {
         dates,
         creturn,
         trades,
         stock_operations: Some(stock_operations),
         ledger,
-    }
+    })
 }
 
 /// Calculate the next signal date based on resample frequency and offset
@@ -1553,10 +1694,17 @@ fn last_day_of_year_i32(days: i32) -> i32 {
 ///
 /// NOTE: Does NOT update previous_price - call update_previous_prices separately
 /// after touched_exit detection. This matches wide format behavior.
-fn update_positions(portfolio: &mut Portfolio, prices: &HashMap<&str, f64>) {
+fn update_positions(portfolio: &mut Portfolio, prices: &HashMap<&str, f64>, separate_mark: bool) {
     for (sym, pos) in portfolio.positions.iter_mut() {
         if let Some(&curr_price) = prices.get(sym.as_str()) {
+            let previous_extreme = (pos.maxcr, pos.max_price);
             pos.update_with_return(curr_price);
+            // Separate marks track the favorable extreme: highs for longs,
+            // lows for shorts. Keep the shared legacy update unchanged.
+            if separate_mark && !pos.is_long() && is_valid_price(curr_price) {
+                pos.maxcr = previous_extreme.0.min(pos.cr);
+                pos.max_price = previous_extreme.1.min(curr_price);
+            }
             // NOTE: previous_price is NOT updated here.
             // Call update_previous_prices after detect_touched_exit.
         }
@@ -1594,6 +1742,7 @@ fn detect_stops_unified(
     close_prices: &HashMap<&str, f64>,
     ohlc: Option<(&HashMap<&str, f64>, &HashMap<&str, f64>, &HashMap<&str, f64>)>,
     config: &BacktestConfig,
+    separate_mark: bool,
 ) -> Vec<StopResult> {
     let mut results = Vec::new();
 
@@ -1659,23 +1808,45 @@ fn detect_stops_unified(
             let high_r = cr / r * (high_price / prev_price);
             let low_r = cr / r * (low_price / prev_price);
 
+            // Separate marks use open -> high -> low ordering. The opening
+            // check uses only its existing peak; a later high may tighten a
+            // long trailing stop for the low check, never retroactively at open.
+            let low_threshold = if separate_mark && is_long && config.trail_stop.is_finite() {
+                min_r.max(maxcr.max(high_r) - config.trail_stop)
+            } else {
+                min_r
+            };
+
             // Check touch conditions (Finlab lines 348-350)
             // NOTE: Uses <= for min_r (not <) to match Finlab's behavior
             let touch_open = open_r >= max_r || open_r <= min_r;
             let touch_high = high_r >= max_r;
-            let touch_low = low_r <= min_r;
+            let touch_low = low_r <= low_threshold;
 
             // Priority: open > high > low (Finlab lines 354-380)
             // Exit ratio adjusts pos[sid] to touched price level
             if touch_open {
                 // Finlab: pos[sid] *= open_r / r
-                results.push(StopResult { symbol: sym.clone(), exit_ratio: open_r / r });
+                results.push(StopResult {
+                    symbol: sym.clone(),
+                    exit_ratio: if separate_mark || config.exec.slippage_ratio > 0.0 {
+                        open_price / close_price
+                    } else {
+                        open_r / r
+                    },
+                });
             } else if touch_high {
                 // Finlab: pos[sid] = entry_pos * max_r = pos / cr * max_r
-                results.push(StopResult { symbol: sym.clone(), exit_ratio: max_r / cr });
+                results.push(StopResult {
+                    symbol: sym.clone(),
+                    exit_ratio: max_r / cr,
+                });
             } else if touch_low {
                 // Finlab: pos[sid] = entry_pos * min_r = pos / cr * min_r
-                results.push(StopResult { symbol: sym.clone(), exit_ratio: min_r / cr });
+                results.push(StopResult {
+                    symbol: sym.clone(),
+                    exit_ratio: low_threshold / cr,
+                });
             }
         } else {
             // Regular stop detection (close price only)
@@ -1683,19 +1854,31 @@ fn detect_stops_unified(
 
             if is_long {
                 if config.take_profit < f64::INFINITY && cr_at_close >= max_r {
-                    results.push(StopResult { symbol: sym.clone(), exit_ratio: 1.0 });
+                    results.push(StopResult {
+                        symbol: sym.clone(),
+                        exit_ratio: 1.0,
+                    });
                     continue;
                 }
                 if cr_at_close < min_r {
-                    results.push(StopResult { symbol: sym.clone(), exit_ratio: 1.0 });
+                    results.push(StopResult {
+                        symbol: sym.clone(),
+                        exit_ratio: 1.0,
+                    });
                 }
             } else {
                 if cr_at_close >= max_r {
-                    results.push(StopResult { symbol: sym.clone(), exit_ratio: 1.0 });
+                    results.push(StopResult {
+                        symbol: sym.clone(),
+                        exit_ratio: 1.0,
+                    });
                     continue;
                 }
                 if config.take_profit < f64::INFINITY && cr_at_close < min_r {
-                    results.push(StopResult { symbol: sym.clone(), exit_ratio: 1.0 });
+                    results.push(StopResult {
+                        symbol: sym.clone(),
+                        exit_ratio: 1.0,
+                    });
                 }
             }
         }
@@ -1717,7 +1900,8 @@ fn execute_stops_impl<T>(
     today_factor: &HashMap<&str, f64>,
     config: &BacktestConfig,
     current_date: i32,
-    exit_sig_date: Option<i32>,  // Some(date) for touched_exit, None for regular
+    exit_sig_date: Option<i32>, // Some(date) for touched_exit, None for regular
+    observe_exit: bool,
     tracker: &mut T,
 )
 where
@@ -1730,8 +1914,14 @@ where
 
             // For touched_exit, adjust exit_price by exit_ratio (touched_price / close_price)
             let close_price = today_prices.get(stop.symbol.as_str()).copied().unwrap_or(pos.previous_price);
-            let exit_price = close_price * stop.exit_ratio;
-            let exit_factor = today_factor.get(stop.symbol.as_str()).copied().unwrap_or(1.0);
+            let exit_price = fill_price(close_price * stop.exit_ratio, -exit_value, config);
+            let exit_factor = today_factor
+                .get(stop.symbol.as_str())
+                .copied()
+                .unwrap_or(1.0);
+            if observe_exit {
+                tracker.record_price(&stop.symbol, exit_price, exit_price);
+            }
             tracker.close_trade(
                 &stop.symbol,
                 current_date,
@@ -1745,11 +1935,10 @@ where
             let leg = LegContext {
                 symbol: &stop.symbol,
                 date: current_date,
-                price: exit_price,
+                price: close_price * stop.exit_ratio,
                 reason: FillReason::Stop,
             };
-            leg.record_exit(exit_value, config, tracker);
-            portfolio.cash += exit_proceeds(exit_value, config);
+            leg.book_exit(&mut portfolio.cash, exit_value, config, tracker);
 
             if config.stop_trading_next_period {
                 stopped_stocks.insert(stop.symbol, true);
@@ -1777,47 +1966,77 @@ impl<'s> LegContext<'s> {
         }
     }
 
-    /// Report a leg of signed `notional`, taxed unless it adds to the position
-    fn record<T>(&self, notional: f64, taxed: bool, config: &BacktestConfig, tracker: &mut T)
+    /// Record the very same result that changes cash and position value.
+    fn record<T>(&self, leg: &BookedLeg, config: &BacktestConfig, tracker: &mut T)
     where
         T: TradeTracker<Key = String, Date = i32, Record = TradeRecord>,
     {
-        if !tracker.wants_ledger() || notional == 0.0 {
-            return;
+        if tracker.wants_ledger() && leg.notional != 0.0 {
+            tracker.record_fill(
+                self.symbol,
+                self.date,
+                &LegFill {
+                    notional: leg.notional,
+                    price: fill_price(self.price, leg.notional, config),
+                    commission: leg.commission,
+                    tax: leg.tax,
+                    slippage: leg.slippage,
+                    reason: self.reason,
+                },
+            );
         }
-        let cost = LegCost::of(notional, taxed, config);
-        let fill = LegFill {
-            notional,
-            price: self.price,
-            commission: cost.commission,
-            tax: cost.tax,
-            reason: self.reason,
-        };
-        tracker.record_fill(self.symbol, self.date, &fill);
     }
 
-    /// Report the full exit of a position worth `value`
-    fn record_exit<T>(&self, value: f64, config: &BacktestConfig, tracker: &mut T)
+    fn book_exit<T>(&self, cash: &mut f64, value: f64, config: &BacktestConfig, tracker: &mut T)
     where
         T: TradeTracker<Key = String, Date = i32, Record = TradeRecord>,
     {
-        self.record(-value, true, config, tracker);
+        let leg = close_leg(value, true, config);
+        *cash += leg.cash_delta;
+        self.record(&leg, config, tracker);
     }
 
-    /// Report the leg `book_leg` books between the same two values
-    fn record_move<T>(
+    fn book_move<T>(
         &self,
-        current_value: f64,
-        target_value: f64,
+        cash: &mut f64,
+        current: f64,
+        target: f64,
         config: &BacktestConfig,
         tracker: &mut T,
-    ) where
+    ) -> f64
+    where
         T: TradeTracker<Key = String, Date = i32, Record = TradeRecord>,
     {
-        let amount = target_value - current_value;
-        let taxed = !is_entry_leg(amount, target_value);
-        self.record(amount, taxed, config, tracker);
+        if config.exec.slippage_ratio > 0.0 && current * target < 0.0 {
+            // Cover/sell the old quantity in full before budgeting the new
+            // entry. Both parts retain the legacy reversal entry tax class.
+            let exit = close_leg(current, false, config);
+            *cash += exit.cash_delta;
+            self.record(&exit, config, tracker);
+            return self.book_move(cash, 0.0, target, config, tracker);
+        }
+        let leg = book_leg(current, target, config);
+        *cash += leg.cash_delta;
+        self.record(&leg, config, tracker);
+        leg.new_value
     }
+}
+
+/// One calculation supplies both portfolio accounting and ledger costs.
+struct BookedLeg {
+    notional: f64,
+    commission: f64,
+    tax: f64,
+    slippage: f64,
+    cash_delta: f64,
+    new_value: f64,
+}
+
+fn fill_price(price: f64, amount: f64, config: &BacktestConfig) -> f64 {
+    if config.exec.slippage_ratio == 0.0 || amount == 0.0 {
+        return price;
+    }
+    price * (1.0 + amount.signum() * config.exec.slippage_ratio)
 }
 
 /// What a leg costs, shared by the booking and the ledger
@@ -1848,9 +2067,22 @@ impl LegCost {
     }
 }
 
-/// Cash received for closing a position worth `value`, after fee and tax
-fn exit_proceeds(value: f64, config: &BacktestConfig) -> f64 {
-    value - LegCost::of(value, true, config).total
+/// Full exits use proceeds accounting even for buy-to-cover legs.
+fn close_leg(value: f64, taxed: bool, config: &BacktestConfig) -> BookedLeg {
+    let notional = if config.exec.slippage_ratio == 0.0 {
+        -value
+    } else {
+        -value * (1.0 - value.signum() * config.exec.slippage_ratio)
+    };
+    let cost = LegCost::of(notional, taxed, config);
+    BookedLeg {
+        notional,
+        commission: cost.commission,
+        tax: cost.tax,
+        slippage: (notional + value).abs(),
+        cash_delta: -notional - cost.total,
+        new_value: 0.0,
+    }
 }
 
 /// Whether a leg of `amount` towards `target_value` adds to the position
@@ -1858,22 +2090,42 @@ fn is_entry_leg(amount: f64, target_value: f64) -> bool {
     (target_value >= 0.0 && amount > 0.0) || (target_value <= 0.0 && amount < 0.0)
 }
 
-/// Book the leg that moves a position from `current_value` to `target_value`
-///
-/// Moves the traded amount through `cash` and returns the new position value.
-/// A buy pays its cost out of the position, a sell out of the proceeds.
-fn book_leg(cash: &mut f64, current_value: f64, target_value: f64, config: &BacktestConfig) -> f64 {
-    let amount = target_value - current_value;
-    let is_buy = amount > 0.0;
-    let cost = LegCost::of(amount, !is_entry_leg(amount, target_value), config).total;
-
-    if is_buy {
-        *cash -= amount;
-        current_value + amount - cost
+/// Compute a net rebalance leg once, preserving legacy fee bases and order.
+fn book_leg(current: f64, target: f64, config: &BacktestConfig) -> BookedLeg {
+    let amount = target - current;
+    let s = config.exec.slippage_ratio;
+    let notional = if amount > 0.0 || s == 0.0 {
+        amount
+    } else {
+        amount * (1.0 - s)
+    };
+    let cost = LegCost::of(notional, !is_entry_leg(amount, target), config);
+    let (new_value, cash_delta, slippage) = if amount > 0.0 {
+        // Keep the legacy budget fee base at every slippage ratio. Only the
+        // post-fee mark value shrinks; the zero branch keeps its exact order.
+        let legacy_value = current + amount - cost.total;
+        if s == 0.0 {
+            (legacy_value, -amount, 0.0)
+        } else {
+            let available = amount - cost.total;
+            let mark = available / (1.0 + s);
+            (current + mark, -amount, available - mark)
+        }
     } else {
         let sell_amount = amount.abs();
-        *cash += sell_amount - cost;
-        current_value - sell_amount
+        (
+            current - sell_amount,
+            -notional - cost.total,
+            (notional - amount).abs(),
+        )
+    };
+    BookedLeg {
+        notional,
+        commission: cost.commission,
+        tax: cost.tax,
+        slippage,
+        cash_delta,
+        new_value,
     }
 }
 
@@ -1892,6 +2144,7 @@ fn execute_rebalance_impl<T>(
     config: &BacktestConfig,
     current_date: i32,
     signal_date: i32,
+    observe_exit: bool,
     tracker: &mut T,
 )
 where
@@ -1906,8 +2159,12 @@ where
     // This matches wide.rs lines 263-279
     let open_positions: Vec<String> = portfolio.positions.keys().cloned().collect();
     for sym in &open_positions {
-        let exit_price = today_prices.get(sym.as_str()).copied().unwrap_or(f64::NAN);
+        let price = today_prices.get(sym.as_str()).copied().unwrap_or(f64::NAN);
+        let exit_price = fill_price(price, -portfolio.positions[sym].last_market_value, config);
         let exit_factor = today_factor.get(sym.as_str()).copied().unwrap_or(1.0);
+        if observe_exit {
+            tracker.record_price(sym, exit_price, exit_price);
+        }
         tracker.close_trade(
             sym,
             current_date,
@@ -1962,8 +2219,7 @@ where
             if let Some(pos) = portfolio.positions.remove(&sym) {
                 let price = today_prices.get(sym.as_str()).copied().unwrap_or(f64::NAN);
                 let leg = LegContext::rebalance(&sym, current_date, price);
-                leg.record_exit(pos.value, config, tracker);
-                portfolio.cash += exit_proceeds(pos.value, config);
+                leg.book_exit(&mut portfolio.cash, pos.value, config, tracker);
             }
         }
         return;
@@ -2003,8 +2259,7 @@ where
                 if let Some(snap) = snapshot {
                     if snap.market_value.abs() > FLOAT_EPSILON {
                         let leg = LegContext::rebalance(sym, current_date, f64::NAN);
-                        leg.record_exit(snap.market_value, config, tracker);
-                        cash += exit_proceeds(snap.market_value, config);
+                        leg.book_exit(&mut cash, snap.market_value, config, tracker);
                     }
                 }
                 continue;
@@ -2013,17 +2268,23 @@ where
             // Finlab behavior: Enter/modify position even with NaN price
             if target_value.abs() > FLOAT_EPSILON {
                 let leg = LegContext::rebalance(sym, current_date, f64::NAN);
-                leg.record_move(current_value, target_value, config, tracker);
-                let new_value = book_leg(&mut cash, current_value, target_value, config);
+                let new_value =
+                    leg.book_move(&mut cash, current_value, target_value, config, tracker);
 
                 if new_value.abs() > FLOAT_EPSILON {
                     // Finlab behavior: Open trade for ALL positions after rebalance
                     let entry_factor = today_factor.get(sym.as_str()).copied().unwrap_or(1.0);
-                    tracker.open_trade(sym.clone(), current_date, signal_date, f64::NAN, target_weight, entry_factor);
-                    portfolio.positions.insert(
+                    tracker.open_trade(
                         sym.clone(),
-                        Position::new_with_nan_price(new_value),
+                        current_date,
+                        signal_date,
+                        f64::NAN,
+                        target_weight,
+                        entry_factor,
                     );
+                    portfolio
+                        .positions
+                        .insert(sym.clone(), Position::new_with_nan_price(new_value));
                 }
             }
             continue;
@@ -2036,25 +2297,38 @@ where
         // Note: close_trade was already called at the start for ALL positions
         if target_weight.abs() < FLOAT_EPSILON {
             if current_value.abs() > FLOAT_EPSILON {
-                leg.record_exit(current_value, config, tracker);
-                cash += exit_proceeds(current_value, config);
+                leg.book_exit(&mut cash, current_value, config, tracker);
             }
             continue;
         }
 
-        leg.record_move(current_value, target_value, config, tracker);
-        let new_position_value = book_leg(&mut cash, current_value, target_value, config);
+        let new_position_value =
+            leg.book_move(&mut cash, current_value, target_value, config, tracker);
 
         if new_position_value.abs() > FLOAT_EPSILON {
             // Finlab behavior: Open trade for ALL positions after rebalance
             // (All trades were closed at the start of rebalance)
             let entry_factor = today_factor.get(sym.as_str()).copied().unwrap_or(1.0);
-            tracker.open_trade(sym.clone(), current_date, signal_date, price, target_weight, entry_factor);
+            // Continuing segments reset at market; whole-position slippage is
+            // reserved for entries from zero and reversals.
+            let entry_price = if current_value * target_value > 0.0 {
+                price
+            } else {
+                fill_price(price, target_value - current_value, config)
+            };
+            tracker.open_trade(
+                sym.clone(),
+                current_date,
+                signal_date,
+                entry_price,
+                target_weight,
+                entry_factor,
+            );
 
             // Determine if this is a continuing same-direction position
             let is_continuing = current_value.abs() > FLOAT_EPSILON && current_value * target_weight > 0.0;
 
-            let new_pos = if config.retain_cost_when_rebalance && is_continuing {
+            let mut new_pos = if config.retain_cost_when_rebalance && is_continuing {
                 // Preserve stop tracking for continuing same-direction positions
                 let snap = snapshot.unwrap(); // Safe: is_continuing implies snapshot exists
                 Position::new_from_snapshot(new_position_value, price, snap)
@@ -2062,6 +2336,19 @@ where
                 // New position or direction change or retain_cost=False: reset all
                 Position::new(new_position_value, price)
             };
+
+            if config.exec.slippage_ratio > 0.0 && !(config.retain_cost_when_rebalance && is_continuing) {
+                new_pos.entry_price = entry_price;
+                new_pos.stop_entry_price = entry_price;
+                new_pos.cr = price / entry_price;
+                // The entry fill is the initial favorable extreme; an
+                // adverse slipped mark must not loosen either direction.
+                new_pos.maxcr = if new_pos.is_long() {
+                    new_pos.cr.max(1.0)
+                } else {
+                    new_pos.cr.min(1.0)
+                };
+            }
 
             portfolio.positions.insert(sym.clone(), new_pos);
         }
@@ -2074,8 +2361,7 @@ where
         if !effective_weights.contains_key(sym) && snap.cost_basis.abs() > FLOAT_EPSILON {
             let price = today_prices.get(sym.as_str()).copied().unwrap_or(f64::NAN);
             let leg = LegContext::rebalance(sym, current_date, price);
-            leg.record_exit(snap.cost_basis, config, tracker);
-            cash += exit_proceeds(snap.cost_basis, config);
+            leg.book_exit(&mut cash, snap.cost_basis, config, tracker);
         }
     }
 
@@ -2199,6 +2485,245 @@ mod tests {
             high_prices: None,
             low_prices: None,
             factor: None,
+            exec: ExecInput::default(),
+        }
+    }
+
+    #[test]
+    fn test_slipped_reversal_closes_before_opposite_entry() {
+        for direction in [-1.0, 1.0] {
+            let mut portfolio = Portfolio::new();
+            portfolio.cash = 1.0 - direction;
+            portfolio.positions.insert("A".into(), Position::new(direction, 100.0));
+            let mut config = BacktestConfig {
+                fee_ratio: 0.0,
+                tax_ratio: 0.0,
+                ..Default::default()
+            };
+            config.exec.slippage_ratio = 0.1;
+            let mut tracker = SymbolTracker::new();
+            execute_rebalance_impl(
+                &mut portfolio,
+                &BTreeMap::from([("A".into(), -direction * 0.05)]),
+                &HashMap::from([("A", 100.0)]),
+                &HashMap::new(),
+                &HashMap::new(),
+                &config,
+                1,
+                0,
+                true,
+                &mut tracker,
+            );
+            let expected = if direction < 0.0 { 0.05 / 1.1 } else { -0.05 };
+            assert!((portfolio.positions["A"].last_market_value - expected).abs() < 1e-12);
+            let entry_slippage = if direction < 0.0 { 0.05 - expected } else { 0.005 };
+            assert!((portfolio.balance() - (0.9 - entry_slippage)).abs() < 1e-12);
+        }
+    }
+
+    #[test]
+    fn test_marked_short_trail_ignores_adverse_highs() {
+        let mut session = SessionState::new();
+        session.pending_weights = Some(BTreeMap::from([("A".into(), -1.0)]));
+        let mut tracker = SymbolTracker::new();
+        let config = BacktestConfig {
+            fee_ratio: 0.0,
+            tax_ratio: 0.0,
+            touched_exit: true,
+            trail_stop: 0.1,
+            ..Default::default()
+        };
+        let open = HashMap::from([("A", 100.0)]);
+        for (date, high) in [(1, 109.0), (2, 115.0)] {
+            run_session_day(
+                &mut session,
+                &open,
+                Some(&open),
+                &HashMap::new(),
+                Some((&open, &HashMap::from([("A", high)]), &open)),
+                &config,
+                date,
+                &mut tracker,
+            );
+        }
+        assert!(session.portfolio.positions.is_empty());
+        assert!((session.portfolio.balance() - 0.9).abs() < 1e-12);
+        assert!((tracker.finalize(0.0, 0.0)[0].exit_price.unwrap() - 110.0).abs() < 1e-12);
+    }
+
+    #[test]
+    fn test_touched_trail_uses_open_then_high_then_low_before_close() {
+        for close in [100.0, 120.0] {
+            let mut session = SessionState::new();
+            session.pending_weights = Some(BTreeMap::from([("A".into(), 1.0)]));
+            let mut tracker = SymbolTracker::new();
+            let config = BacktestConfig {
+                fee_ratio: 0.0,
+                tax_ratio: 0.0,
+                touched_exit: true,
+                trail_stop: 0.1,
+                ..Default::default()
+            };
+            let open = HashMap::from([("A", 100.0)]);
+            let high = HashMap::from([("A", 125.0)]);
+            let low = HashMap::from([("A", 99.0)]);
+            run_session_day(
+                &mut session,
+                &open,
+                Some(&HashMap::from([("A", close)])),
+                &HashMap::new(),
+                Some((&open, &high, &low)),
+                &config,
+                1,
+                &mut tracker,
+            );
+            let trades = tracker.finalize(0.0, 0.0);
+            assert_eq!(trades.len(), 1);
+            assert!((trades[0].exit_price.unwrap() - 115.0).abs() < 1e-12);
+            assert!(session.portfolio.positions.is_empty());
+            assert!((session.portfolio.balance() - 1.15).abs() < 1e-12);
+        }
+    }
+
+    #[test]
+    fn test_carried_gap_is_checked_before_resetting_rebalance_basis() {
+        for rebalance in [false, true] {
+            let mut session = SessionState::new();
+            session.portfolio.cash = 0.0;
+            session
+                .portfolio
+                .positions
+                .insert("A".into(), Position::new(1.0, 100.0));
+            if rebalance {
+                session.pending_weights = Some(BTreeMap::from([("A".into(), 1.0)]));
+            }
+            let mut tracker = SymbolTracker::new();
+            tracker.open_trade("A".into(), 0, 0, 100.0, 1.0, 1.0);
+            let config = BacktestConfig {
+                fee_ratio: 0.0,
+                tax_ratio: 0.0,
+                touched_exit: true,
+                stop_loss: 0.1,
+                ..Default::default()
+            };
+            let open = HashMap::from([("A", 80.0)]);
+            let high = HashMap::from([("A", 95.0)]);
+            let low = HashMap::from([("A", 79.0)]);
+            run_session_day(
+                &mut session,
+                &open,
+                Some(&HashMap::from([("A", 90.0)])),
+                &HashMap::new(),
+                Some((&open, &high, &low)),
+                &config,
+                1,
+                &mut tracker,
+            );
+            let trades = tracker.finalize(0.0, 0.0);
+            assert_eq!(trades[0].exit_price, Some(80.0));
+            assert!(session.portfolio.positions.is_empty());
+            assert!((session.portfolio.balance() - 0.8).abs() < 1e-12);
+        }
+    }
+
+    #[test]
+    fn test_slippage_observes_final_fill_for_rebalance_and_stop() {
+        for stop in [false, true] {
+            let mut session = SessionState::new();
+            session.portfolio.cash = 0.0;
+            session
+                .portfolio
+                .positions
+                .insert("A".into(), Position::new(1.0, 100.0));
+            if stop {
+                session.pending_stop_exits.push("A".into());
+            } else {
+                session.pending_weights = Some(BTreeMap::new());
+            }
+            let mut tracker = SymbolTracker::new();
+            tracker.open_trade("A".into(), 0, 0, 110.0, 1.0, 1.0);
+            let mut config = BacktestConfig {
+                fee_ratio: 0.0,
+                tax_ratio: 0.0,
+                ..Default::default()
+            };
+            config.exec.slippage_ratio = 0.1;
+            run_session_day(
+                &mut session,
+                &HashMap::from([("A", 100.0)]),
+                None,
+                &HashMap::new(),
+                None,
+                &config,
+                1,
+                &mut tracker,
+            );
+            let trade = &tracker.finalize(0.0, 0.0)[0];
+            let expected = 90.0 / 110.0 - 1.0;
+            assert_eq!(trade.exit_price, Some(90.0));
+            assert!((trade.mae.unwrap() - expected).abs() < 1e-12);
+            assert!((trade.mdd.unwrap() - expected).abs() < 1e-12);
+        }
+    }
+
+    #[test]
+    fn test_partial_rebalance_does_not_slip_the_held_stop_basis() {
+        for target in [0.5, 0.9] {
+            let mut portfolio = Portfolio::new();
+            portfolio.cash = 0.2;
+            portfolio
+                .positions
+                .insert("A".into(), Position::new(0.8, 100.0));
+            let mut config = BacktestConfig::default();
+            config.exec.slippage_ratio = 0.1;
+            config.retain_cost_when_rebalance = false;
+            config.fee_ratio = 0.0;
+            config.tax_ratio = 0.0;
+            let prices = HashMap::from([("A", 100.0)]);
+            let weights = BTreeMap::from([("A".into(), target)]);
+            let mut tracker = SymbolTracker::new();
+            tracker.enable_ledger(1.0);
+            execute_rebalance_impl(
+                &mut portfolio,
+                &weights,
+                &prices,
+                &HashMap::new(),
+                &HashMap::new(),
+                &config,
+                1,
+                0,
+                false,
+                &mut tracker,
+            );
+            let pos = &portfolio.positions["A"];
+            assert_eq!(pos.entry_price, 100.0);
+            assert_eq!(pos.stop_entry_price, 100.0);
+            assert_eq!(pos.cr, 1.0);
+            assert_eq!(pos.maxcr, 1.0);
+            assert_eq!(tracker.finalize(0.0, 0.0)[0].entry_price, 100.0);
+        }
+    }
+
+    #[test]
+    fn test_native_marks_require_row_alignment() {
+        let dates = Int32Array::from(vec![0, 1]);
+        let symbols = make_symbols(vec!["A", "A"]);
+        let prices = Float64Array::from(vec![100.0; 2]);
+        let weights = Float64Array::from(vec![1.0; 2]);
+        let mut input = make_input(&dates, &symbols, &prices, &weights);
+        input.exec.mark_prices = Some(&[100.0]);
+        let config = BacktestConfig::default();
+        for error in [
+            backtest_long_arrow(&input, ResampleFreq::Daily, None, &config)
+                .err()
+                .unwrap(),
+            backtest_with_report_long_arrow(&input, ResampleFreq::Daily, None, &config)
+                .err()
+                .unwrap(),
+        ] {
+            assert_eq!(error.expected, 2);
+            assert_eq!(error.actual, 1);
+            assert!(error.to_string().contains("row-aligned"));
         }
     }
 
@@ -2210,7 +2735,13 @@ mod tests {
         let weights = Float64Array::from(Vec::<f64>::new());
 
         let input = make_input(&dates, &symbols, &prices, &weights);
-        let result = backtest_long_arrow(&input, ResampleFreq::Daily, None, &BacktestConfig::default());
+        let result = backtest_long_arrow(
+            &input,
+            ResampleFreq::Daily,
+            None,
+            &BacktestConfig::default(),
+        )
+        .unwrap();
 
         assert!(result.creturn.is_empty());
     }
@@ -2241,7 +2772,7 @@ mod tests {
             ..Default::default()
         };
 
-        let result = backtest_long_arrow(&input, ResampleFreq::Daily, None, &config);
+        let result = backtest_long_arrow(&input, ResampleFreq::Daily, None, &config).unwrap();
 
         assert_eq!(result.creturn.len(), 4);
         assert!((result.creturn[0] - 1.0).abs() < FLOAT_EPSILON, "Day 0: {}", result.creturn[0]);
@@ -2269,7 +2800,7 @@ mod tests {
             ..Default::default()
         };
 
-        let result = backtest_long_arrow(&input, ResampleFreq::Daily, None, &config);
+        let result = backtest_long_arrow(&input, ResampleFreq::Daily, None, &config).unwrap();
 
         assert_eq!(result.creturn.len(), 3);
         assert!((result.creturn[0] - 1.0).abs() < FLOAT_EPSILON);
@@ -2297,7 +2828,7 @@ mod tests {
             ..Default::default()
         };
 
-        let result = backtest_long_arrow(&input, ResampleFreq::Daily, None, &config);
+        let result = backtest_long_arrow(&input, ResampleFreq::Daily, None, &config).unwrap();
 
         // Day 1: Entry with 1% fee = 0.99
         assert!((result.creturn[1] - 0.99).abs() < 1e-6, "Day 1: {}", result.creturn[1]);
@@ -2324,7 +2855,7 @@ mod tests {
             ..Default::default()
         };
 
-        let result = backtest_long_arrow(&input, ResampleFreq::Monthly, None, &config);
+        let result = backtest_long_arrow(&input, ResampleFreq::Monthly, None, &config).unwrap();
 
         // Jan 31 is month-end, so signal triggers entry on Feb 1
         // Recording starts from first signal (Jan 31), not from the beginning

@@ -32,6 +32,7 @@ fn daily_frame(ledger: &Ledger<String, i32>) -> PolarsResult<DataFrame> {
         float_column("cash", rows().map(|r| r.close.cash)),
         float_column("commission", rows().map(|r| r.commission)),
         float_column("tax", rows().map(|r| r.tax)),
+        float_column("slippage", rows().map(|r| r.slippage)),
         float_column("gross_long", rows().map(|r| r.close.gross_long)),
         float_column("gross_short", rows().map(|r| r.close.gross_short)),
         float_column(

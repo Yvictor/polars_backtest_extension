@@ -29,6 +29,7 @@ pub use long::{
     backtest_with_report_long_arrow,
     // Types
     LongFormatArrowInput,
+    ExecInput,
     Portfolio,
     ResampleFreq,
     ResampleOffset,

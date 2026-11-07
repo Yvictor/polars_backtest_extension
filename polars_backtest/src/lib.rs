@@ -51,7 +51,7 @@ use btcore::{
     PriceData, TradeRecord, WideTradeRecord,
     simulation::{
         backtest_long_arrow, backtest_with_report_long_arrow,
-        LongFormatArrowInput, ResampleFreq, ResampleOffset, StockOperations,
+        ExecInput, LongFormatArrowInput, ResampleFreq, ResampleOffset, StockOperations,
     },
 };
 
@@ -495,6 +495,7 @@ struct LongColumnNames<'a> {
     high: &'a str,
     low: &'a str,
     factor: Option<&'a str>,
+    mark_price: Option<&'a str>,
 }
 
 /// Long format columns as arrow-rs arrays (zero-copy), ready for btcore
@@ -507,6 +508,7 @@ struct LongArrays {
     high: Option<Float64Array>,
     low: Option<Float64Array>,
     factor: Option<Float64Array>,
+    mark: Option<Float64Array>,
 }
 
 impl LongArrays {
@@ -520,6 +522,9 @@ impl LongArrays {
             high_prices: self.high.as_ref(),
             low_prices: self.low.as_ref(),
             factor: self.factor.as_ref(),
+            exec: ExecInput {
+                mark_prices: self.mark.as_ref().map(|a| a.values().as_ref()),
+            },
         }
     }
 }
@@ -699,6 +704,10 @@ fn long_arrays(
         .map_err(|e| PyValueError::new_err(format!("FFI symbol conversion failed: {}", e)))?;
     let prices = float_column_to_arrow(df, names.trade_at_price)?;
     let weights = float_column_to_arrow(df, names.position)?;
+    let mark = names.mark_price
+        .filter(|&name| name != names.trade_at_price)
+        .map(|name| float_column_to_arrow(df, name))
+        .transpose()?;
 
     // OHLC columns are only read when touched_exit is enabled
     let (open, high, low) = if touched_exit {
@@ -728,6 +737,7 @@ fn long_arrays(
         high,
         low,
         factor,
+        mark,
     })
 }
 
@@ -850,7 +860,9 @@ fn creturn_frame(date: &str, dates: &[i32], creturn: &[f64]) -> PyResult<DataFra
     skip_sort=false,
     rebalance_every=1,
     rebalance_phase=0,
-    rebalance_anchor=None
+    rebalance_anchor=None,
+    mark_price=None,
+    slippage_ratio=0.0
 ))]
 fn backtest(
     df: PyDataFrame,
@@ -869,6 +881,8 @@ fn backtest(
     rebalance_every: i32,
     rebalance_phase: i32,
     rebalance_anchor: Option<i32>,
+    mark_price: Option<&str>,
+    slippage_ratio: f64,
 ) -> PyResult<PyBacktestResult> {
     use fastant::Instant;
 
@@ -885,9 +899,12 @@ fn backtest(
         high,
         low,
         factor,
+        mark_price,
     };
     let resample_freq = ResampleFreq::from_str(resample);
     let mut cfg = long_config(config);
+    cfg.exec.slippage_ratio = slippage_ratio;
+    cfg.exec.validate_prices().map_err(PyValueError::new_err)?;
     set_schedule(
         &mut cfg,
         resample_freq,
@@ -912,7 +929,8 @@ fn backtest(
     let offset = parse_resample_offset(resample_offset)?;
 
     // Run backtest using btcore with arrow-rs arrays
-    let result = backtest_long_arrow(&arrays.input(), resample_freq, offset, &cfg);
+    let result = backtest_long_arrow(&arrays.input(), resample_freq, offset, &cfg)
+        .map_err(|e| PyValueError::new_err(e.to_string()))?;
 
     profile!("[PROFILE] Backtest (btcore): {:?}", step_start.elapsed());
     step_start = Instant::now();
@@ -968,7 +986,9 @@ fn backtest(
     rebalance_every=1,
     rebalance_phase=0,
     rebalance_anchor=None,
-    ledger=false
+    ledger=false,
+    mark_price=None,
+    slippage_ratio=0.0
 ))]
 fn backtest_with_report(
     df: PyDataFrame,
@@ -992,6 +1012,8 @@ fn backtest_with_report(
     rebalance_phase: i32,
     rebalance_anchor: Option<i32>,
     ledger: bool,
+    mark_price: Option<&str>,
+    slippage_ratio: f64,
 ) -> PyResult<PyBacktestReport> {
     let n_rows = df.0.height();
     let names = LongColumnNames {
@@ -1003,9 +1025,12 @@ fn backtest_with_report(
         high,
         low,
         factor,
+        mark_price,
     };
     let resample_freq = ResampleFreq::from_str(resample);
     let mut cfg = long_config(config);
+    cfg.exec.slippage_ratio = slippage_ratio;
+    cfg.exec.validate_prices().map_err(PyValueError::new_err)?;
     set_schedule(
         &mut cfg,
         resample_freq,
@@ -1020,7 +1045,8 @@ fn backtest_with_report(
     let offset = parse_resample_offset(resample_offset)?;
 
     // Run backtest with report using btcore
-    let result = backtest_with_report_long_arrow(&arrays.input(), resample_freq, offset, &cfg);
+    let result = backtest_with_report_long_arrow(&arrays.input(), resample_freq, offset, &cfg)
+        .map_err(|e| PyValueError::new_err(e.to_string()))?;
 
     // Process benchmark parameter (can be str column name or PyDataFrame)
     let benchmark_df: Option<DataFrame> = if let Some(bm_obj) = benchmark {
@@ -1133,7 +1159,8 @@ fn backtest_with_report(
         weights_df,
         next_weights_df,
     )
-    .with_ledger(ledger_df))
+    .with_ledger(ledger_df)
+    .with_trade_at(trade_at_price))
 }
 
 // =============================================================================
